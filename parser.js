@@ -41,8 +41,8 @@ function parseAdMessage(text, date) {
   const adPrice  = parseFloat(headerMatch[3].replace(/,/g, ""));
 
   // ── PAGE INFO section ────────────────────────────────────────────────────────
-  let pageHandle = null;
-  let timeMST    = "";
+  let timeMST  = "";
+  const pageEntries = []; // { handle, price } — may be multiple for bulk ads
 
   const pageInfoIdx = lines.findIndex((l) =>
     l.replace(/\*/g, "").toLowerCase().includes("page info")
@@ -54,31 +54,40 @@ function parseAdMessage(text, date) {
 
       // Extract time: "NOW / 4:45 PM AZ" or "1-1:30pm AZ / 3pm EST" or "4:45 PM AZ"
       if (!timeMST) {
-        // Try "NOW" first
         if (/^now\b/i.test(line)) {
           timeMST = "NOW";
         } else {
-          // Look for a time pattern followed by AZ or MST
           const timeMatch = line.match(/([\d]{1,2}(?:[-–][\d:]+)?(?::\d{2})?\s*(?:am|pm)?)\s*(?:AZ|MST)/i);
-          if (timeMatch) {
-            timeMST = timeMatch[1].trim().toUpperCase();
-          }
+          if (timeMatch) timeMST = timeMatch[1].trim().toUpperCase();
         }
       }
 
-      // Extract "@handle - $amount"
-      if (!pageHandle) {
-        const m = line.match(/^@([\w.]+)\s*-\s*\$?([\d,]+(?:\.\d{1,2})?)/);
-        if (m) pageHandle = m[1].toLowerCase();
+      // Multi-page format: "(9/15) @handle - $price" or "(9/15)@handle - $price"
+      const multiMatch = line.match(/^\([\d/]+\)\s*@([\w.]+)\s*-\s*\$?([\d,]+(?:\.\d{1,2})?)/);
+      if (multiMatch) {
+        pageEntries.push({
+          handle: multiMatch[1].toLowerCase(),
+          price:  parseFloat(multiMatch[2].replace(/,/g, "")),
+        });
+        continue;
+      }
+
+      // Single-page format: "@handle - $price"
+      const singleMatch = line.match(/^@([\w.]+)\s*-\s*\$?([\d,]+(?:\.\d{1,2})?)/);
+      if (singleMatch) {
+        pageEntries.push({
+          handle: singleMatch[1].toLowerCase(),
+          price:  parseFloat(singleMatch[2].replace(/,/g, "")),
+        });
       }
     }
   }
 
-  // Fallback page handle: scan whole message
-  if (!pageHandle) {
+  // Fallback: scan whole message for "@handle - $price" if PAGE INFO had none
+  if (pageEntries.length === 0) {
     for (const line of lines) {
       const m = line.match(/^@([\w.]+)\s*-\s*\$?([\d,]+)/);
-      if (m) { pageHandle = m[1].toLowerCase(); break; }
+      if (m) { pageEntries.push({ handle: m[1].toLowerCase(), price: parseFloat(m[2].replace(/,/g, "")) }); break; }
     }
   }
 
@@ -138,16 +147,18 @@ function parseAdMessage(text, date) {
     year:    "2-digit",
   });
 
-  return {
-    client,
-    category,
-    adPrice,
-    pageHandle,
-    postType,
-    nif,
-    datePosted,
-    timeMST,
-  };
+  const base = { client, category, postType, nif, datePosted, timeMST };
+
+  if (pageEntries.length === 0) {
+    // No page found — return single result using header price
+    return { ...base, adPrice, pageHandle: null };
+  } else if (pageEntries.length === 1) {
+    // Single page — use per-page price from PAGE INFO
+    return { ...base, adPrice: pageEntries[0].price, pageHandle: pageEntries[0].handle };
+  } else {
+    // Multi-page bulk ad — return array, one entry per page
+    return pageEntries.map((p) => ({ ...base, adPrice: p.price, pageHandle: p.handle }));
+  }
 }
 
 module.exports = { parseAdMessage };

@@ -71,29 +71,35 @@ async function handleAdMessage(ctx) {
     // Not an ad message — ignore silently
     if (!parsed) return;
 
-    console.log(
-      `[adHandler] Ad detected: "${parsed.client}" / ${parsed.category} / $${parsed.adPrice}` +
-      (parsed.pageHandle ? ` → @${parsed.pageHandle}` : " (no page handle found)")
-    );
+    // Normalise to array so multi-page and single-page use the same code path
+    const parsedList = Array.isArray(parsed) ? parsed : [parsed];
 
-    const row = buildRow(parsed);
-    const results = [];
+    console.log(
+      `[adHandler] Ad detected: "${parsedList[0].client}" / ${parsedList[0].category}` +
+      (parsedList.length > 1
+        ? ` — ${parsedList.length} pages (bulk ad)`
+        : ` / $${parsedList[0].adPrice}` + (parsedList[0].pageHandle ? ` → @${parsedList[0].pageHandle}` : " (no page handle)"))
+    );
 
     // ── Write to Master Revenue Sheet ──────────────────────────────────────────
     if (MASTER_SHEET_ID && !PLACEHOLDER_PATTERN.test(MASTER_SHEET_ID)) {
-      try {
-        await appendRow(MASTER_SHEET_ID, TAB_NAME, row);
-        console.log(`[adHandler] ✅ Master sheet write succeeded (tab: "${TAB_NAME}")`);
-        results.push("✅ Master sheet");
-      } catch (err) {
-        console.error(`[adHandler] ❌ Master sheet write error: ${err.message}`);
-        console.error(err.stack);
-        results.push("❌ Master sheet (error)");
+      let successCount = 0;
+      for (const item of parsedList) {
+        const row = buildRow(item);
+        try {
+          await appendRow(MASTER_SHEET_ID, TAB_NAME, row);
+          successCount++;
+        } catch (err) {
+          console.error(`[adHandler] ❌ Master sheet write error for @${item.pageHandle}: ${err.message}`);
+          console.error(err.stack);
+        }
       }
+      console.log(`[adHandler] ✅ Master sheet: wrote ${successCount}/${parsedList.length} row(s) (tab: "${TAB_NAME}")`);
     } else {
       console.warn("[adHandler] MASTER_SHEET_ID not configured — skipping master sheet.");
-      results.push("⚠️ Master sheet (not configured)");
     }
+
+    const results = [];
 
     // ── Write to individual page revenue sheet ─────────────────────────────────
     // 🚧 DISABLED during A/B test phase — master sheet only for now.
