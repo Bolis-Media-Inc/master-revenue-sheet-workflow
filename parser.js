@@ -105,12 +105,22 @@ function parseAdMessage(text, date) {
       }
     }
 
-    // NIF / duration — "30min NIF", "45 MIN NIF", "Perm post", "do not delete"
-    const nifKeywords = ["nif", "perm", "do not delete", "24h", "48h", "hour", "week", "month"];
+    // NIF / duration — prefer lines with "NIF" explicitly, then fall back to perm/duration keywords
+    // Priority 1: explicit NIF mention (e.g. "1hr NIF", "30min NIF")
     for (const instr of instrLines) {
-      if (nifKeywords.some((k) => instr.toLowerCase().includes(k))) {
+      if (/\bnif\b/i.test(instr)) {
         nif = instr.charAt(0).toUpperCase() + instr.slice(1);
         break;
+      }
+    }
+    // Priority 2: perm / duration keywords
+    if (!nif) {
+      const nifKeywords = ["perm", "do not delete", "24h", "48h", "hour", "week", "month", "permanent"];
+      for (const instr of instrLines) {
+        if (nifKeywords.some((k) => instr.toLowerCase().includes(k))) {
+          nif = instr.charAt(0).toUpperCase() + instr.slice(1);
+          break;
+        }
       }
     }
 
