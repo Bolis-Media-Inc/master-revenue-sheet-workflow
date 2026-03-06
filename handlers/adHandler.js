@@ -16,29 +16,39 @@ const pages               = require("../config/pages.json");
 
 const TARGET_CHAT_ID  = process.env.TARGET_CHAT_ID;
 const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
-const TAB_NAME        = process.env.SHEET_TAB_NAME || "IG Revenue Tracker";
+const TAB_NAME        = process.env.SHEET_TAB_NAME || "2026 Ad Overview";
 
 // Placeholder values that haven't been filled in yet (to skip writing to that sheet)
 const PLACEHOLDER_PATTERN = /^SHEET_ID_/;
 
 /**
- * Build the row array that matches the revenue sheet column order:
- * [Client Name, Ad Type, Bulk #, Date Posted, Post Type, Post Duration, Ad Price, Notes, (blank), Gross Revenue to Date, Purchase Price]
+ * Build the row array matching the Master Revenue Sheet "2026 Ad Overview" tab:
  *
- * Columns I (hidden) and J (Gross Revenue to Date) and K (Purchase Price) are left
- * blank — they're typically calculated or filled in manually.
+ *  A: Forwarded   — left blank (checkbox, VA ticks manually)
+ *  B: Client Name — parsed client
+ *  C: Ad Type     — parsed category
+ *  D: Date        — message date  e.g. "Thu 3/5/26"
+ *  E: Time (MST)  — time from PAGE INFO  e.g. "4:45 PM"
+ *  F: Page        — @pageHandle
+ *  G: Bulk #      — left blank (manual)
+ *  H: Page Ad Price — "$750"
+ *  I: Status      — left blank (manual)
+ *  J: Views       — left blank (filled in later)
+ *  K: NIF         — NIF/duration from INSTRUCTIONS  e.g. "30min NIF"
  */
-function buildRow(parsed, pageHandle) {
+function buildRow(parsed) {
   return [
-    parsed.client,       // A: Client Name
-    parsed.category,     // B: Ad Type (category from message)
-    "",                  // C: Bulk # (manual)
-    parsed.datePosted,   // D: Date Posted
-    parsed.postType,     // E: Post Type (feed/reels/carousel)
-    parsed.postDuration, // F: Post Duration (perm/30min NIF/etc.)
-    `$${parsed.adPrice}`,// G: Ad Price
-    parsed.notes || "",  // H: Notes
-    pageHandle ? `@${pageHandle}` : "", // I: Page handle (extra context on Master sheet)
+    "",                                          // A: Forwarded (checkbox — skip)
+    parsed.client,                               // B: Client Name
+    parsed.category,                             // C: Ad Type
+    parsed.datePosted,                           // D: Date
+    parsed.timeMST || "",                        // E: Time (MST)
+    parsed.pageHandle ? `@${parsed.pageHandle}` : "", // F: Page
+    "",                                          // G: Bulk # (manual)
+    parsed.adPrice ? `$${parsed.adPrice}` : "",  // H: Page Ad Price
+    "",                                          // I: Status (manual)
+    "",                                          // J: Views (manual)
+    parsed.nif || "",                            // K: NIF
   ];
 }
 
@@ -66,7 +76,7 @@ async function handleAdMessage(ctx) {
       (parsed.pageHandle ? ` → @${parsed.pageHandle}` : " (no page handle found)")
     );
 
-    const row = buildRow(parsed, parsed.pageHandle);
+    const row = buildRow(parsed);
     const results = [];
 
     // ── Write to Master Revenue Sheet ──────────────────────────────────────────

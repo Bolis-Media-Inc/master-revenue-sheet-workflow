@@ -13,7 +13,7 @@
  *   - 30min NIF / Perm post / etc.
  *
  *   **PAGE INFO:**
- *   [time] AZ / [time] EST
+ *   [time] AZ / [time] EST   ← or "NOW / 4:45 PM AZ"
  *   @{page_handle} - ${price}
  *
  * Returns null if the message doesn't look like a valid ad.
@@ -22,7 +22,7 @@
 /**
  * @param {string} text  Raw Telegram message text
  * @param {Date}   date  Timestamp of the message
- * @returns {{ client, category, adPrice, pageHandle, postType, postDuration, notes, datePosted } | null}
+ * @returns {{ client, category, adPrice, pageHandle, postType, nif, datePosted, timeMST } | null}
  */
 function parseAdMessage(text, date) {
   if (!text || typeof text !== "string") return null;
@@ -31,7 +31,6 @@ function parseAdMessage(text, date) {
   if (lines.length < 2) return null;
 
   // ── Line 1: "{Client} - {Category} - ${amount}" ─────────────────────────────
-  // Allow $ or no $ (some messages write $0 or just a number)
   const headerMatch = lines[0].match(
     /^(.+?)\s*-\s*(.+?)\s*-\s*\$?([\d,]+(?:\.\d{1,2})?)$/
   );
@@ -42,37 +41,51 @@ function parseAdMessage(text, date) {
   const adPrice  = parseFloat(headerMatch[3].replace(/,/g, ""));
 
   // ── PAGE INFO section ────────────────────────────────────────────────────────
-  // Find the line "**PAGE INFO:**" then scan for "@handle - $amount"
   let pageHandle = null;
+  let timeMST    = "";
+
   const pageInfoIdx = lines.findIndex((l) =>
     l.replace(/\*/g, "").toLowerCase().includes("page info")
   );
 
   if (pageInfoIdx !== -1) {
-    // Look at lines after PAGE INFO for "@handle - $amount"
     for (let i = pageInfoIdx + 1; i < lines.length; i++) {
-      const m = lines[i].match(/^@([\w.]+)\s*-\s*\$?([\d,]+(?:\.\d{1,2})?)/);
-      if (m) {
-        pageHandle = m[1].toLowerCase();
-        break;
+      const line = lines[i];
+
+      // Extract time: "NOW / 4:45 PM AZ" or "1-1:30pm AZ / 3pm EST" or "4:45 PM AZ"
+      if (!timeMST) {
+        // Try "NOW" first
+        if (/^now\b/i.test(line)) {
+          timeMST = "NOW";
+        } else {
+          // Look for a time pattern followed by AZ or MST
+          const timeMatch = line.match(/([\d]{1,2}(?:[-–][\d:]+)?(?::\d{2})?\s*(?:am|pm)?)\s*(?:AZ|MST)/i);
+          if (timeMatch) {
+            timeMST = timeMatch[1].trim().toUpperCase();
+          }
+        }
+      }
+
+      // Extract "@handle - $amount"
+      if (!pageHandle) {
+        const m = line.match(/^@([\w.]+)\s*-\s*\$?([\d,]+(?:\.\d{1,2})?)/);
+        if (m) pageHandle = m[1].toLowerCase();
       }
     }
   }
 
-  // Fallback: scan the whole message for an @handle that looks like a page (not an admin)
+  // Fallback page handle: scan whole message
   if (!pageHandle) {
     for (const line of lines) {
       const m = line.match(/^@([\w.]+)\s*-\s*\$?([\d,]+)/);
-      if (m) {
-        pageHandle = m[1].toLowerCase();
-        break;
-      }
+      if (m) { pageHandle = m[1].toLowerCase(); break; }
     }
   }
 
   // ── INSTRUCTIONS section ─────────────────────────────────────────────────────
-  let postType     = "";
-  let postDuration = "";
+  let postType = "";
+  let nif      = "";   // NIF / Perm / duration — maps to column K
+
   const instrIdx = lines.findIndex((l) =>
     l.replace(/\*/g, "").toLowerCase().includes("instructions")
   );
@@ -83,54 +96,47 @@ function parseAdMessage(text, date) {
       l.replace(/^[-*•]\s*/, "").replace(/\*/g, "").trim()
     );
 
-    // Post type
+    // Post type (feed / reels / carousel / story)
     const typeKeywords = ["feed", "reel", "reels", "carousel", "story", "stories"];
     for (const instr of instrLines) {
-      const lower = instr.toLowerCase();
-      if (typeKeywords.some((k) => lower.includes(k))) {
-        // Capitalise first letter
+      if (typeKeywords.some((k) => instr.toLowerCase().includes(k))) {
         postType = instr.charAt(0).toUpperCase() + instr.slice(1);
         break;
       }
     }
 
-    // Post duration — perm / NIF / time-based
-    const durationKeywords = ["perm", "nif", "do not delete", "24h", "48h", "hour", "week", "month"];
+    // NIF / duration — "30min NIF", "45 MIN NIF", "Perm post", "do not delete"
+    const nifKeywords = ["nif", "perm", "do not delete", "24h", "48h", "hour", "week", "month"];
     for (const instr of instrLines) {
-      const lower = instr.toLowerCase();
-      if (durationKeywords.some((k) => lower.includes(k))) {
-        postDuration = instr.charAt(0).toUpperCase() + instr.slice(1);
+      if (nifKeywords.some((k) => instr.toLowerCase().includes(k))) {
+        nif = instr.charAt(0).toUpperCase() + instr.slice(1);
         break;
       }
     }
 
-    // If still no postType (e.g. just "feed" with no keyword match above), try first bullet
     if (!postType && instrLines.length > 0) {
       postType = instrLines[0].charAt(0).toUpperCase() + instrLines[0].slice(1);
     }
   }
 
-  // ── Notes — any non-standard instructions ────────────────────────────────────
-  const notes = "";
-
-  // ── Format the date ───────────────────────────────────────────────────────────
+  // ── Format date (matches sheet "Thu 1/1/26" style) ───────────────────────────
   const d = date || new Date();
-  const datePosted = `${d.toLocaleDateString("en-US", {
+  const datePosted = d.toLocaleDateString("en-US", {
     weekday: "short",
-    month: "numeric",
-    day: "numeric",
-    year: "2-digit",
-  })}`;
+    month:   "numeric",
+    day:     "numeric",
+    year:    "2-digit",
+  });
 
   return {
     client,
     category,
     adPrice,
-    pageHandle,   // null if not found — will still write to Master sheet
+    pageHandle,
     postType,
-    postDuration,
-    notes,
+    nif,
     datePosted,
+    timeMST,
   };
 }
 
