@@ -59,12 +59,12 @@ async function appendRow(spreadsheetId, tabName, rowValues) {
   const client = await auth.getClient();
   const sheets = google.sheets({ version: "v4", auth: client });
 
-  // Use the tab name only (no column constraint) so the API finds the true last row
-  // across ALL columns — avoids blank-row interleaving when the sheet has data beyond col K.
-  // OVERWRITE means "write to first empty row" without inserting/shifting existing rows.
+  // A:K constrains the "find last row" lookup to columns A–K only.
+  // OVERWRITE means "write to the next empty row" without inserting/shifting rows —
+  // this prevents blank-row interleaving when the sheet has data beyond column K.
   await sheets.spreadsheets.values.append({
     spreadsheetId,
-    range: tabName,
+    range: `${tabName}!A:K`,
     valueInputOption: "USER_ENTERED", // Lets Sheets parse dates and currency strings
     insertDataOption: "OVERWRITE",
     requestBody: {
@@ -106,7 +106,7 @@ async function appendSeparatorRow(spreadsheetId, tabName) {
   // Append 11 empty cells — enough to anchor the row in the table
   const appendResult = await sheets.spreadsheets.values.append({
     spreadsheetId,
-    range: tabName,
+    range: `${tabName}!A:K`,
     valueInputOption: "USER_ENTERED",
     insertDataOption: "OVERWRITE",
     requestBody: { values: [["", "", "", "", "", "", "", "", "", "", ""]] },
