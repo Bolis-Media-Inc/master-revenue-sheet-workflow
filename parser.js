@@ -63,11 +63,12 @@ function parseAdMessage(text, date) {
       }
 
       // Multi-page format: "(9/15) @handle - $price" or "(9/15)@handle - $price"
-      const multiMatch = line.match(/^\([\d/]+\)\s*@([\w.]+)\s*-\s*\$?([\d,]+(?:\.\d{1,2})?)/);
+      const multiMatch = line.match(/^\(([\d/]+)\)\s*@([\w.]+)\s*-\s*\$?([\d,]+(?:\.\d{1,2})?)/);
       if (multiMatch) {
         pageEntries.push({
-          handle: multiMatch[1].toLowerCase(),
-          price:  parseFloat(multiMatch[2].replace(/,/g, "")),
+          handle:  multiMatch[2].toLowerCase(),
+          price:   parseFloat(multiMatch[3].replace(/,/g, "")),
+          bulkNum: multiMatch[1], // e.g. "11/15"
         });
         continue;
       }
@@ -161,14 +162,11 @@ function parseAdMessage(text, date) {
   const base = { client, category, postType, nif, datePosted, timeMST };
 
   if (pageEntries.length === 0) {
-    // No page found — return single result using header price
-    return { ...base, adPrice, pageHandle: null };
+    return { ...base, adPrice, pageHandle: null, bulkNum: "" };
   } else if (pageEntries.length === 1) {
-    // Single page — use per-page price from PAGE INFO
-    return { ...base, adPrice: pageEntries[0].price, pageHandle: pageEntries[0].handle };
+    return { ...base, adPrice: pageEntries[0].price, pageHandle: pageEntries[0].handle, bulkNum: pageEntries[0].bulkNum || "" };
   } else {
-    // Multi-page bulk ad — return array, one entry per page
-    return pageEntries.map((p) => ({ ...base, adPrice: p.price, pageHandle: p.handle }));
+    return pageEntries.map((p) => ({ ...base, adPrice: p.price, pageHandle: p.handle, bulkNum: p.bulkNum || "" }));
   }
 }
 

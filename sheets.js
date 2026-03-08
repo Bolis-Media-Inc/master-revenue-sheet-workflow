@@ -153,4 +153,46 @@ async function appendSeparatorRow(spreadsheetId, tabName) {
   });
 }
 
-module.exports = { appendRow, getLastDate, appendSeparatorRow };
+/**
+ * Update Status (column I) to "Live" for any rows whose Page (column F)
+ * matches one of the given handles AND whose current Status is "Scheduled".
+ * Returns the number of rows updated.
+ */
+async function updateStatusToLive(spreadsheetId, tabName, pageHandles) {
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: "v4", auth: client });
+
+  // Read columns F (Page) and I (Status)
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `${tabName}!F:I`,
+  });
+
+  const rows    = response.data.values || [];
+  const updates = [];
+  const normalised = pageHandles.map((h) => `@${h.toLowerCase().replace(/^@/, "")}`);
+
+  for (let i = 0; i < rows.length; i++) {
+    const pageCell   = (rows[i]?.[0] || "").trim().toLowerCase();  // F
+    const statusCell = (rows[i]?.[3] || "").trim();                 // I (F=0,G=1,H=2,I=3)
+
+    if (normalised.includes(pageCell) && statusCell === "Scheduled") {
+      updates.push({
+        range:  `${tabName}!I${i + 1}`,
+        values: [["Live"]],
+      });
+    }
+  }
+
+  if (updates.length > 0) {
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId,
+      requestBody: { valueInputOption: "USER_ENTERED", data: updates },
+    });
+  }
+
+  return updates.length;
+}
+
+module.exports = { appendRow, getLastDate, appendSeparatorRow, updateStatusToLive };

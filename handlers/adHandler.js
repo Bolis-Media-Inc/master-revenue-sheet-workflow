@@ -11,7 +11,7 @@
  */
 
 const { parseAdMessage }  = require("../parser");
-const { appendRow, getLastDate, appendSeparatorRow } = require("../sheets");
+const { appendRow, getLastDate, appendSeparatorRow, updateStatusToLive } = require("../sheets");
 const pages               = require("../config/pages.json");
 
 const TARGET_CHAT_ID  = process.env.TARGET_CHAT_ID;
@@ -38,17 +38,17 @@ const PLACEHOLDER_PATTERN = /^SHEET_ID_/;
  */
 function buildRow(parsed) {
   return [
-    "",                                          // A: Forwarded (checkbox — skip)
-    parsed.client,                               // B: Client Name
-    parsed.category,                             // C: Ad Type
-    parsed.datePosted,                           // D: Date
-    parsed.timeMST || "",                        // E: Time (MST)
+    "",                                               // A: Forwarded (checkbox — skip)
+    parsed.client,                                    // B: Client Name
+    parsed.category,                                  // C: Ad Type
+    parsed.datePosted,                                // D: Date
+    parsed.timeMST || "",                             // E: Time (MST)
     parsed.pageHandle ? `@${parsed.pageHandle}` : "", // F: Page
-    "",                                          // G: Bulk # (manual)
-    parsed.adPrice ? `$${parsed.adPrice}` : "",  // H: Page Ad Price
-    "",                                          // I: Status (manual)
-    "",                                          // J: Views (manual)
-    parsed.nif || "",                            // K: NIF
+    parsed.bulkNum || "",                             // G: Bulk # (e.g. "11/15")
+    parsed.adPrice ? `$${parsed.adPrice}` : "",       // H: Page Ad Price
+    "Scheduled",                                      // I: Status — default on insert
+    "",                                               // J: Views (filled manually later)
+    parsed.nif || "",                                 // K: NIF
   ];
 }
 
@@ -64,6 +64,25 @@ async function handleAdMessage(ctx) {
 
     const text = ctx.message?.text || ctx.message?.caption;
     if (!text) return;
+
+    // ── "Posted on" reply → flip matching rows from Scheduled → Live ───────────
+    if (/^posted on\b/i.test(text.trim())) {
+      const handles = text.split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l.startsWith("@"))
+        .map((l) => l.match(/^@([\w.]+)/)?.[1])
+        .filter(Boolean);
+
+      if (handles.length > 0 && MASTER_SHEET_ID) {
+        try {
+          const updated = await updateStatusToLive(MASTER_SHEET_ID, TAB_NAME, handles);
+          console.log(`[adHandler] ✅ "Posted on" — marked ${updated} row(s) as Live`);
+        } catch (err) {
+          console.error(`[adHandler] ❌ "Posted on" update error: ${err.message}`);
+        }
+      }
+      return;
+    }
 
     const date   = ctx.message?.date ? new Date(ctx.message.date * 1000) : new Date();
     const parsed = parseAdMessage(text, date);
