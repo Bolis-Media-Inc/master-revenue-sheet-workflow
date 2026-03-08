@@ -73,4 +73,84 @@ async function appendRow(spreadsheetId, tabName, rowValues) {
   });
 }
 
-module.exports = { appendRow };
+/**
+ * Get the date value from the last populated row in column D (Date column).
+ * Returns a normalised date string like "Fri 3/6/26", or null if not found.
+ */
+async function getLastDate(spreadsheetId, tabName) {
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: "v4", auth: client });
+
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `${tabName}!D:D`,
+  });
+
+  const values = response.data.values || [];
+  for (let i = values.length - 1; i >= 0; i--) {
+    const val = values[i]?.[0]?.trim();
+    if (val) return val.replace(/,/g, "").trim(); // normalise "Fri, 3/6/26" → "Fri 3/6/26"
+  }
+  return null;
+}
+
+/**
+ * Append a black separator row (used to mark the start of a new day).
+ */
+async function appendSeparatorRow(spreadsheetId, tabName) {
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: "v4", auth: client });
+
+  // Append 11 empty cells — enough to anchor the row in the table
+  const appendResult = await sheets.spreadsheets.values.append({
+    spreadsheetId,
+    range: tabName,
+    valueInputOption: "USER_ENTERED",
+    insertDataOption: "OVERWRITE",
+    requestBody: { values: [["", "", "", "", "", "", "", "", "", "", ""]] },
+  });
+
+  // Parse the row number from the updatedRange e.g. "'2026 Ad Overview'!A3129:K3129"
+  const updatedRange = appendResult.data.updates?.updatedRange || "";
+  const rowMatch     = updatedRange.match(/[A-Z](\d+):/);
+  if (!rowMatch) return;
+
+  const rowIndex = parseInt(rowMatch[1]) - 1; // 0-indexed
+
+  // Resolve the sheetId (numeric) for the target tab
+  const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId });
+  const sheet = spreadsheet.data.sheets?.find(
+    (s) => s.properties.title === tabName
+  );
+  if (!sheet) return;
+
+  const sheetId = sheet.properties.sheetId;
+
+  // Paint the entire row black
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: [{
+        repeatCell: {
+          range: {
+            sheetId,
+            startRowIndex: rowIndex,
+            endRowIndex:   rowIndex + 1,
+            startColumnIndex: 0,
+            endColumnIndex:   26, // A–Z, covers all columns
+          },
+          cell: {
+            userEnteredFormat: {
+              backgroundColor: { red: 0, green: 0, blue: 0 },
+            },
+          },
+          fields: "userEnteredFormat.backgroundColor",
+        },
+      }],
+    },
+  });
+}
+
+module.exports = { appendRow, getLastDate, appendSeparatorRow };

@@ -11,7 +11,7 @@
  */
 
 const { parseAdMessage }  = require("../parser");
-const { appendRow }       = require("../sheets");
+const { appendRow, getLastDate, appendSeparatorRow } = require("../sheets");
 const pages               = require("../config/pages.json");
 
 const TARGET_CHAT_ID  = process.env.TARGET_CHAT_ID;
@@ -83,6 +83,19 @@ async function handleAdMessage(ctx) {
 
     // ── Write to Master Revenue Sheet ──────────────────────────────────────────
     if (MASTER_SHEET_ID && !PLACEHOLDER_PATTERN.test(MASTER_SHEET_ID)) {
+
+      // Insert a black separator row if the date has changed since the last entry
+      try {
+        const lastDate = await getLastDate(MASTER_SHEET_ID, TAB_NAME);
+        const newDate  = parsedList[0].datePosted.replace(/,/g, "").trim();
+        if (lastDate && lastDate !== newDate) {
+          await appendSeparatorRow(MASTER_SHEET_ID, TAB_NAME);
+          console.log(`[adHandler] 📅 New day detected (${lastDate} → ${newDate}) — separator row inserted`);
+        }
+      } catch (err) {
+        console.warn(`[adHandler] ⚠️ Could not insert separator row: ${err.message}`);
+      }
+
       let successCount = 0;
       for (const item of parsedList) {
         const row = buildRow(item);
