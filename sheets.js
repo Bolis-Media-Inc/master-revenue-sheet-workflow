@@ -59,13 +59,14 @@ async function appendRow(spreadsheetId, tabName, rowValues) {
   const client = await auth.getClient();
   const sheets = google.sheets({ version: "v4", auth: client });
 
-  const range = `${tabName}!A:K`; // Columns A–K covers all revenue sheet columns
-
+  // Use the tab name only (no column constraint) so the API finds the true last row
+  // across ALL columns — avoids blank-row interleaving when the sheet has data beyond col K.
+  // OVERWRITE means "write to first empty row" without inserting/shifting existing rows.
   await sheets.spreadsheets.values.append({
     spreadsheetId,
-    range,
+    range: tabName,
     valueInputOption: "USER_ENTERED", // Lets Sheets parse dates and currency strings
-    insertDataOption: "INSERT_ROWS",
+    insertDataOption: "OVERWRITE",
     requestBody: {
       values: [rowValues],
     },

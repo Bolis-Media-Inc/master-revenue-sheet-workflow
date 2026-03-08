@@ -72,12 +72,23 @@ function parseAdMessage(text, date) {
         continue;
       }
 
-      // Single-page format: "@handle - $price"
+      // Single-page format with price: "@handle - $price"
       const singleMatch = line.match(/^@([\w.]+)\s*-\s*\$?([\d,]+(?:\.\d{1,2})?)/);
       if (singleMatch) {
         pageEntries.push({
           handle: singleMatch[1].toLowerCase(),
           price:  parseFloat(singleMatch[2].replace(/,/g, "")),
+        });
+        continue;
+      }
+
+      // Handle-only format (no price): "@handle"  e.g. Whop-style bulk ads
+      // Use the header price (adPrice) as the per-page price
+      const handleOnly = line.match(/^@([\w.]+)\s*$/);
+      if (handleOnly) {
+        pageEntries.push({
+          handle: handleOnly[1].toLowerCase(),
+          price:  adPrice,
         });
       }
     }
