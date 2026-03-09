@@ -7,19 +7,28 @@
  *  2. Build the row (matches columns in the revenue sheets)
  *  3. Append to Master Revenue Sheet (always)
  *  4. Append to the individual page's revenue sheet (if handle is known in pages.json)
- *  5. Reply with a ✅ confirmation (or stay silent if not an ad)
+ *  5. Forward the ad content + brief to each page's Telegram destination (if configured)
+ *  6. Reply with a ✅ confirmation (or stay silent if not an ad)
  */
 
-const { parseAdMessage }  = require("../parser");
+const { parseAdMessage }       = require("../parser");
 const { appendRow, getLastDate, appendSeparatorRow, updateStatusToLive } = require("../sheets");
-const pages               = require("../config/pages.json");
+const { getPrecedingMessages } = require("../messageBuffer");
+const pages                    = require("../config/pages.json");
+const destinations             = require("../config/telegram-destinations.json");
 
 const TARGET_CHAT_ID  = process.env.TARGET_CHAT_ID;
 const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
 const TAB_NAME        = process.env.SHEET_TAB_NAME || "2026 Ad Overview";
 
+// How many messages before the ad brief to grab as content (image / video / copy)
+const CONTENT_MESSAGES_TO_FORWARD = parseInt(process.env.FORWARD_PRECEDING_COUNT || "2");
+
+// Set FORWARDING_ENABLED=true in env to turn on forwarding
+const FORWARDING_ENABLED = (process.env.FORWARDING_ENABLED || "").toLowerCase() === "true";
+
 // Placeholder values that haven't been filled in yet (to skip writing to that sheet)
-const PLACEHOLDER_PATTERN = /^SHEET_ID_/;
+const PLACEHOLDER_PATTERN = /^(SHEET_ID_|TELEGRAM_CHAT_ID_)/;
 
 /**
  * Build the row array matching the Master Revenue Sheet "2026 Ad Overview" tab:
@@ -50,6 +59,42 @@ function buildRow(parsed) {
     "",                                               // J: Views (filled manually later)
     parsed.nif || "",                                 // K: NIF
   ];
+}
+
+/**
+ * Forward the ad content (preceding messages) + the ad brief itself
+ * to the Telegram destination for a single page handle.
+ *
+ * Uses forwardMessage so media + original sender info are preserved.
+ *
+ * @param {object} telegram        ctx.telegram (Telegraf Telegram instance)
+ * @param {string} sourceChatId    The group the ad came from
+ * @param {number} adMessageId     The ad brief's message_id
+ * @param {Array}  precedingMsgs   The content messages (image/video) before the ad
+ * @param {string} destChatId      Destination Telegram chat ID (page's group/DM)
+ * @param {string} pageHandle      For logging
+ */
+async function forwardToPage(telegram, sourceChatId, adMessageId, precedingMsgs, destChatId, pageHandle) {
+  const results = [];
+
+  // Forward content messages first (oldest → newest), then the ad brief
+  const messagesToForward = [...precedingMsgs, { message_id: adMessageId, _isAdBrief: true }];
+
+  for (const msg of messagesToForward) {
+    try {
+      await telegram.forwardMessage(
+        destChatId,       // to
+        sourceChatId,     // from chat
+        msg.message_id    // message to forward
+      );
+      results.push(`✅ msg ${msg.message_id}`);
+    } catch (err) {
+      results.push(`❌ msg ${msg.message_id}: ${err.message}`);
+    }
+  }
+
+  console.log(`[adHandler] Forward @${pageHandle} → ${destChatId}: ${results.join(", ")}`);
+  return results;
 }
 
 /**
@@ -174,6 +219,52 @@ async function handleAdMessage(ctx) {
       }
     }
     */
+
+    // ── Forward content + ad brief to each page's Telegram destination ─────────
+    if (FORWARDING_ENABLED && !destinations._forwarding_disabled_globally) {
+
+      const adMessageId = ctx.message.message_id;
+      const sourceChatId = chatId;
+
+      // Grab the N messages that came before this ad brief
+      const precedingMsgs = getPrecedingMessages(sourceChatId, adMessageId, CONTENT_MESSAGES_TO_FORWARD);
+      console.log(`[adHandler] 📤 Forwarding enabled — found ${precedingMsgs.length} preceding message(s) to include`);
+
+      // Deduplicate page handles (bulk ads list the same handle at most once,
+      // but let's be safe)
+      const uniqueHandles = [...new Set(parsedList.map((p) => p.pageHandle).filter(Boolean))];
+
+      let forwardOk = 0;
+      let forwardSkipped = 0;
+
+      for (const handle of uniqueHandles) {
+        const destChatId = destinations[handle];
+
+        if (!destChatId || PLACEHOLDER_PATTERN.test(String(destChatId))) {
+          console.warn(`[adHandler] ⚠️ No Telegram destination configured for @${handle} — skipping forward`);
+          forwardSkipped++;
+          continue;
+        }
+
+        try {
+          await forwardToPage(
+            ctx.telegram,
+            sourceChatId,
+            adMessageId,
+            precedingMsgs,
+            String(destChatId),
+            handle
+          );
+          forwardOk++;
+        } catch (err) {
+          console.error(`[adHandler] ❌ Forward error for @${handle}: ${err.message}`);
+        }
+      }
+
+      console.log(
+        `[adHandler] 📤 Forward summary: ${forwardOk} sent, ${forwardSkipped} skipped (no destination configured)`
+      );
+    }
 
     // ── Optional: reply in the chat with a status update ──────────────────────
     // Uncomment the block below if you want the bot to silently confirm each write.

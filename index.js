@@ -2,6 +2,7 @@ require("dotenv").config();
 const http = require("http");
 const { Telegraf } = require("telegraf");
 const { handleAdMessage } = require("./handlers/adHandler");
+const { addMessage }       = require("./messageBuffer");
 
 // ── Validate required env vars ─────────────────────────────────────────────────
 const required = ["TELEGRAM_BOT_TOKEN", "TARGET_CHAT_ID", "MASTER_SHEET_ID"];
@@ -14,8 +15,12 @@ if (missing.length) {
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
 // ── Passive listener — fires on every message ─────────────────────────────────
-// adHandler internally ignores any chat that isn't TARGET_CHAT_ID
-bot.on("message", (ctx) => handleAdMessage(ctx));
+// 1. Feed every message into the rolling buffer (needed for content forwarding)
+// 2. Run the ad handler (ignores non-ads and non-target chats internally)
+bot.on("message", (ctx) => {
+  if (ctx.message) addMessage(ctx.message);
+  handleAdMessage(ctx);
+});
 
 // ── Launch: webhook on Railway, polling locally ───────────────────────────────
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
