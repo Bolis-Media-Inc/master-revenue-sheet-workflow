@@ -13,7 +13,7 @@
 
 const { parseAdMessage }       = require("../parser");
 const { appendRow, getLastDate, appendSeparatorRow, updateStatusToLive } = require("../sheets");
-const { getPrecedingMessages } = require("../messageBuffer");
+const { getPrecedingMessages, getContentBundlesByPage, getCollabBundlesByPage } = require("../messageBuffer");
 const pages                    = require("../config/pages.json");
 const destinations             = require("../config/telegram-destinations.json");
 
@@ -260,19 +260,42 @@ async function handleAdMessage(ctx) {
     // ── Forward content + ad brief to each page's Telegram destination ─────────
     if (FORWARDING_ENABLED && !destinations._forwarding_disabled_globally) {
 
-      const adMessageId = ctx.message.message_id;
+      const adMessageId  = ctx.message.message_id;
       const sourceChatId = chatId;
 
-      // Grab the N messages that came before this ad brief
-      const precedingMsgs = getPrecedingMessages(sourceChatId, adMessageId, CONTENT_MESSAGES_TO_FORWARD);
-      console.log(`[adHandler] 📤 Forwarding enabled — found ${precedingMsgs.length} preceding message(s) to include`);
+      // ── Detect which content format this ad uses ──────────────────────────
+      //
+      // Priority 1 — Per-creative ("Thefuck.tv^" label + images per page)
+      // Priority 2 — Collab ("Host: @X, invite: @A @B" + paired video)
+      // Priority 3 — Standard (shared preceding N messages → all pages)
+      //
+      const contentBundles = getContentBundlesByPage(sourceChatId, adMessageId);
+      const collabBundles  = getCollabBundlesByPage(sourceChatId, adMessageId);
+
+      const hasLabels = contentBundles.size > 0;
+      const hasCollab = collabBundles !== null;   // null = not collab, Map = collab
+
+      let fallbackMsgs = [];
+      if (hasLabels) {
+        console.log(
+          `[adHandler] 📤 Per-creative format — ${contentBundles.size} labeled bundle(s): ` +
+          [...contentBundles.keys()].join(", ")
+        );
+      } else if (hasCollab) {
+        console.log(
+          `[adHandler] 📤 Collab format — ${collabBundles.size} page(s) mapped from Host/invite messages`
+        );
+      } else {
+        fallbackMsgs = getPrecedingMessages(sourceChatId, adMessageId, CONTENT_MESSAGES_TO_FORWARD);
+        console.log(`[adHandler] 📤 Standard format — forwarding ${fallbackMsgs.length} shared message(s) to all pages`);
+      }
 
       // Only forward for pages that are enabled AND have a configured destination
       const uniqueHandles = [...new Set(
         parsedList.map((p) => p.pageHandle).filter((h) => h && isPageEnabled(h))
       )];
 
-      let forwardOk = 0;
+      let forwardOk      = 0;
       let forwardSkipped = 0;
 
       for (const handle of uniqueHandles) {
@@ -284,12 +307,48 @@ async function handleAdMessage(ctx) {
           continue;
         }
 
+        // ── Pick the right content messages for this page ──────────────────
+        let contentMsgs;
+
+        // Helper: look up a handle in a Map, with a dot/underscore-stripped fallback
+        const lookupHandle = (map, h) => {
+          if (map.has(h)) return map.get(h);
+          const stripped = h.replace(/[._]/g, "");
+          for (const [k, v] of map) {
+            if (k.replace(/[._]/g, "") === stripped) return v;
+          }
+          return null;
+        };
+
+        if (hasLabels) {
+          // Format 1 — per-creative ("Thefuck.tv^" bundles)
+          contentMsgs = lookupHandle(contentBundles, handle);
+          if (!contentMsgs) {
+            console.warn(`[adHandler] ⚠️ No per-creative bundle for @${handle} — skipping forward`);
+            forwardSkipped++;
+            continue;
+          }
+
+        } else if (hasCollab) {
+          // Format 2 — collab ("Host: @X, invite: @A @B" + paired video)
+          contentMsgs = lookupHandle(collabBundles, handle);
+          if (!contentMsgs) {
+            console.warn(`[adHandler] ⚠️ No collab bundle for @${handle} — skipping forward`);
+            forwardSkipped++;
+            continue;
+          }
+
+        } else {
+          // Format 3 — standard (shared content forwarded to all pages)
+          contentMsgs = fallbackMsgs;
+        }
+
         try {
           await forwardToPage(
             ctx.telegram,
             sourceChatId,
             adMessageId,
-            precedingMsgs,
+            contentMsgs,
             String(destChatId),
             handle
           );
@@ -300,7 +359,7 @@ async function handleAdMessage(ctx) {
       }
 
       console.log(
-        `[adHandler] 📤 Forward summary: ${forwardOk} sent, ${forwardSkipped} skipped (no destination configured)`
+        `[adHandler] 📤 Forward summary: ${forwardOk} sent, ${forwardSkipped} skipped`
       );
     }
 
