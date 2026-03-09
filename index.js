@@ -1,4 +1,12 @@
 require("dotenv").config();
+
+// ── Cleanup mode — set CLEANUP_MODE=true in Railway env vars, redeploy,
+// watch the logs, then remove the var and redeploy again to restore normal operation.
+if (process.env.CLEANUP_MODE === "true") {
+  require("./cleanup-bad-rows").runCleanup().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); });
+  return;
+}
+
 const http = require("http");
 const { Telegraf } = require("telegraf");
 const { handleAdMessage } = require("./handlers/adHandler");

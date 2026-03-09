@@ -6,10 +6,9 @@
  *    are missing Client Name (col B), Date (col D), and Price (col H).
  *  - Blank rows sitting between those bad rows (from the runaway separator inserts).
  *
- * Run with:   railway run node cleanup-bad-rows.js
- * Or locally: node cleanup-bad-rows.js  (requires .env with credentials)
- *
- * SAFE — prints a preview first and asks you to confirm before deleting.
+ * Run via Railway env var:  set CLEANUP_MODE=true, redeploy, check logs, remove var, redeploy.
+ * Run with railway CLI:     railway run node cleanup-bad-rows.js
+ * Run locally:              node cleanup-bad-rows.js  (requires .env with credentials)
  */
 
 require("dotenv").config();
@@ -18,6 +17,9 @@ const readline = require("readline");
 
 const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
 const TAB_NAME        = process.env.SHEET_TAB_NAME || "2026 Ad Overview";
+
+// When called from index.js via CLEANUP_MODE, skip the interactive confirmation
+const AUTO_CONFIRM = process.env.CLEANUP_MODE === "true";
 
 if (!MASTER_SHEET_ID || !process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
   console.error("❌ MASTER_SHEET_ID and GOOGLE_SERVICE_ACCOUNT_JSON must be set");
@@ -105,17 +107,21 @@ async function main() {
   }
 
   // ── Step 5: Confirm ────────────────────────────────────────────────────────
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  await new Promise((resolve) => {
-    rl.question(`\nDelete these ${badRowIndices.length} rows? Type YES to confirm: `, (answer) => {
-      rl.close();
-      if (answer.trim().toUpperCase() !== "YES") {
-        console.log("Aborted.");
-        process.exit(0);
-      }
-      resolve();
+  if (AUTO_CONFIRM) {
+    console.log("CLEANUP_MODE=true — auto-confirming deletion.");
+  } else {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    await new Promise((resolve) => {
+      rl.question(`\nDelete these ${badRowIndices.length} rows? Type YES to confirm: `, (answer) => {
+        rl.close();
+        if (answer.trim().toUpperCase() !== "YES") {
+          console.log("Aborted.");
+          process.exit(0);
+        }
+        resolve();
+      });
     });
-  });
+  }
 
   // ── Step 6: Delete rows in reverse order (so indices stay valid) ───────────
   // Build deletion requests. Google Sheets API requires ranges to be
@@ -160,7 +166,13 @@ async function main() {
   console.log(`✅ Done! Deleted ${badRowIndices.length} bad rows from "${TAB_NAME}".`);
 }
 
-main().catch((err) => {
-  console.error("Error:", err.message);
-  process.exit(1);
-});
+// Export for use via CLEANUP_MODE in index.js
+module.exports = { runCleanup: main };
+
+// Also runnable directly
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("Error:", err.message);
+    process.exit(1);
+  });
+}
