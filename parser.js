@@ -95,10 +95,13 @@ function parseAdMessage(text, date) {
     }
   }
 
-  // Fallback: scan whole message for "@handle - $price" if PAGE INFO had none
+  // Fallback: scan whole message for "@handle - $price" if PAGE INFO had none.
+  // Only looks at lines AFTER the PAGE INFO section (or whole message if no PAGE INFO found)
+  // to avoid accidentally picking up admin handles listed near the top.
   if (pageEntries.length === 0) {
-    for (const line of lines) {
-      const m = line.match(/^@([\w.]+)\s*-\s*\$?([\d,]+)/);
+    const scanStart = pageInfoIdx !== -1 ? pageInfoIdx + 1 : 0;
+    for (let i = scanStart; i < lines.length; i++) {
+      const m = lines[i].match(/^@([\w.]+)\s*-\s*\$?([\d,]+)/);
       if (m) { pageEntries.push({ handle: m[1].toLowerCase(), price: parseFloat(m[2].replace(/,/g, "")) }); break; }
     }
   }

@@ -54,7 +54,7 @@ function buildRow(parsed) {
     parsed.timeMST || "",                             // E: Time (MST)
     parsed.pageHandle ? `@${parsed.pageHandle}` : "", // F: Page
     parsed.bulkNum || "",                             // G: Bulk # (e.g. "11/15")
-    parsed.adPrice ? `$${parsed.adPrice}` : "",       // H: Page Ad Price
+    parsed.adPrice != null ? `$${parsed.adPrice}` : "", // H: Page Ad Price ($0 is valid)
     "Scheduled",                                      // I: Status — default on insert
     "",                                               // J: Views (filled manually later)
     parsed.nif || "",                                 // K: NIF
