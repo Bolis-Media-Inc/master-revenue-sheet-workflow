@@ -53,9 +53,8 @@ const PLACEHOLDER_PATTERN = /^(SHEET_ID_|TELEGRAM_CHAT_ID_)/;
  *  D: Date Posted  — e.g. "Mon 3/9/26"
  *  E: Post Type    — Reels / Carousel / Story / Feed (from INSTRUCTIONS)
  *  F: Post Duration — Permanent / 24hr / 1hr NIF etc. (from INSTRUCTIONS)
- *  G: (blank)
- *  H: Ad Price     — "$500"
- *  I: Notes        — (blank — filled manually)
+ *  G: Ad Price     — "$500"
+ *  H: Notes        — (blank — filled manually)
  */
 function buildPageRow(parsed) {
   return [
@@ -65,9 +64,8 @@ function buildPageRow(parsed) {
     parsed.datePosted    || "",  // D: Date Posted
     parsed.postType      || "",  // E: Post Type (Reels, Carousel, etc.)
     parsed.nif           || "",  // F: Post Duration (Permanent, 24hr, etc.)
-    "",                          // G: blank
-    parsed.adPrice != null ? `$${parsed.adPrice}` : "", // H: Ad Price
-    "",                          // I: Notes
+    parsed.adPrice != null ? `$${parsed.adPrice}` : "", // G: Ad Price
+    "",                          // H: Notes
   ];
 }
 
