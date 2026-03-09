@@ -19,13 +19,26 @@ const destinations             = require("../config/telegram-destinations.json")
 
 const TARGET_CHAT_ID  = process.env.TARGET_CHAT_ID;
 const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
-const TAB_NAME        = process.env.SHEET_TAB_NAME || "2026 Ad Overview";
+const TAB_NAME        = process.env.SHEET_TAB_NAME      || "2026 Ad Overview";
+const PAGE_TAB_NAME   = process.env.PAGE_SHEET_TAB_NAME || "IG Revenue Tracker";
 
 // How many messages before the ad brief to grab as content (image / video / copy)
 const CONTENT_MESSAGES_TO_FORWARD = parseInt(process.env.FORWARD_PRECEDING_COUNT || "2");
 
 // Set FORWARDING_ENABLED=true in env to turn on forwarding
 const FORWARDING_ENABLED = (process.env.FORWARDING_ENABLED || "").toLowerCase() === "true";
+
+// Comma-separated list of page handles to enable individual sheet writes + forwarding for.
+// e.g. ENABLED_PAGES=artistswithoutautotune
+// Leave empty / unset to disable all individual page writes (master sheet only).
+// Set to "*" to enable for all pages.
+const ENABLED_PAGES_RAW = process.env.ENABLED_PAGES || "";
+const ENABLED_PAGES_ALL = ENABLED_PAGES_RAW.trim() === "*";
+const ENABLED_PAGES_SET = new Set(
+  ENABLED_PAGES_RAW.split(",").map((h) => h.trim().toLowerCase().replace(/^@/, "")).filter(Boolean)
+);
+const isPageEnabled = (handle) =>
+  handle && (ENABLED_PAGES_ALL || ENABLED_PAGES_SET.has(handle.toLowerCase()));
 
 // Placeholder values that haven't been filled in yet (to skip writing to that sheet)
 const PLACEHOLDER_PATTERN = /^(SHEET_ID_|TELEGRAM_CHAT_ID_)/;
@@ -191,34 +204,32 @@ async function handleAdMessage(ctx) {
 
     const results = [];
 
-    // ── Write to individual page revenue sheet ─────────────────────────────────
-    // 🚧 DISABLED during A/B test phase — master sheet only for now.
-    // Re-enable once master sheet output is validated against the manual process.
-    /*
-    if (parsed.pageHandle) {
-      const sheetId = pages[parsed.pageHandle];
+    // ── Write to individual page revenue sheet ────────────────────────────────
+    // Gated by ENABLED_PAGES env var — only runs for explicitly enabled handles.
+    // Set ENABLED_PAGES=artistswithoutautotune to start; expand as validated.
+    // Set ENABLED_PAGES=* to enable for all pages.
+    let pageSheetCount = 0;
+    for (const item of parsedList) {
+      if (!item.pageHandle || !isPageEnabled(item.pageHandle)) continue;
 
-      if (sheetId && !PLACEHOLDER_PATTERN.test(sheetId)) {
-        try {
-          await appendRow(sheetId, TAB_NAME, row);
-          results.push(`✅ @${parsed.pageHandle} sheet`);
-        } catch (err) {
-          console.error(
-            `[adHandler] Individual sheet write error for @${parsed.pageHandle}: ${err.message}`
-          );
-          results.push(`❌ @${parsed.pageHandle} sheet (error — check share permissions)`);
-        }
-      } else if (!sheetId) {
-        console.warn(
-          `[adHandler] No sheet ID mapped for @${parsed.pageHandle}. Add it to config/pages.json.`
-        );
-        results.push(`⚠️ @${parsed.pageHandle} (no sheet mapped — update pages.json)`);
-      } else {
-        // Has a placeholder value
-        results.push(`⚠️ @${parsed.pageHandle} (sheet ID is a placeholder — update pages.json)`);
+      const sheetId = pages[item.pageHandle];
+      if (!sheetId || PLACEHOLDER_PATTERN.test(sheetId)) {
+        console.warn(`[adHandler] ⚠️ No sheet ID for @${item.pageHandle} — add to pages.json`);
+        continue;
+      }
+
+      const row = buildRow(item);
+      try {
+        await appendRow(sheetId, PAGE_TAB_NAME, row);
+        pageSheetCount++;
+        console.log(`[adHandler] ✅ Page sheet write: @${item.pageHandle} → "${PAGE_TAB_NAME}"`);
+      } catch (err) {
+        console.error(`[adHandler] ❌ Page sheet error for @${item.pageHandle}: ${err.message}`);
       }
     }
-    */
+    if (pageSheetCount > 0) {
+      console.log(`[adHandler] ✅ Individual page sheets: wrote ${pageSheetCount} row(s)`);
+    }
 
     // ── Forward content + ad brief to each page's Telegram destination ─────────
     if (FORWARDING_ENABLED && !destinations._forwarding_disabled_globally) {
@@ -230,9 +241,10 @@ async function handleAdMessage(ctx) {
       const precedingMsgs = getPrecedingMessages(sourceChatId, adMessageId, CONTENT_MESSAGES_TO_FORWARD);
       console.log(`[adHandler] 📤 Forwarding enabled — found ${precedingMsgs.length} preceding message(s) to include`);
 
-      // Deduplicate page handles (bulk ads list the same handle at most once,
-      // but let's be safe)
-      const uniqueHandles = [...new Set(parsedList.map((p) => p.pageHandle).filter(Boolean))];
+      // Only forward for pages that are enabled AND have a configured destination
+      const uniqueHandles = [...new Set(
+        parsedList.map((p) => p.pageHandle).filter((h) => h && isPageEnabled(h))
+      )];
 
       let forwardOk = 0;
       let forwardSkipped = 0;
