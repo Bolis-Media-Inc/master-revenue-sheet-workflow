@@ -41,7 +41,7 @@
 
   "goal":                          "TELEGRAM_CHAT_ID_GOAL",
   "archivedrunway":                "TELEGRAM_CHAT_ID_ARCHIVEDRUNWAY",
-  "tonsil":                        "TELEGRAM_CHAT_ID_TONSIL",
+  "tonsil":                        "-5170307215",
   "secrets.jp":                    "TELEGRAM_CHAT_ID_SECRETSJP",
   "databases":                     "TELEGRAM_CHAT_ID_DATABASES",
   "historic":                      "TELEGRAM_CHAT_ID_HISTORIC",
