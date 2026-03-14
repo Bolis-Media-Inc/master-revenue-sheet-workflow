@@ -12,8 +12,10 @@
  */
 
 const { parseAdMessage }       = require("../parser");
-const { appendRow, updateStatusToLive } = require("../sheets");
+const { appendRow, markForwarded, updateStatusToLive, appendReminder } = require("../sheets");
 const { getPrecedingMessages, getContentBundlesByPage, getCollabBundlesByPage, MAX_BUFFER_PER_CHAT } = require("../messageBuffer");
+const { parseNifMs, scheduleNifReminder } = require("../scheduler");
+const { parsePostDuration }    = require("../reminders");
 const pages                    = require("../config/pages.json");
 const destinations             = require("../config/telegram-destinations.json");
 
@@ -202,14 +204,18 @@ async function handleAdMessage(ctx) {
     );
 
     // ── Write to Master Revenue Sheet ──────────────────────────────────────────
+    // masterRowByHandle: handle → 1-indexed row number (used later to tick checkbox)
+    const masterRowByHandle = new Map();
+
     if (MASTER_SHEET_ID && !PLACEHOLDER_PATTERN.test(MASTER_SHEET_ID)) {
 
       let successCount = 0;
       for (const item of parsedList) {
         const row = buildRow(item);
         try {
-          await appendRow(MASTER_SHEET_ID, TAB_NAME, row);
+          const rowNumber = await appendRow(MASTER_SHEET_ID, TAB_NAME, row);
           successCount++;
+          if (item.pageHandle && rowNumber) masterRowByHandle.set(item.pageHandle, rowNumber);
         } catch (err) {
           console.error(`[adHandler] ❌ Master sheet write error for @${item.pageHandle}: ${err.message}`);
           console.error(err.stack);
@@ -347,6 +353,39 @@ async function handleAdMessage(ctx) {
             handle
           );
           forwardOk++;
+
+          // ── Tick "Forwarded" checkbox in master sheet (column A) ────────────
+          const masterRow = masterRowByHandle.get(handle);
+          if (MASTER_SHEET_ID && masterRow) {
+            markForwarded(MASTER_SHEET_ID, TAB_NAME, masterRow).catch((err) =>
+              console.error(`[adHandler] ❌ markForwarded error for @${handle}: ${err.message}`)
+            );
+          }
+
+          // ── NIF expiration reminder (in-process setTimeout) ──────────────────
+          const item    = parsedList.find((p) => p.pageHandle === handle);
+          const nifMs   = parseNifMs(item?.nif);
+          if (nifMs) {
+            scheduleNifReminder(ctx.telegram, String(destChatId), item.client, handle, nifMs);
+          }
+
+          // ── Post expiry / analytics reminder (persisted to Reminders sheet) ──
+          if (MASTER_SHEET_ID && item) {
+            const postDur = parsePostDuration(item.nif);
+            if (postDur) {
+              const dueAt = new Date(Date.now() + postDur.ms).toISOString();
+              appendReminder(MASTER_SHEET_ID, {
+                handle,
+                client:     item.client,
+                destChatId: String(destChatId),
+                type:       postDur.type,
+                dueAt,
+              }).catch((err) =>
+                console.error(`[adHandler] ❌ appendReminder error for @${handle}: ${err.message}`)
+              );
+            }
+          }
+
         } catch (err) {
           console.error(`[adHandler] ❌ Forward error for @${handle}: ${err.message}`);
         }

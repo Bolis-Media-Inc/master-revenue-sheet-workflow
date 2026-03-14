@@ -54,6 +54,10 @@ function getAuth() {
  * @param {string} tabName         Tab name, e.g. "IG Revenue Tracker"
  * @param {any[]}  rowValues       Array of cell values in column order
  */
+/**
+ * Append a single row and return the 1-indexed row number that was written.
+ * Returns null if the row number can't be determined from the API response.
+ */
 async function appendRow(spreadsheetId, tabName, rowValues) {
   const auth   = getAuth();
   const client = await auth.getClient();
@@ -62,7 +66,7 @@ async function appendRow(spreadsheetId, tabName, rowValues) {
   // A:K constrains the "find last row" lookup to columns A–K only.
   // OVERWRITE means "write to the next empty row" without inserting/shifting rows —
   // this prevents blank-row interleaving when the sheet has data beyond column K.
-  await sheets.spreadsheets.values.append({
+  const result = await sheets.spreadsheets.values.append({
     spreadsheetId,
     range: `${tabName}!A:K`,
     valueInputOption: "USER_ENTERED", // Lets Sheets parse dates and currency strings
@@ -70,6 +74,29 @@ async function appendRow(spreadsheetId, tabName, rowValues) {
     requestBody: {
       values: [rowValues],
     },
+  });
+
+  // Parse row number from updatedRange e.g. "'2026 Ad Overview'!A245:K245"
+  const updatedRange = result.data.updates?.updatedRange || "";
+  const rowMatch     = updatedRange.match(/[A-Z](\d+):/);
+  return rowMatch ? parseInt(rowMatch[1]) : null;
+}
+
+/**
+ * Tick the "Forwarded" checkbox (column A) for the given 1-indexed row
+ * in the master sheet. Column A is a checkbox — writing TRUE checks it.
+ */
+async function markForwarded(spreadsheetId, tabName, rowNumber) {
+  if (!rowNumber) return;
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: "v4", auth: client });
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range:           `${tabName}!A${rowNumber}`,
+    valueInputOption: "USER_ENTERED",
+    requestBody:     { values: [["TRUE"]] },
   });
 }
 
@@ -357,4 +384,115 @@ async function deleteAdRows(spreadsheetId, tabName, pageHandles, clientName, isM
   return rowsToDelete.length;
 }
 
-module.exports = { appendRow, getLastDate, appendSeparatorRow, updateStatusToLive, updateAdPrice, deleteAdRows };
+// ── Reminders tab helpers ─────────────────────────────────────────────────────
+// Schema (columns A–F):
+//   A: page handle   B: client   C: destChatId   D: type (permanent|timed)
+//   E: dueAt (ISO)   F: sent (FALSE/TRUE)
+
+const REMINDERS_TAB = "Reminders";
+
+/**
+ * Ensure the Reminders tab exists in the master sheet. Creates it if missing.
+ */
+async function ensureRemindersTab(spreadsheetId) {
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: "v4", auth: client });
+
+  const meta = await sheets.spreadsheets.get({ spreadsheetId });
+  const exists = meta.data.sheets?.some((s) => s.properties.title === REMINDERS_TAB);
+  if (exists) return;
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: [{ addSheet: { properties: { title: REMINDERS_TAB } } }],
+    },
+  });
+  console.log(`[sheets] Created "${REMINDERS_TAB}" tab`);
+}
+
+/**
+ * Append a reminder record to the Reminders tab.
+ * @param {string} spreadsheetId  Master sheet ID
+ * @param {{ handle, client, destChatId, type, dueAt }} reminder
+ */
+async function appendReminder(spreadsheetId, reminder) {
+  await ensureRemindersTab(spreadsheetId);
+
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: "v4", auth: client });
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId,
+    range:            `${REMINDERS_TAB}!A:F`,
+    valueInputOption: "USER_ENTERED",
+    insertDataOption: "OVERWRITE",
+    requestBody: {
+      values: [[
+        reminder.handle,
+        reminder.client,
+        reminder.destChatId,
+        reminder.type,
+        reminder.dueAt,
+        "FALSE",
+      ]],
+    },
+  });
+}
+
+/**
+ * Read all pending (unsent) reminders whose dueAt is in the past.
+ * Returns array of { rowNumber, handle, client, destChatId, type }
+ */
+async function getPendingReminders(spreadsheetId) {
+  await ensureRemindersTab(spreadsheetId);
+
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: "v4", auth: client });
+
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `${REMINDERS_TAB}!A:F`,
+  });
+
+  const rows = response.data.values || [];
+  const now  = Date.now();
+  const due  = [];
+
+  for (let i = 0; i < rows.length; i++) {
+    const [handle, client_, destChatId, type, dueAt, sent] = rows[i];
+    if (!handle || sent === "TRUE") continue;
+    const dueMs = new Date(dueAt).getTime();
+    if (!isNaN(dueMs) && dueMs <= now) {
+      due.push({ rowNumber: i + 1, handle, client: client_, destChatId, type });
+    }
+  }
+
+  return due;
+}
+
+/**
+ * Mark a reminder row as sent (set column F = TRUE).
+ */
+async function markReminderSent(spreadsheetId, rowNumber) {
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: "v4", auth: client });
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range:            `${REMINDERS_TAB}!F${rowNumber}`,
+    valueInputOption: "USER_ENTERED",
+    requestBody:      { values: [["TRUE"]] },
+  });
+}
+
+module.exports = {
+  appendRow, markForwarded,
+  getLastDate, appendSeparatorRow,
+  updateStatusToLive, updateAdPrice, deleteAdRows,
+  appendReminder, getPendingReminders, markReminderSent,
+};

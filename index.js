@@ -8,10 +8,12 @@ if (process.env.CLEANUP_MODE === "true") {
 }
 
 const http = require("http");
+const cron = require("node-cron");
 const { Telegraf } = require("telegraf");
-const { handleAdMessage }   = require("./handlers/adHandler");
+const { handleAdMessage }    = require("./handlers/adHandler");
 const { handleAuditCommand } = require("./handlers/auditHandler");
 const { addMessage }         = require("./messageBuffer");
+const { checkAndFireReminders } = require("./reminders");
 
 // ── Validate required env vars ─────────────────────────────────────────────────
 const required = ["TELEGRAM_BOT_TOKEN", "TARGET_CHAT_ID", "MASTER_SHEET_ID"];
@@ -30,6 +32,15 @@ bot.on("message", (ctx) => {
   if (ctx.message) addMessage(ctx.message);
   handleAuditCommand(ctx); // reply-based audit commands (price update / takedown / creative update)
   handleAdMessage(ctx);    // new ad detection + sheet logging + forwarding
+});
+
+// ── Persistent reminders — poll every 15 minutes ─────────────────────────────
+// Fires overdue post-expiry / analytics check-in reminders stored in the
+// "Reminders" tab on the master sheet (survives Railway restarts).
+cron.schedule("*/15 * * * *", () => {
+  checkAndFireReminders(bot.telegram).catch((err) =>
+    console.error("[cron] reminders error:", err.message)
+  );
 });
 
 // ── Launch: webhook on Railway, polling locally ───────────────────────────────
