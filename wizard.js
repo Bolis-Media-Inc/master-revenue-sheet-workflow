@@ -113,6 +113,15 @@ function nextStep(from, session) {
   return i >= 0 && i < STEPS.length - 1 ? STEPS[i + 1] : "preview";
 }
 
+function prevStep(from, session) {
+  if (from === "pageprices") return "pages";
+  if (from === "format" && session?.answers?.priceMode === "per-page") return "pageprices";
+  // postType follows price in per-page mode
+  if (from === "postType" && session?.answers?.priceMode === "per-page") return "price";
+  const i = STEPS.indexOf(from);
+  return i > 0 ? STEPS[i - 1] : "client";
+}
+
 // ── Summary ───────────────────────────────────────────────────────────────────
 
 function renderSummary(a) {
@@ -158,34 +167,42 @@ function buildKeyboard(step) {
       return Markup.inlineKeyboard(rows);
     }
     case "campaignRef":
-      return Markup.inlineKeyboard([[b("⏭️  Skip — no ref", "a:skipCampaignRef")]]);
+      return Markup.inlineKeyboard([
+        [b("⏭️  Skip — no ref", "a:skipCampaignRef")],
+        [b("← Back", "a:back")],
+      ]);
 
     case "adType":
       return Markup.inlineKeyboard([
         [b("Affiliate",    "f:adType:Affiliate"),    b("E-Com",        "f:adType:E-Com")],
         [b("Info Product", "f:adType:Info Product"), b("Music",        "f:adType:Music")],
         [b("✏️  Custom",   "c:adType")],
+        [b("← Back", "a:back")],
       ]);
     case "price":
       return Markup.inlineKeyboard([
         [b("$0",   "f:price:0"),   b("$250", "f:price:250"), b("$500",  "f:price:500")],
         [b("$750", "f:price:750"), b("$1000","f:price:1000"), b("✏️  Custom", "c:price")],
         [b("📋  Different per page", "a:perPageMode")],
+        [b("← Back", "a:back")],
       ]);
     case "postType":
       return Markup.inlineKeyboard([
         [b("Reels",   "f:postType:Reels"),   b("Carousel", "f:postType:Carousel")],
         [b("Story",   "f:postType:Story"),   b("Feed",     "f:postType:Feed")],
+        [b("← Back", "a:back")],
       ]);
     case "duration":
       return Markup.inlineKeyboard([
         [b("Permanent", "f:duration:Permanent"), b("24hr", "f:duration:24hr"), b("48hr", "f:duration:48hr")],
         [b("✏️  Custom", "c:duration")],
+        [b("← Back", "a:back")],
       ]);
     case "nif":
       return Markup.inlineKeyboard([
         [b("No NIF", "f:nif:none"), b("15min", "f:nif:15min NIF"), b("30min", "f:nif:30min NIF")],
         [b("1hr",  "f:nif:1hr NIF"), b("2hr", "f:nif:2hr NIF"), b("✏️  Custom", "c:nif")],
+        [b("← Back", "a:back")],
       ]);
     case "time": {
       const slots = getAZTimeSlots();
@@ -197,17 +214,23 @@ function buildKeyboard(step) {
         rows.push(row);
       }
       rows.push([b("✏️  Custom time", "c:time")]);
+      rows.push([b("← Back", "a:back")]);
       return Markup.inlineKeyboard(rows);
     }
     case "format":
       return Markup.inlineKeyboard([
         [b("Standard", "f:format:Standard"), b("Per-creative", "f:format:Per-creative"), b("Collab", "f:format:Collab")],
+        [b("← Back", "a:back")],
       ]);
     case "caption":
-      return Markup.inlineKeyboard([[b("⏭️  Skip — no caption", "a:skipCaption")]]);
+      return Markup.inlineKeyboard([
+        [b("⏭️  Skip — no caption", "a:skipCaption")],
+        [b("← Back", "a:back")],
+      ]);
     case "preview":
       return Markup.inlineKeyboard([
         [b("✅  Post it", "a:post"), b("✏️  Edit", "a:edit"), b("🗑️  Cancel", "a:cancel")],
+        [b("← Back", "a:back")],
       ]);
     default:
       return null;
@@ -257,6 +280,7 @@ function renderPagePricesStep(session) {
         [b("$0",   "pp:0"),   b("$100",  "pp:100"),  b("$200", "pp:200")],
         [b("$250", "pp:250"), b("$300",  "pp:300"),  b("$400", "pp:400")],
         [b("$500", "pp:500"), b("$750",  "pp:750"),  b("✏️  Custom", "c:pageprice")],
+        [b("← Back", "a:back")],
       ]),
     };
   }
@@ -267,7 +291,10 @@ function renderPagePricesStep(session) {
       text: `📋 *New Ad Brief*\n\n${sum}\n\n📋  *Bulk slot for @${handle}?*  (${idx + 1} / ${pages.length})\n` +
             `_e.g. 9/15 · or skip if not a bulk campaign_\n` +
             `${pp?.price !== undefined ? `Price: $${pp.price}` : ""}`,
-      keyboard: Markup.inlineKeyboard([[b("⏭️  Skip bulk #", "pp:skipbulk")]]),
+      keyboard: Markup.inlineKeyboard([
+        [b("⏭️  Skip bulk #", "pp:skipbulk")],
+        [b("← Back", "a:back")],
+      ]),
     };
   }
 
@@ -531,6 +558,18 @@ bot.on("callback_query", async (ctx) => {
       await ctx.telegram.editMessageText(
         session.chatId, session.wizardMsgId, undefined, "🗑️ Brief cancelled."
       );
+      return;
+    }
+    if (action === "back") {
+      session.awaitingCustom = null;
+      const cur = session.step;
+      session.step = prevStep(cur, session);
+      // If going back into per-page pricing, reset to last page/phase
+      if (session.step === "pageprices") {
+        session.answers.pagePriceIdx   = Math.max(0, session.answers.pages.length - 1);
+        session.answers.pagePricePhase = "price";
+      }
+      await updateWizard(ctx.telegram, session);
       return;
     }
     if (action === "edit") {
