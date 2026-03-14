@@ -16,6 +16,8 @@
  */
 
 require("dotenv").config();
+const fs              = require("fs");
+const path            = require("path");
 const { Telegraf, Markup } = require("telegraf");
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -30,6 +32,15 @@ if (!TARGET_CHAT)   { console.error("❌  WIZARD_TARGET_CHAT_ID not set");  proc
 
 let KNOWN_CLIENTS = [];
 try { KNOWN_CLIENTS = require("./config/clients.json"); } catch (_) {}
+
+const BULKS_PATH = path.join(__dirname, "config", "bulks.json");
+let KNOWN_BULKS = [];
+try { KNOWN_BULKS = JSON.parse(fs.readFileSync(BULKS_PATH, "utf8")); } catch (_) {}
+
+/** Persist updated lastRefNum back to bulks.json (best-effort, ephemeral between deploys). */
+function saveBulks() {
+  try { fs.writeFileSync(BULKS_PATH, JSON.stringify(KNOWN_BULKS, null, 2)); } catch (_) {}
+}
 
 const bot = new Telegraf(WIZARD_TOKEN);
 
@@ -540,6 +551,26 @@ bot.command("new", async (ctx) => {
   sessions.set(ctx.from.id, session);
 });
 
+// ── /newbulk — pick a saved bulk template ─────────────────────────────────────
+
+bot.command("newbulk", async (ctx) => {
+  if (!KNOWN_BULKS.length) {
+    return ctx.reply(
+      "📦 No bulk templates configured yet.\nEdit *config/bulks.json* to add some.",
+      { parse_mode: "Markdown" }
+    );
+  }
+  const keyboard = Markup.inlineKeyboard(
+    KNOWN_BULKS.map((t) => [b(t.name, `blk:${t.id}`)])
+  );
+  const session = freshSession(ctx.chat.id);
+  const msg = await ctx.reply("📦 *Which bulk campaign?*", {
+    parse_mode: "Markdown", ...keyboard,
+  });
+  session.wizardMsgId = msg.message_id;
+  sessions.set(ctx.from.id, session);
+});
+
 // ── Callback queries ──────────────────────────────────────────────────────────
 
 bot.on("callback_query", async (ctx) => {
@@ -581,6 +612,16 @@ bot.on("callback_query", async (ctx) => {
       try {
         await postToGroup(ctx.telegram, session);
         const brief = buildBrief(session.answers);
+
+        // ── Increment bulk counter (persisted in-process; resets on redeploy) ──
+        if (session._bulkTemplateId) {
+          const bidx = KNOWN_BULKS.findIndex((t) => t.id === session._bulkTemplateId);
+          if (bidx >= 0) {
+            KNOWN_BULKS[bidx].lastRefNum = (KNOWN_BULKS[bidx].lastRefNum || 0) + 1;
+            saveBulks();
+          }
+        }
+
         sessions.delete(ctx.from.id);
         await ctx.telegram.editMessageText(
           session.chatId, session.wizardMsgId, undefined,
@@ -675,6 +716,44 @@ bot.on("callback_query", async (ctx) => {
       content.collabVideoIdx++;
       if (content.collabVideoIdx >= content.collabGroups.length) session.step = "preview";
     }
+    await updateWizard(ctx.telegram, session);
+    return;
+  }
+
+  // ── Bulk template selection ───────────────────────────────────────────────
+  if (data.startsWith("blk:")) {
+    const id       = data.slice(4);
+    const template = KNOWN_BULKS.find((t) => t.id === id);
+    if (!template) return;
+
+    const nextNum = (template.lastRefNum || 0) + 1;
+    const a       = session.answers;
+
+    a.client      = template.client    || null;
+    a.campaignRef = template.refPrefix ? `${template.refPrefix} ${nextNum}` : null;
+    a.adType      = template.adType    || null;
+    a.postType    = template.postType  || null;
+    a.duration    = template.duration  || null;
+    a.nif         = template.nif       || null;
+    a.priceMode   = template.priceMode || "same";
+    a.format      = template.format    || null;
+    a.pages       = [...(template.pages || [])];
+    a.perPagePrices = JSON.parse(JSON.stringify(template.perPagePrices || {}));
+
+    // Compute header price as sum of per-page prices
+    if (a.priceMode === "per-page") {
+      const total = a.pages.reduce((sum, h) => {
+        const p = parseFloat(a.perPagePrices[h]?.price || "0");
+        return sum + (isNaN(p) ? 0 : p);
+      }, 0);
+      a.price = String(total);
+    }
+
+    // Remember which template we're using (for counter increment on post)
+    session._bulkTemplateId = id;
+
+    // Everything is pre-filled — jump straight to time selection
+    session.step = "time";
     await updateWizard(ctx.telegram, session);
     return;
   }

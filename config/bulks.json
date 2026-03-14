@@ -1,0 +1,45 @@
+[
+  {
+    "id": "stake-bet-slips",
+    "name": "Stake Bet Slips",
+    "client": "Stake",
+    "refPrefix": "BET SLIP Day",
+    "lastRefNum": 0,
+    "adType": "Affiliate",
+    "postType": "Reels",
+    "duration": "Permanent",
+    "nif": "none",
+    "priceMode": "per-page",
+    "format": "Standard",
+    "pages": [
+      "dailyhumor_4u",
+      "i_have_no_memes96_v2",
+      "marvelmovies",
+      "hoodreels",
+      "thefuck.tv",
+      "psychological",
+      "scooby",
+      "oddlyhorrifying",
+      "hauntedfootage",
+      "dailyhoodposts",
+      "unforgettablesportsmoments",
+      "dopejukes",
+      "hoopsxcenter"
+    ],
+    "perPagePrices": {
+      "dailyhumor_4u":               { "price": "400", "bulk": "13/15" },
+      "i_have_no_memes96_v2":        { "price": "400", "bulk": "13/15" },
+      "marvelmovies":                { "price": "350", "bulk": "13/15" },
+      "hoodreels":                   { "price": "300", "bulk": "13/15" },
+      "thefuck.tv":                  { "price": "300", "bulk": "13/15" },
+      "psychological":               { "price": "200", "bulk": "13/15" },
+      "scooby":                      { "price": "120", "bulk": "13/15" },
+      "oddlyhorrifying":             { "price": "250", "bulk": "11/15" },
+      "hauntedfootage":              { "price": "150", "bulk": "15/15" },
+      "dailyhoodposts":              { "price": "200", "bulk": "15/15" },
+      "unforgettablesportsmoments":  { "price": "100", "bulk": "15/15" },
+      "dopejukes":                   { "price": "50",  "bulk": "15/15" },
+      "hoopsxcenter":                { "price": "50",  "bulk": "15/15" }
+    }
+  }
+]
