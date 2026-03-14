@@ -5,7 +5,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "start:wizard": "node wizard.js",
+    "dev": "nodemon index.js",
+    "dev:wizard": "nodemon wizard.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
