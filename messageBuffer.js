@@ -169,7 +169,10 @@ function getCollabBundlesByPage(chatId, adMessageId) {
   // Group messages into {video, hostMsgs[]} blocks.
   // A new block opens every time we see a video file.
   // Host messages after a video belong to that video's block.
-  const groups = []; // Array<{video: msg|null, hostMsgs: [{msg, handles: string[]}]}>
+  // Plain text that isn't a Host: line is treated as shared caption copy
+  // (e.g. "Now he can buy 100,000 new shirts 🥹👕") and forwarded to every page.
+  const groups      = []; // Array<{video: msg|null, hostMsgs: [{msg, handles: string[]}]}>
+  const captionMsgs = []; // Plain-text caption/promo messages shared by all pages
   let current = { video: null, hostMsgs: [] };
 
   for (const msg of preceding) {
@@ -187,18 +190,26 @@ function getCollabBundlesByPage(chatId, adMessageId) {
         const inviteHandles = (m[2].match(/@([\w.]+)/g) || [])
           .map((h) => h.slice(1).toLowerCase());
         current.hostMsgs.push({ msg, handles: [hostHandle, ...inviteHandles] });
+      } else if (text) {
+        // Plain text that isn't a Host: line — treat as shared caption/promo copy.
+        // Collect it so we can append it to every page's bundle.
+        captionMsgs.push(msg);
       }
-      // Non-host text (promo copy, hashtags, etc.) — skip silently
     }
   }
   // Flush final block
   if (current.hostMsgs.length > 0) groups.push(current);
 
-  // ── Build handle → [video?, hostMsg] map ─────────────────────────────────
+  // ── Build handle → [video?, hostMsg, ...captionMsgs] map ─────────────────
   const result = new Map();
   for (const group of groups) {
     for (const { msg: hostMsg, handles } of group.hostMsgs) {
-      const toForward = group.video ? [group.video, hostMsg] : [hostMsg];
+      // Order: video → host/invite message → caption copy (same order as the chat)
+      const toForward = [
+        ...(group.video ? [group.video] : []),
+        hostMsg,
+        ...captionMsgs,
+      ];
       for (const handle of handles) {
         result.set(handle, toForward);
       }
