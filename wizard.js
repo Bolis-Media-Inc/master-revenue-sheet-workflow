@@ -1133,6 +1133,19 @@ bot.command("deal", async (ctx) => {
   }
 });
 
+// ── /recap — trigger morning recap on demand ──────────────────────────────────
+
+bot.command("recap", async (ctx) => {
+  try {
+    await ctx.reply("🌅 Generating morning recap...");
+    await brain.sendMorningRecap();
+    await ctx.reply("✅ Recap sent to Greg+ Sales Team.");
+  } catch (err) {
+    console.error("[wizard] /recap error:", err.message);
+    await ctx.reply("Recap error: " + err.message);
+  }
+});
+
 // ── Text messages ─────────────────────────────────────────────────────────────
 
 bot.on("text", async (ctx) => {
