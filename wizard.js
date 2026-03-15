@@ -1241,28 +1241,38 @@ bot.on(["photo", "video", "document", "animation"], async (ctx) => {
 // ── /pipeline — AI-powered pipeline summary ───────────────────────────────────
 
 bot.command("pipeline", async (ctx) => {
-  const msg = await ctx.reply("🔍 Pulling pipeline...", { parse_mode: "Markdown" });
-  const summary = await brain.getPipelineSummary();
-  await ctx.telegram.editMessageText(
-    ctx.chat.id, msg.message_id, undefined,
-    `📊 *Pipeline Summary*\n\n${summary}`,
-    { parse_mode: "Markdown" }
-  );
+  try {
+    const msg = await ctx.reply("🔍 Pulling pipeline...", { parse_mode: "Markdown" });
+    const summary = await brain.getPipelineSummary();
+    await ctx.telegram.editMessageText(
+      ctx.chat.id, msg.message_id, undefined,
+      `📊 *Pipeline Summary*\n\n${summary}`,
+      { parse_mode: "Markdown" }
+    );
+  } catch (err) {
+    console.error("[wizard] /pipeline error:", err.message);
+    await ctx.reply("Pipeline error: " + err.message);
+  }
 });
 
 // ── /deal [client] — advice on a specific deal ────────────────────────────────
 
 bot.command("deal", async (ctx) => {
-  const clientName = ctx.message.text.replace(/^\/deal\s*/i, "").trim();
-  if (!clientName) {
-    return ctx.reply("Usage: /deal [client name]");
+  try {
+    const clientName = ctx.message.text.replace(/^\/deal\s*/i, "").trim();
+    if (!clientName) {
+      return ctx.reply("Usage: /deal [client name]");
+    }
+    const msg = await ctx.reply(`🔍 Analyzing deal for "${clientName}"...`);
+    const advice = await brain.getDealAdvice(clientName);
+    await ctx.telegram.editMessageText(
+      ctx.chat.id, msg.message_id, undefined,
+      advice, { parse_mode: "Markdown" }
+    );
+  } catch (err) {
+    console.error("[wizard] /deal error:", err.message);
+    await ctx.reply("Pipeline error: " + err.message);
   }
-  const msg = await ctx.reply(`🔍 Analyzing deal for "${clientName}"...`);
-  const advice = await brain.getDealAdvice(clientName);
-  await ctx.telegram.editMessageText(
-    ctx.chat.id, msg.message_id, undefined,
-    advice, { parse_mode: "Markdown" }
-  );
 });
 
 // ── Sales intelligence startup ────────────────────────────────────────────────

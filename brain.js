@@ -66,7 +66,8 @@ Return ONLY valid JSON matching this schema:
 }
 
 Be conservative — only mark relevant=true if the message clearly relates to a sales deal, prospect, or negotiation.
-Ignore operational messages about ad posting, scheduling, content, or internal logistics.`;
+Ignore operational messages about ad posting, scheduling, content, or internal logistics.
+Respond with raw JSON only, no markdown formatting or code fences.`;
 
 async function classifyMessage(senderHandle, text) {
   try {
@@ -76,7 +77,8 @@ async function classifyMessage(senderHandle, text) {
       system: CLASSIFY_SYSTEM,
       messages: [{ role: "user", content: `Sender: @${senderHandle}\nMessage: ${text}` }],
     });
-    const raw = msg.content[0]?.text?.trim() || "{}";
+    let raw = msg.content[0]?.text?.trim() || "{}";
+    raw = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/g, '').trim();
     return JSON.parse(raw);
   } catch (e) {
     console.error("[brain] classifyMessage error:", e.message);
