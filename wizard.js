@@ -561,9 +561,8 @@ function renderMsg(session) {
 // ── Brief builder ─────────────────────────────────────────────────────────────
 
 function buildBrief(a) {
-  const clientFull = [a.client, a.campaignRef].filter(Boolean).join(" ");
-  const header     = `${clientFull} - ${a.adType} - $${a.price ?? 0}`;
-  const topTags    = [...ADMIN_HANDLES, "sales_bolismedia"].map((h) => `@${h}`).join("\n");
+  const header  = `${a.client} - ${a.adType} - $${a.price ?? 0}`;
+  const topTags = [...ADMIN_HANDLES, "sales_bolismedia"].map((h) => `@${h}`).join("\n");
 
   const instr = ["INSTRUCTIONS:", `- ${a.postType}`];
   if (a.duration === "Permanent") instr.push("- Permanent post - DO NOT DELETE");
@@ -572,16 +571,25 @@ function buildBrief(a) {
 
   const timeStr = /AZ|MST/i.test(a.time) ? a.time : `${a.time} AZ`;
 
+  // Extract just the #NUM from a campaign ref (e.g. "Bounty Post #149" → "#149")
+  const campaignNumPrefix = a.campaignRef
+    ? (a.campaignRef.match(/#\d+/)?.[0] ?? a.campaignRef)
+    : null;
+
   let pageLines;
   if (a.priceMode === "per-page") {
     pageLines = a.pages.map((h) => {
       const pp    = a.perPagePrices[h] || {};
       const price = pp.price ?? "0";
-      const bulk  = pp.bulk;
-      return bulk ? `(${bulk}) @${h} - $${price}` : `@${h} - $${price}`;
+      // Bulk slot # (13/15) takes priority; campaign #NUM is the fallback — both go in Bulk # column
+      const prefix = pp.bulk || campaignNumPrefix || null;
+      return prefix ? `(${prefix}) @${h} - $${price}` : `@${h} - $${price}`;
     }).join("\n");
   } else {
-    pageLines = a.pages.map((h) => `@${h}`).join("\n");
+    // Same price — prefix every page with campaign #NUM if set
+    pageLines = a.pages.map((h) =>
+      campaignNumPrefix ? `(${campaignNumPrefix}) @${h}` : `@${h}`
+    ).join("\n");
   }
 
   return [
