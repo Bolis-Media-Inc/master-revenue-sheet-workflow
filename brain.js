@@ -226,7 +226,14 @@ Given a list of open deals and recent sales lessons, provide:
 2. For each active deal: one concrete next action to move it forward
 3. Any patterns you see across deals
 
-Be direct, specific, and actionable. Use bullet points. Keep it under 400 words.`;
+Be direct, specific, and actionable. Keep it under 400 words.
+
+FORMATTING RULES (strict — this is for Telegram, not a web page):
+- NO markdown: no **, ##, ---, or \`backticks\`
+- Use emoji bullets: 🔥 🎯 📌 ⚠️ ✅ etc.
+- Use plain line breaks to separate sections
+- Use ALL CAPS or emoji for emphasis instead of bold/italic
+- Keep it scannable — short lines, not dense paragraphs`;
 
 async function getPipelineSummary() {
   // Pull open deals
@@ -311,7 +318,8 @@ async function getDealAdvice(clientName) {
     const msg = await anthropic.messages.create({
       model: "claude-sonnet-4-6",
       max_tokens: 500,
-      system: `You are Greg, a sales advisor for Bolis Media. Analyze this deal and give specific, actionable closing advice.`,
+      system: `You are Greg, a sales advisor for Bolis Media. Analyze this deal and give specific, actionable closing advice.
+FORMATTING: This is for Telegram. NO markdown (no **, ##, ---, backticks). Use emoji bullets and ALL CAPS for emphasis. Short lines, not paragraphs.`,
       messages: [{
         role: "user",
         content: `DEAL: ${deal.client_name} | ${deal.status}${deal.value ? ` | $${deal.value}` : ""}
@@ -395,7 +403,14 @@ async function extractNightlyLessons() {
 
 const RECAP_SYSTEM = `You are Greg, a sharp sales assistant for Bolis Media — a social media marketing agency.
 Every morning you send the team a focused daily sales recap. Be direct, specific, and motivating.
-Use clear sections with emojis. Keep it under 500 words. Make every line actionable.`;
+Keep it under 500 words. Make every line actionable.
+
+FORMATTING (strict — this is for Telegram, not a web page):
+- NO markdown: no **, ##, ---, or backticks
+- Use emoji bullets for sections and items: 🔥 🎯 📌 ⚠️ ✅ etc.
+- Use ALL CAPS for emphasis instead of bold/italic
+- Plain line breaks between sections — no horizontal rules
+- Keep lines short and scannable`;
 
 async function sendMorningRecap() {
   // Pull open deals
