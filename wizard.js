@@ -66,31 +66,35 @@ function getAZTimeSlots() {
 
 const sessions = new Map();
 
-function freshSession(chatId) {
+function freshSession(chatId, mode = "brief") {
   return {
     chatId,
     wizardMsgId:    null,
-    step:           "client",
-    awaitingCustom: null,  // field name expecting a text reply
+    mode,                  // "brief" | "template"
+    step:           mode === "template" ? "bulkName" : "client",
+    awaitingCustom: null,
+
+    // template-creation extras (mode === "template" only)
+    _bulkName:      null,
+    _bulkRefPrefix: null,
 
     answers: {
       client:      null,
-      campaignRef: null,   // optional — appended to client in header
+      campaignRef: null,
       adType:      null,
-      price:       null,   // header price; "0" for per-page mode
-      priceMode:   "same", // "same" | "per-page"
+      price:       null,
+      priceMode:   "same",
       postType:    null,
       duration:    null,
       nif:         null,
       time:        null,
       pages:       [],
       format:      null,
-      caption:     null,   // optional post caption
+      caption:     null,
 
-      // Per-page pricing
-      perPagePrices: {},   // handle → { price: string, bulk: string|null }
-      pagePriceIdx:  0,    // which page we're currently pricing
-      pagePricePhase: "price", // "price" | "bulk"
+      perPagePrices:  {},
+      pagePriceIdx:   0,
+      pagePricePhase: "price",
     },
 
     content: {
@@ -107,8 +111,8 @@ function freshSession(chatId) {
 }
 
 // ── Step order ────────────────────────────────────────────────────────────────
-// "pageprices" is conditional (not in linear array) — inserted after "pages"
-// when priceMode === "per-page".
+// "pageprices" is conditional — inserted after "pages" when priceMode === "per-page".
+// Template mode has its own step list (bulkName/bulkRefPrefix up front; no time/caption/content).
 
 const STEPS = [
   "client", "campaignRef", "adType", "price",
@@ -116,21 +120,34 @@ const STEPS = [
   "pages", "format", "caption", "content", "preview",
 ];
 
+// Template creation: skip campaignRef (replaced by bulkRefPrefix), time, caption, content.
+const TEMPLATE_STEPS = [
+  "bulkName", "bulkRefPrefix", "client", "adType", "price",
+  "postType", "duration", "nif", "pages", "format", "preview",
+];
+
 function nextStep(from, session) {
+  const isTemplate = session?.mode === "template";
+  const steps      = isTemplate ? TEMPLATE_STEPS : STEPS;
+
   if (from === "pages"      && session?.answers?.priceMode === "per-page") return "pageprices";
   if (from === "pageprices")  return "format";
   if (from === "price"      && session?.answers?.priceMode === "per-page") return "postType";
-  const i = STEPS.indexOf(from);
-  return i >= 0 && i < STEPS.length - 1 ? STEPS[i + 1] : "preview";
+
+  const i = steps.indexOf(from);
+  return i >= 0 && i < steps.length - 1 ? steps[i + 1] : "preview";
 }
 
 function prevStep(from, session) {
+  const isTemplate = session?.mode === "template";
+  const steps      = isTemplate ? TEMPLATE_STEPS : STEPS;
+
   if (from === "pageprices") return "pages";
   if (from === "format" && session?.answers?.priceMode === "per-page") return "pageprices";
-  // postType follows price in per-page mode
   if (from === "postType" && session?.answers?.priceMode === "per-page") return "price";
-  const i = STEPS.indexOf(from);
-  return i > 0 ? STEPS[i - 1] : "client";
+
+  const i = steps.indexOf(from);
+  return i > 0 ? steps[i - 1] : steps[0];
 }
 
 // ── Summary ───────────────────────────────────────────────────────────────────
@@ -164,8 +181,15 @@ function renderSummary(a) {
 
 const b = (label, data) => Markup.button.callback(label, data);
 
-function buildKeyboard(step) {
+function buildKeyboard(step, session) {
+  const isTemplate = session?.mode === "template";
   switch (step) {
+    case "bulkName":
+      return null; // text input only
+
+    case "bulkRefPrefix":
+      return Markup.inlineKeyboard([[b("⏭️  No ref prefix", "a:skipBulkRefPrefix")]]);
+
     case "client": {
       if (!KNOWN_CLIENTS.length) return null;
       const rows = [];
@@ -239,27 +263,34 @@ function buildKeyboard(step) {
         [b("← Back", "a:back")],
       ]);
     case "preview":
-      return Markup.inlineKeyboard([
-        [b("✅  Post it", "a:post"), b("✏️  Edit", "a:edit"), b("🗑️  Cancel", "a:cancel")],
-        [b("← Back", "a:back")],
-      ]);
+      return isTemplate
+        ? Markup.inlineKeyboard([
+            [b("💾  Save template", "a:saveTemplate"), b("✏️  Edit", "a:edit"), b("🗑️  Cancel", "a:cancel")],
+            [b("← Back", "a:back")],
+          ])
+        : Markup.inlineKeyboard([
+            [b("✅  Post it", "a:post"), b("✏️  Edit", "a:edit"), b("🗑️  Cancel", "a:cancel")],
+            [b("← Back", "a:back")],
+          ]);
     default:
       return null;
   }
 }
 
 const QUESTIONS = {
-  client:      KNOWN_CLIENTS.length ? "👤  *Client?*" : "👤  *Client name?*\n_Type below ↓_",
-  campaignRef: "🏷️  *Campaign reference?* _(optional)_\n_e.g. Bounty Post \\#147 · BET SLIP Day 4 · Type below ↓_",
-  adType:      "📂  *Ad type?*",
-  price:       "💰  *Price?*",
-  postType:    "🎬  *Post type?*",
-  duration:    "⏳  *Post duration?*",
-  nif:         "⏰  *NIF?*",
-  time:        "🕐  *Scheduled time?*\n_Next 12 hrs — or tap Custom for anything further out_",
-  pages:       "📄  *Which pages?*\n_Type @handles below ↓_",
-  format:      "📐  *Content format?*",
-  caption:     "💬  *Post caption?* _(optional)_\n_The copy text that goes with the post — Type below ↓ or skip_",
+  bulkName:      "📦  *Bulk template name?*\n_e.g. Stake Bet Slips · Type below ↓_",
+  bulkRefPrefix: "🏷️  *Campaign ref prefix?* _(optional)_\n_e.g. BET SLIP Day → Greg will append 1, 2, 3… each run · Type below ↓_",
+  client:        KNOWN_CLIENTS.length ? "👤  *Client?*" : "👤  *Client name?*\n_Type below ↓_",
+  campaignRef:   "🏷️  *Campaign reference?* _(optional)_\n_e.g. Bounty Post \\#147 · BET SLIP Day 4 · Type below ↓_",
+  adType:        "📂  *Ad type?*",
+  price:         "💰  *Price?*",
+  postType:      "🎬  *Post type?*",
+  duration:      "⏳  *Post duration?*",
+  nif:           "⏰  *NIF?*",
+  time:          "🕐  *Scheduled time?*\n_Next 12 hrs — or tap Custom for anything further out_",
+  pages:         "📄  *Which pages?*\n_Type @handles below ↓_",
+  format:        "📐  *Content format?*",
+  caption:       "💬  *Post caption?* _(optional)_\n_The copy text that goes with the post — Type below ↓ or skip_",
 };
 
 // ── Per-page pricing step renderer ───────────────────────────────────────────
@@ -407,13 +438,39 @@ function renderContentStep(session) {
 // ── Main message renderer ─────────────────────────────────────────────────────
 
 function renderMsg(session) {
-  const { step, answers, awaitingCustom } = session;
+  const { step, answers, awaitingCustom, mode } = session;
+  const isTemplate = mode === "template";
+  const heading    = isTemplate ? "📦 *New Bulk Template*" : "📋 *New Ad Brief*";
+
+  // ── Template-specific steps ───────────────────────────────────────────────
+  if (step === "bulkName") {
+    return {
+      text:     `${heading}\n\n📦  *Bulk template name?*\n_e.g. Stake Bet Slips · Type below ↓_`,
+      keyboard: null,
+    };
+  }
+  if (step === "bulkRefPrefix") {
+    const set = session._bulkName ? `Template: *${session._bulkName}*\n\n` : "";
+    return {
+      text:     `${heading}\n\n${set}🏷️  *Campaign ref prefix?* _(optional)_\n_e.g. BET SLIP Day  →  Greg appends 1, 2, 3… each run_\n_Type below ↓ or skip_`,
+      keyboard: buildKeyboard("bulkRefPrefix", session),
+    };
+  }
 
   if (step === "preview") {
+    if (isTemplate) {
+      const refExample = session._bulkRefPrefix
+        ? `${session._bulkRefPrefix} 1, ${session._bulkRefPrefix} 2, …`
+        : "no ref";
+      return {
+        text:     `${heading}\n\n*${session._bulkName || "Unnamed"}*\nRef: ${refExample}\n\n${renderSummary(answers)}`,
+        keyboard: buildKeyboard("preview", session),
+      };
+    }
     const brief = buildBrief(answers);
     return {
       text:     `📋 *Ad Brief — Preview*\n\n${renderSummary(answers)}\n\n\`\`\`\n${brief}\n\`\`\``,
-      keyboard: buildKeyboard("preview"),
+      keyboard: buildKeyboard("preview", session),
     };
   }
 
@@ -435,14 +492,14 @@ function renderMsg(session) {
       })(),
     };
     return {
-      text:     `📋 *New Ad Brief*\n\n${renderSummary(answers)}\n\n${prompts[awaitingCustom] || "Type below ↓"}`,
+      text:     `${heading}\n\n${renderSummary(answers)}\n\n${prompts[awaitingCustom] || "Type below ↓"}`,
       keyboard: null,
     };
   }
 
   return {
-    text:     `📋 *New Ad Brief*\n\n${renderSummary(answers)}\n\n${QUESTIONS[step] || ""}`,
-    keyboard: buildKeyboard(step),
+    text:     `${heading}\n\n${renderSummary(answers)}\n\n${QUESTIONS[step] || ""}`,
+    keyboard: buildKeyboard(step, session),
   };
 }
 
@@ -551,17 +608,31 @@ bot.command("new", async (ctx) => {
   sessions.set(ctx.from.id, session);
 });
 
-// ── /newbulk — pick a saved bulk template ─────────────────────────────────────
+// ── /newbulk — create a new bulk template ─────────────────────────────────────
 
 bot.command("newbulk", async (ctx) => {
+  const session = freshSession(ctx.chat.id, "template");
+  const { text, keyboard } = renderMsg(session);
+  const msg = await ctx.reply(text, { parse_mode: "Markdown", ...(keyboard || {}) });
+  session.wizardMsgId = msg.message_id;
+  sessions.set(ctx.from.id, session);
+});
+
+// ── /continuebulk — run an existing bulk template ─────────────────────────────
+
+bot.command("continuebulk", async (ctx) => {
   if (!KNOWN_BULKS.length) {
     return ctx.reply(
-      "📦 No bulk templates configured yet.\nEdit *config/bulks.json* to add some.",
-      { parse_mode: "Markdown" }
+      "📦 No bulk templates saved yet\\.\nUse /newbulk to create one\\.",
+      { parse_mode: "MarkdownV2" }
     );
   }
   const keyboard = Markup.inlineKeyboard(
-    KNOWN_BULKS.map((t) => [b(t.name, `blk:${t.id}`)])
+    KNOWN_BULKS.map((t) => {
+      const num = (t.lastRefNum || 0) + 1;
+      const label = t.refPrefix ? `${t.name}  ·  #${num}` : t.name;
+      return [b(label, `blk:${t.id}`)];
+    })
   );
   const session = freshSession(ctx.chat.id);
   const msg = await ctx.reply("📦 *Which bulk campaign?*", {
@@ -635,6 +706,49 @@ bot.on("callback_query", async (ctx) => {
           `❌ Failed to post: ${err.message}`
         );
       }
+      return;
+    }
+    if (action === "skipBulkRefPrefix") {
+      session._bulkRefPrefix = null;
+      session.step = nextStep("bulkRefPrefix", session);
+      await updateWizard(ctx.telegram, session);
+      return;
+    }
+    if (action === "saveTemplate") {
+      const a   = session.answers;
+      const id  = (session._bulkName || "bulk")
+        .toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
+      const existing = KNOWN_BULKS.findIndex((t) => t.id === id);
+      const template = {
+        id,
+        name:        session._bulkName || "Unnamed",
+        refPrefix:   session._bulkRefPrefix || null,
+        lastRefNum:  0,
+        client:      a.client,
+        adType:      a.adType,
+        postType:    a.postType,
+        duration:    a.duration,
+        nif:         a.nif,
+        priceMode:   a.priceMode,
+        format:      a.format,
+        pages:       [...a.pages],
+        perPagePrices: JSON.parse(JSON.stringify(a.perPagePrices)),
+      };
+      if (existing >= 0) {
+        template.lastRefNum = KNOWN_BULKS[existing].lastRefNum || 0;
+        KNOWN_BULKS[existing] = template;
+      } else {
+        KNOWN_BULKS.push(template);
+      }
+      saveBulks();
+      sessions.delete(ctx.from.id);
+      await ctx.telegram.editMessageText(
+        session.chatId, session.wizardMsgId, undefined,
+        `💾 *Bulk template saved!*\n\n*${template.name}*\n` +
+        `${template.refPrefix ? `Ref prefix: ${template.refPrefix}\n` : ""}` +
+        `${template.pages.length} pages · Use /continuebulk to run it.`,
+        { parse_mode: "Markdown" }
+      );
       return;
     }
     if (action === "skipCampaignRef") {
@@ -788,6 +902,20 @@ bot.on("text", async (ctx) => {
 
   const input = ctx.message.text.trim();
   try { await ctx.deleteMessage(); } catch (_) {}
+
+  // ── Template creation steps ───────────────────────────────────────────────
+  if (session.step === "bulkName") {
+    session._bulkName = input;
+    session.step = nextStep("bulkName", session);
+    await updateWizard(ctx.telegram, session);
+    return;
+  }
+  if (session.step === "bulkRefPrefix") {
+    session._bulkRefPrefix = input;
+    session.step = nextStep("bulkRefPrefix", session);
+    await updateWizard(ctx.telegram, session);
+    return;
+  }
 
   // ── Custom field overrides ────────────────────────────────────────────────
   if (session.awaitingCustom) {
