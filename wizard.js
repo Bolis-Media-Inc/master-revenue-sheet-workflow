@@ -131,7 +131,7 @@ function freshSession(chatId, mode = "brief") {
 
 const STEPS = [
   "client", "campaignRef", "adType", "price",
-  "postType", "duration", "nif", "time", "seniors",
+  "postType", "duration", "nif", "time",
   "pages", "format", "caption", "content", "preview",
 ];
 
