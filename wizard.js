@@ -27,6 +27,11 @@ const TARGET_CHAT   = process.env.WIZARD_TARGET_CHAT_ID;
 const ADMIN_HANDLES = (process.env.WIZARD_ADMIN_HANDLES || "")
   .split(",").map((h) => h.trim().replace(/^@/, "")).filter(Boolean);
 
+const ALL_SENIORS = [
+  "davogabriel", "jazmynecooper", "sales_bolismedia",
+  "vendemia", "onah_bolismedia", "isaac_bolismedia", "dannygabriel",
+];
+
 if (!WIZARD_TOKEN)  { console.error("❌  WIZARD_BOT_TOKEN not set");       process.exit(1); }
 if (!TARGET_CHAT)   { console.error("❌  WIZARD_TARGET_CHAT_ID not set");  process.exit(1); }
 
@@ -97,6 +102,7 @@ function freshSession(chatId, mode = "brief") {
       duration:    null,
       nif:         null,
       time:        null,
+      seniors:     [],   // selected responsible handles
       pages:       [],
       format:      null,
       caption:     null,
@@ -125,20 +131,20 @@ function freshSession(chatId, mode = "brief") {
 
 const STEPS = [
   "client", "campaignRef", "adType", "price",
-  "postType", "duration", "nif", "time",
+  "postType", "duration", "nif", "time", "seniors",
   "pages", "format", "caption", "content", "preview",
 ];
 
 // Bulk template creation: bulkStartNum tracks how far through the slot package we are.
 const TEMPLATE_STEPS = [
   "bulkName", "bulkRefPrefix", "bulkStartNum", "client", "adType", "price",
-  "postType", "duration", "nif", "pages", "format", "preview",
+  "postType", "duration", "nif", "seniors", "pages", "format", "preview",
 ];
 
 // Campaign template creation: no bulkStartNum (ref # is freeform each run, not sequential).
 const TEMPLATE_CAMPAIGN_STEPS = [
   "bulkName", "bulkRefPrefix", "client", "adType", "price",
-  "postType", "duration", "nif", "pages", "format", "preview",
+  "postType", "duration", "nif", "seniors", "pages", "format", "preview",
 ];
 
 function _stepsFor(session) {
@@ -184,8 +190,9 @@ function renderSummary(a) {
   ].filter(Boolean).join("  ·  ");
   if (r2) lines.push(r2);
 
-  if (a.time)         lines.push(`🕐  ${a.time}`);
-  if (a.pages.length) lines.push(`📄  ${a.pages.map((h) => `@${h}`).join("  ")}`);
+  if (a.time)              lines.push(`🕐  ${a.time}`);
+  if (a.seniors?.length)   lines.push(`👥  ${a.seniors.map((h) => `@${h}`).join("  ")}`);
+  if (a.pages.length)      lines.push(`📄  ${a.pages.map((h) => `@${h}`).join("  ")}`);
   if (a.format)       lines.push(`📐  ${a.format}`);
   if (a.caption)      lines.push(`💬  "${a.caption}"`);
 
@@ -278,6 +285,16 @@ function buildKeyboard(step, session) {
       rows.push([b("← Back", "a:back")]);
       return Markup.inlineKeyboard(rows);
     }
+    case "seniors": {
+      const selected = session?.answers?.seniors || [];
+      const rows = ALL_SENIORS.map((h) => {
+        const label = selected.includes(h) ? `✅ @${h}` : `@${h}`;
+        return [b(label, `sr:${h}`)];
+      });
+      rows.push([b("✅  Done", "a:seniorsDone")]);
+      rows.push([b("← Back", "a:back")]);
+      return Markup.inlineKeyboard(rows);
+    }
     case "format":
       return Markup.inlineKeyboard([
         [b("Standard", "f:format:Standard"), b("Per-creative", "f:format:Per-creative"), b("Collab", "f:format:Collab")],
@@ -315,6 +332,7 @@ const QUESTIONS = {
   duration:      "⏳  *Post duration?*",
   nif:           "⏰  *NIF?*",
   time:          "🕐  *Scheduled time?*\n_Next 12 hrs — or tap Custom for anything further out_",
+  seniors:       "👥  *Who's responsible for posting?*\n_Select one or more — tap Done when ready_",
   pages:         "📄  *Which pages?*\n_Type @handles below ↓_",
   format:        "📐  *Content format?*",
   caption:       "💬  *Post caption?* _(optional)_\n_The copy text that goes with the post — Type below ↓ or skip_",
@@ -562,7 +580,8 @@ function renderMsg(session) {
 
 function buildBrief(a) {
   const header  = `${a.client} - ${a.adType} - $${a.price ?? 0}`;
-  const topTags = [...ADMIN_HANDLES, "sales_bolismedia"].map((h) => `@${h}`).join("\n");
+  const seniorList = (a.seniors && a.seniors.length > 0) ? a.seniors : ADMIN_HANDLES;
+  const topTags = seniorList.map((h) => `@${h}`).join("\n");
 
   const instr = ["INSTRUCTIONS:", `- ${a.postType}`];
   if (a.duration === "Permanent") instr.push("- Permanent post - DO NOT DELETE");
@@ -825,6 +844,7 @@ bot.on("callback_query", async (ctx) => {
         postType:    a.postType,
         duration:    a.duration,
         nif:         a.nif,
+        seniors:     [...(a.seniors || [])],
         priceMode:   a.priceMode,
         format:      a.format,
         pages:       [...a.pages],
@@ -869,6 +889,12 @@ bot.on("callback_query", async (ctx) => {
       session.answers.priceMode = "per-page";
       session.answers.price     = null;
       session.step = nextStep("price", session); // jumps to postType
+      await updateWizard(ctx.telegram, session);
+      return;
+    }
+    if (action === "seniorsDone") {
+      if (!session.answers.seniors.length) return; // require at least 1
+      session.step = nextStep("seniors", session);
       await updateWizard(ctx.telegram, session);
       return;
     }
@@ -945,6 +971,17 @@ bot.on("callback_query", async (ctx) => {
     return;
   }
 
+  // ── Seniors toggle ────────────────────────────────────────────────────────
+  if (data.startsWith("sr:")) {
+    const handle  = data.slice(3);
+    const seniors = session.answers.seniors;
+    const idx     = seniors.indexOf(handle);
+    if (idx >= 0) seniors.splice(idx, 1);
+    else seniors.push(handle);
+    await updateWizard(ctx.telegram, session);
+    return;
+  }
+
   // ── Bulk template selection ───────────────────────────────────────────────
   if (data.startsWith("blk:")) {
     const id       = data.slice(4);
@@ -960,6 +997,7 @@ bot.on("callback_query", async (ctx) => {
     a.postType    = template.postType  || null;
     a.duration    = template.duration  || null;
     a.nif         = template.nif       || null;
+    a.seniors     = [...(template.seniors || [])];
     a.priceMode   = template.priceMode || "same";
     a.format      = template.format    || null;
     a.pages       = [...(template.pages || [])];
@@ -995,6 +1033,7 @@ bot.on("callback_query", async (ctx) => {
     a.postType    = template.postType || null;
     a.duration    = template.duration || null;
     a.nif         = template.nif      || null;
+    a.seniors     = [...(template.seniors || [])];
     a.priceMode   = template.priceMode || "same";
     a.format      = template.format   || null;
     a.pages       = [...(template.pages || [])];
