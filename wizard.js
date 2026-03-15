@@ -256,8 +256,7 @@ function buildKeyboard(step, session) {
       ]);
     case "postType":
       return Markup.inlineKeyboard([
-        [b("Reels",   "f:postType:Reels"),   b("Carousel", "f:postType:Carousel")],
-        [b("Story",   "f:postType:Story"),   b("Feed",     "f:postType:Feed")],
+        [b("Reels",   "f:postType:Reels"),   b("Carousel", "f:postType:Carousel"), b("Story", "f:postType:Story")],
         [b("← Back", "a:back")],
       ]);
     case "duration":
