@@ -19,6 +19,7 @@ require("dotenv").config();
 const fs              = require("fs");
 const path            = require("path");
 const { Telegraf, Markup } = require("telegraf");
+const cron            = require("node-cron");
 const brain           = require("./brain");
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -1264,39 +1265,24 @@ bot.command("deal", async (ctx) => {
   );
 });
 
-// ── /watchsales — register this chat for sales monitoring ────────────────────
+// ── Sales intelligence startup ────────────────────────────────────────────────
+// Connects to @sales_bolismedia and listens to all chats automatically.
 
-bot.command("watchsales", async (ctx) => {
-  await brain.registerChat(ctx.chat.id, ctx.chat.title || ctx.chat.username || String(ctx.chat.id));
-  await ctx.reply("👁️ Greg is now watching this chat for sales signals.");
-});
+brain.startAutoCapture();
 
-// ── Passive sales listener — auto-capture sales-relevant messages ─────────────
-// Runs on every non-command text in monitored chats (non-blocking).
+// ── Morning recap — 8:00 AM Arizona time (MST, no DST) ───────────────────────
 
-bot.on("text", async (ctx) => {
-  if (ctx.message.text.startsWith("/")) return;
+cron.schedule("0 8 * * *", () => {
+  brain.sendMorningRecap()
+    .catch((e) => console.error("[wizard] morning recap error:", e.message));
+}, { timezone: "America/Phoenix" });
 
-  // Check if this chat is monitored (non-blocking — don't await wizard logic)
-  brain.isMonitoredChat(ctx.chat.id).then((monitored) => {
-    if (!monitored) return;
-    const handle = ctx.from.username || String(ctx.from.id);
-    brain.captureMessage(
-      ctx.chat.id,
-      ctx.message.message_id,
-      handle,
-      ctx.message.text
-    ).catch((e) => console.error("[wizard] brain.captureMessage error:", e.message));
-  }).catch(() => {});
-});
+// ── Nightly lesson extraction — 11:00 PM Arizona time ────────────────────────
 
-// ── Nightly lesson extraction (runs once a day) ───────────────────────────────
-
-const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
-setInterval(() => {
+cron.schedule("0 23 * * *", () => {
   brain.extractNightlyLessons()
     .catch((e) => console.error("[wizard] nightly lessons error:", e.message));
-}, TWENTY_FOUR_HOURS);
+}, { timezone: "America/Phoenix" });
 
 // ── Launch ────────────────────────────────────────────────────────────────────
 
