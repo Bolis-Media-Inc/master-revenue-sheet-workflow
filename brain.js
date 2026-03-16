@@ -482,7 +482,131 @@ Write the morning recap.`,
   }
 }
 
-// ── Exports ───────────────────────────────────────────────────────────────────
+// -- Nightly revenue recap ------------------------------------------------
+// End-of-day summary: revenue closed today, pipeline movement, wins/losses,
+// and a motivational wrap-up. Sent to Greg+ Sales Team group.
+
+const NIGHTLY_RECAP_SYSTEM = `You are Greg, a sharp sales assistant for Bolis Media — a social media marketing agency.
+Every night you send the team an end-of-day revenue recap. Cover:
+1. Revenue closed TODAY (new deals closed, total value)
+2. Pipeline movement (deals that advanced, went cold, or were lost)
+3. Top wins and highlights of the day
+4. Anything that needs attention tomorrow morning
+5. A short motivational close — keep the energy up
+
+Be direct, specific, and celebratory when there are wins.
+Keep it under 500 words.
+
+FORMATTING (strict — this is for Telegram, not a web page):
+- NO markdown: no **, ##, ---, or backticks
+- Use emoji bullets for sections and items: 💰 🔥 🎯 📌 ⚠️ ✅ 📈 🏆 etc.
+- Use ALL CAPS for emphasis instead of bold/italic
+- Plain line breaks between sections — no horizontal rules
+- Keep lines short and scannable`;
+
+async function sendNightlyRecap() {
+  const now = new Date();
+  const todayStart = new Date(now);
+  todayStart.setHours(0, 0, 0, 0);
+  const todayISO = todayStart.toISOString();
+
+  const tonight = now.toLocaleDateString("en-US", {
+    weekday: "long", month: "long", day: "numeric",
+    timeZone: "America/Phoenix",
+  });
+
+  // Deals closed/lost today
+  const { data: closedToday } = await supabase
+    .from("deals")
+    .select("client_name, status, value, owner_handle")
+    .in("status", ["closed", "lost"])
+    .gte("updated_at", todayISO);
+
+  // All open deals (pipeline snapshot)
+  const { data: openDeals } = await supabase
+    .from("deals")
+    .select("client_name, status, value, owner_handle, notes, updated_at")
+    .not("status", "in", '("closed","lost")')
+    .order("updated_at", { ascending: false });
+
+  // Today's deal activities
+  const { data: activities } = await supabase
+    .from("deal_activities")
+    .select("deal_id, activity, actor, created_at")
+    .gte("created_at", todayISO)
+    .order("created_at", { ascending: false })
+    .limit(20);
+
+  // Recent lessons
+  const { data: lessons } = await supabase
+    .from("sales_lessons")
+    .select("lesson")
+    .order("created_at", { ascending: false })
+    .limit(5);
+
+  const closedText = closedToday?.length
+    ? closedToday.map((d) =>
+        `- ${d.client_name} [${d.status.toUpperCase()}]${d.value ? ` $${d.value}` : ""}${d.owner_handle ? ` — @${d.owner_handle}` : ""}`
+      ).join("\n")
+    : "No deals closed or lost today.";
+
+  const totalClosed = (closedToday || [])
+    .filter((d) => d.status === "closed")
+    .reduce((sum, d) => sum + (d.value || 0), 0);
+
+  const openText = openDeals?.length
+    ? openDeals.map((d) =>
+        `- ${d.client_name} [${d.status}]${d.value ? ` $${d.value}` : ""}${d.owner_handle ? ` — @${d.owner_handle}` : ""}`
+      ).join("\n")
+    : "No open deals.";
+
+  const activityText = activities?.length
+    ? activities.map((a) => `- ${a.activity} (by @${a.actor})`).join("\n")
+    : "No deal activity logged today.";
+
+  const lessonsText = lessons?.length
+    ? lessons.map((l) => `- ${l.lesson}`).join("\n")
+    : "None yet.";
+
+  const totalPipelineValue = (openDeals || []).reduce((sum, d) => sum + (d.value || 0), 0);
+
+  try {
+    const msg = await anthropic.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 700,
+      system: NIGHTLY_RECAP_SYSTEM,
+      messages: [{
+        role: "user",
+        content: `Date: ${tonight}
+
+CLOSED/LOST TODAY:
+${closedText}
+Total revenue closed today: $${totalClosed}
+
+OPEN PIPELINE (${openDeals?.length || 0} deals, $${totalPipelineValue} total value):
+${openText}
+
+TODAY'S ACTIVITY:
+${activityText}
+
+RECENT LESSONS:
+${lessonsText}
+
+Write the nightly revenue recap.`,
+      }],
+    });
+
+    const recap = msg.content[0]?.text?.trim();
+    if (recap) {
+      await userClient.sendRecap(`🌙 NIGHTLY REVENUE RECAP\n${tonight}\n\n${recap}`);
+      console.log("[brain] 📬 Nightly recap sent");
+    }
+  } catch (e) {
+    console.error("[brain] sendNightlyRecap error:", e.message);
+  }
+}
+
+// -- Exports --------------------------------------------------------------
 
 module.exports = {
   startAutoCapture,
@@ -491,4 +615,5 @@ module.exports = {
   getDealAdvice,
   extractNightlyLessons,
   sendMorningRecap,
+  sendNightlyRecap,
 };

@@ -1146,6 +1146,19 @@ bot.command("recap", async (ctx) => {
   }
 });
 
+// ── /nightrecap — trigger nightly revenue recap on demand ──────────────────
+
+bot.command("nightrecap", async (ctx) => {
+  try {
+    await ctx.reply("🌙 Generating nightly revenue recap...");
+    await brain.sendNightlyRecap();
+    await ctx.reply("✅ Nightly recap sent to Greg+ Sales Team.");
+  } catch (err) {
+    console.error("[wizard] /nightrecap error:", err.message);
+    await ctx.reply("Nightly recap error: " + err.message);
+  }
+});
+
 // ── Text messages ─────────────────────────────────────────────────────────────
 
 bot.on("text", async (ctx) => {
@@ -1318,6 +1331,13 @@ cron.schedule("0 8 * * *", () => {
 cron.schedule("0 23 * * *", () => {
   brain.extractNightlyLessons()
     .catch((e) => console.error("[wizard] nightly lessons error:", e.message));
+}, { timezone: "America/Phoenix" });
+
+// ── Nightly revenue recap — 9:00 PM Arizona time ─────────────────────────
+
+cron.schedule("0 21 * * *", () => {
+  brain.sendNightlyRecap()
+    .catch((e) => console.error("[wizard] nightly recap error:", e.message));
 }, { timezone: "America/Phoenix" });
 
 // ── Launch ────────────────────────────────────────────────────────────────────
