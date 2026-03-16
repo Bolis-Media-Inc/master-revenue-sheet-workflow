@@ -606,6 +606,139 @@ Write the nightly revenue recap.`,
   }
 }
 
+// -- Stake bet slip cover generation (via Digi) ---------------------------
+// Analyzes a bet slip screenshot with Claude Vision, extracts headline and
+// player search query, then calls Digi's API to render the cover image.
+
+const DIGI_API_URL = process.env.DIGI_API_URL || "http://localhost:3000";
+const DIGI_API_SECRET = process.env.DIGI_API_SECRET || "";
+
+const BETSLIP_ANALYSIS_SYSTEM = `You are Greg, a sports media assistant for Bolis Media.
+You are analyzing a screenshot of a betting slip to create a cover image and ad caption for social media.
+
+From the bet slip, extract:
+1. The teams/players involved
+2. The sport (NBA, NFL, UFC, soccer, etc.)
+3. A short, punchy headline (2-12 words) — make it sound like sports media, not a bet description
+4. A search query to find a high-quality action photo of the key player(s)
+5. An Instagram ad caption — short, engaging, sports-media style with relevant emojis and hashtags
+
+The headline should be written in the style of sports media covers — dramatic, attention-grabbing.
+Examples of good headlines:
+- "LOS ANGELES HEADS TO HOUSTON AFTER A HUGE WIN AGAINST DENVER AT HOME"
+- "CURRY DROPS 40 IN WARRIORS COMEBACK"
+- "MAHOMES VS ALLEN THE REMATCH"
+
+The caption should be 1-3 lines max, hype the matchup or bet, include 3-5 relevant hashtags.
+Example caption: "The Spurs are LOCKED IN tonight 🔒🏀 Who's riding with us?\\n\\n#NBA #Spurs #SanAntonio #SportsBetting #Stake"
+
+Return ONLY valid JSON:
+{
+  "teams": ["team1", "team2"],
+  "sport": "NBA",
+  "headline": "THE HEADLINE TEXT",
+  "imageSearchQuery": "player name action photo high quality",
+  "accentColor": "#hex color that matches the sport/team",
+  "caption": "The Instagram ad caption with emojis and hashtags"
+}
+
+Respond with raw JSON only, no markdown or code fences.`;
+
+/**
+ * Analyze a bet slip screenshot using Claude Vision.
+ * Returns extracted info for cover generation.
+ */
+async function analyzeBetSlip(imageBase64, mimeType = "image/png") {
+  try {
+    const msg = await anthropic.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 400,
+      system: BETSLIP_ANALYSIS_SYSTEM,
+      messages: [{
+        role: "user",
+        content: [
+          {
+            type: "image",
+            source: { type: "base64", media_type: mimeType, data: imageBase64 },
+          },
+          {
+            type: "text",
+            text: "Analyze this bet slip and generate the cover image data.",
+          },
+        ],
+      }],
+    });
+
+    let raw = msg.content[0]?.text?.trim() || "{}";
+    raw = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/g, "").trim();
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error("[brain] analyzeBetSlip error:", e.message);
+    return null;
+  }
+}
+
+/**
+ * Generate a Stake bet slip cover by calling Digi's API.
+ *
+ * @param {string} betSlipBase64 - Base64-encoded bet slip screenshot
+ * @param {string} [betSlipMime] - MIME type (default: image/png)
+ * @param {object} [overrides] - Optional overrides for headline, accentColor, etc.
+ * @returns {Promise<{success: boolean, imageBase64?: string, analysis?: object, error?: string}>}
+ */
+async function generateBetSlipCover(betSlipBase64, betSlipMime = "image/png", overrides = {}) {
+  // 1. Analyze the bet slip with Claude Vision
+  console.log("[brain] Analyzing bet slip with Claude Vision...");
+  const analysis = await analyzeBetSlip(betSlipBase64, betSlipMime);
+  if (!analysis || !analysis.headline) {
+    return { success: false, error: "Could not analyze bet slip" };
+  }
+
+  console.log(`[brain] Bet slip analysis: ${analysis.headline} (${analysis.sport})`);
+  console.log(`[brain] Image search query: ${analysis.imageSearchQuery}`);
+
+  // 2. Call Digi's API to render the cover
+  const requestBody = {
+    headline: overrides.headline || analysis.headline,
+    betSlipBase64,
+    betSlipMime,
+    bgImageSearch: overrides.bgImageSearch || analysis.imageSearchQuery,
+    accentColor: overrides.accentColor || analysis.accentColor || "#FF3B30",
+    brandText: overrides.brandText || "ODDS",
+    returnFormat: "base64",
+  };
+
+  try {
+    const headers = { "Content-Type": "application/json" };
+    if (DIGI_API_SECRET) {
+      headers["Authorization"] = `Bearer ${DIGI_API_SECRET}`;
+    }
+
+    console.log(`[brain] Calling Digi API at ${DIGI_API_URL}/api/stake/cover`);
+    const res = await fetch(`${DIGI_API_URL}/api/stake/cover`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      return { success: false, error: `Digi API error: ${res.status} — ${errText}`, analysis };
+    }
+
+    const data = await res.json();
+    if (data.success && data.image) {
+      console.log(`[brain] Cover generated (${Math.round(data.size / 1024)}KB)`);
+      return { success: true, imageBase64: data.image, analysis };
+    }
+
+    return { success: false, error: data.error || "Unknown Digi error", analysis };
+  } catch (e) {
+    console.error("[brain] generateBetSlipCover Digi call error:", e.message);
+    return { success: false, error: `Could not reach Digi: ${e.message}`, analysis };
+  }
+}
+
 // -- Exports --------------------------------------------------------------
 
 module.exports = {
@@ -616,4 +749,6 @@ module.exports = {
   extractNightlyLessons,
   sendMorningRecap,
   sendNightlyRecap,
+  analyzeBetSlip,
+  generateBetSlipCover,
 };
