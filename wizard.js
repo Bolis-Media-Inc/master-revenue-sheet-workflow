@@ -934,6 +934,24 @@ bot.on("callback_query", async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const data = ctx.callbackQuery.data || "";
 
+  // ── Betslip image option pick ──────────────────────────────────────────
+  if (data.startsWith("bsimg:")) {
+    const idx = parseInt(data.slice(6), 10);
+    const pending = _betslipPending.get(ctx.from.id);
+    if (!pending) return;
+    const options = pending.analysis.imageOptions || [];
+    const chosen = options[idx];
+    if (!chosen) return;
+    // Remove the picker buttons
+    await ctx.telegram.editMessageText(
+      ctx.chat.id, ctx.callbackQuery.message.message_id, undefined,
+      `🖼️ Selected: *${chosen.label}*\n🎨 Generating cover...`,
+      { parse_mode: "Markdown" }
+    ).catch(() => {});
+    await finalizeBetSlipCover(ctx, ctx.from.id, chosen.query);
+    return;
+  }
+
   // ── Edit template selection (ebs: = edit bulk select, ecs: = edit camp select)
   if (data.startsWith("ebs:") || data.startsWith("ecs:")) {
     const kind = data.startsWith("ebs:") ? "bulk" : "camp";
@@ -1568,9 +1586,12 @@ bot.on("photo", async (ctx) => {
   await processBetSlipPhoto(ctx, ctx.message);
 });
 
+// Store pending betslip data while user picks an image option
+const _betslipPending = new Map(); // userId → { analysis, betSlipBase64, betSlipMime, photoMsg, progressMsgId }
+
 async function processBetSlipPhoto(ctx, photoMsg) {
   try {
-    const progressMsg = await ctx.reply("🎨 Analyzing bet slip and generating cover...");
+    const progressMsg = await ctx.reply("🎨 Analyzing bet slip with Claude Vision...");
 
     // Get highest resolution photo
     const photo = photoMsg.photo[photoMsg.photo.length - 1];
@@ -1581,17 +1602,72 @@ async function processBetSlipPhoto(ctx, photoMsg) {
     if (!res.ok) throw new Error("Failed to download bet slip photo");
     const buffer = Buffer.from(await res.arrayBuffer());
     const base64 = buffer.toString("base64");
-
-    // Determine MIME type from URL
     const mime = fileLink.href.includes(".png") ? "image/png" : "image/jpeg";
 
-    // Generate cover via brain → Digi
+    // Step 1: Analyze the bet slip (get headline, player options, etc.)
+    const analysis = await brain.analyzeBetSlip(base64, mime);
+    if (!analysis || !analysis.headline) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, progressMsg.message_id, undefined,
+        "❌ Could not analyze bet slip — try a clearer screenshot"
+      );
+      return;
+    }
+
+    // Store pending data for when user picks an image
+    _betslipPending.set(ctx.from.id, {
+      analysis,
+      betSlipBase64: base64,
+      betSlipMime: mime,
+      photoMsg,
+    });
+
+    // Step 2: Show image options as buttons
+    const options = analysis.imageOptions || [];
+    if (options.length === 0) {
+      // Fallback: no options, auto-generate with default query
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, progressMsg.message_id, undefined,
+        "🎨 Generating cover..."
+      ).catch(() => {});
+      await finalizeBetSlipCover(ctx, ctx.from.id, analysis.imageSearchQuery || analysis.headline);
+      return;
+    }
+
+    const rows = options.map((opt, i) =>
+      [Markup.button.callback(opt.label, `bsimg:${i}`)]
+    );
+
     await ctx.telegram.editMessageText(
       ctx.chat.id, progressMsg.message_id, undefined,
-      "🎨 Analyzing bet slip with Claude Vision..."
-    ).catch(() => {});
+      `📊 *${analysis.sport || "Sports"}* — ${analysis.teams?.join(" vs ") || ""}\n` +
+      `📝 *${analysis.headline}*\n\n` +
+      `🖼️ *Pick a background image:*`,
+      { parse_mode: "Markdown", ...Markup.inlineKeyboard(rows) }
+    );
 
-    const result = await brain.generateBetSlipCover(base64, mime);
+  } catch (err) {
+    console.error("[wizard] processBetSlipPhoto error:", err.message);
+    await ctx.reply("❌ Analysis error: " + err.message);
+  }
+}
+
+/**
+ * Finalize: render cover with chosen image query, then flow into /bulk.
+ */
+async function finalizeBetSlipCover(ctx, userId, imageQuery) {
+  const pending = _betslipPending.get(userId);
+  if (!pending) {
+    await ctx.reply("❌ No pending bet slip — run /betslip again");
+    return;
+  }
+  _betslipPending.delete(userId);
+
+  const progressMsg = await ctx.reply("🎨 Generating cover...");
+  const { analysis, betSlipBase64, betSlipMime, photoMsg } = pending;
+
+  try {
+    const result = await brain.renderCoverWithQuery(betSlipBase64, betSlipMime, analysis, imageQuery);
 
     if (!result.success) {
       await ctx.telegram.editMessageText(
@@ -1606,22 +1682,21 @@ async function processBetSlipPhoto(ctx, photoMsg) {
       "✅ Cover generated! Setting up bulk ad brief..."
     ).catch(() => {});
 
-    // Send the cover image to chat so we have a copyable message reference
+    // Send the cover image to chat
     const coverBuffer = Buffer.from(result.imageBase64, "base64");
     const coverMsg = await ctx.replyWithPhoto(
       { source: coverBuffer, filename: "stake-cover.jpg" },
-      { caption: `📊 ${result.analysis?.sport || "Sports"} | ${result.analysis?.headline || ""}` }
+      { caption: `📊 ${analysis.sport || "Sports"} | ${analysis.headline || ""}` }
     );
 
     // ── Auto-flow into /bulk with stake-bet-slips template ──────────────
     const template = KNOWN_BULKS.find((t) => t.id === "stake-bet-slips");
     if (!template) {
-      await ctx.reply("⚠️ No 'stake-bet-slips' bulk template found. Use /newbulk to create one first, then try /betslip again.");
+      await ctx.reply("⚠️ No 'stake-bet-slips' bulk template found. Use /newbulk to create one first.");
       await ctx.telegram.deleteMessage(ctx.chat.id, progressMsg.message_id).catch(() => {});
       return;
     }
 
-    // Create a fresh session and pre-fill from bulk template
     const session = freshSession(ctx.chat.id);
     const nextNum = (template.lastRefNum || 0) + 1;
     const a = session.answers;
@@ -1638,7 +1713,6 @@ async function processBetSlipPhoto(ctx, photoMsg) {
     a.pages       = [...(template.pages || [])];
     a.perPagePrices = JSON.parse(JSON.stringify(template.perPagePrices || {}));
 
-    // Compute header price as sum of per-page prices
     if (a.priceMode === "per-page") {
       const total = a.pages.reduce((sum, h) => {
         const p = parseFloat(a.perPagePrices[h]?.price || "0");
@@ -1647,37 +1721,23 @@ async function processBetSlipPhoto(ctx, photoMsg) {
       a.price = String(total);
     }
 
-    // Pre-fill caption from Claude analysis
-    a.caption = result.analysis?.caption || null;
+    a.caption = analysis.caption || null;
 
-    // Store the cover image as content (message ref for copyMessage)
-    session.content.shared.push({
-      fromChatId: ctx.chat.id,
-      msgId:      coverMsg.message_id,
-    });
+    session.content.shared.push({ fromChatId: ctx.chat.id, msgId: coverMsg.message_id });
+    session.content.shared.push({ fromChatId: photoMsg.chat.id, msgId: photoMsg.message_id });
 
-    // Also store the original bet slip as content
-    session.content.shared.push({
-      fromChatId: photoMsg.chat.id,
-      msgId:      photoMsg.message_id,
-    });
-
-    // Remember template for counter increment on post
     session._bulkTemplateId = "stake-bet-slips";
-
-    // Jump straight to time selection (everything else is pre-filled)
     session.step = "time";
 
-    // Show the wizard
     const { text, keyboard } = renderMsg(session);
     const wizMsg = await ctx.reply(text, { parse_mode: "Markdown", ...(keyboard || {}) });
     session.wizardMsgId = wizMsg.message_id;
-    sessions.set(ctx.from.id, session);
+    sessions.set(userId, session);
 
     await ctx.telegram.deleteMessage(ctx.chat.id, progressMsg.message_id).catch(() => {});
   } catch (err) {
-    console.error("[wizard] processBetSlipPhoto error:", err.message);
-    await ctx.reply("Cover generation error: " + err.message);
+    console.error("[wizard] finalizeBetSlipCover error:", err.message);
+    await ctx.reply("❌ Cover generation error: " + err.message);
   }
 }
 

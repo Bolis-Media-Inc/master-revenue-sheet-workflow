@@ -640,7 +640,12 @@ From the bet slip, extract:
 1. The teams/players involved
 2. The sport (NBA, NFL, UFC, soccer, etc.)
 3. A short, punchy headline (2-12 words) — make it sound like sports media, not a bet description
-4. A search query to find a high-quality close-up action photo of the star player — use their full name + team + "close up action" (e.g. "LeBron James Lakers close up action")
+4. Player/image options — give 4-5 search suggestions the user can pick from:
+   - The biggest star from team 1 (e.g. "LeBron James Lakers")
+   - The biggest star from team 2 (e.g. "Jalen Green Rockets")
+   - Both stars together or a rivalry shot (e.g. "LeBron James vs Jalen Green NBA")
+   - A team action shot (e.g. "Los Angeles Lakers team celebration")
+   - Optionally a secondary star or coach
 5. An Instagram ad caption — short, engaging, sports-media style with relevant emojis and hashtags
 
 The headline should be written in the style of sports media covers — dramatic, attention-grabbing.
@@ -657,8 +662,13 @@ Return ONLY valid JSON:
   "teams": ["team1", "team2"],
   "sport": "NBA",
   "headline": "THE HEADLINE TEXT",
-  "imageSearchQuery": "LeBron James Lakers close up action",
-  "accentColor": "#hex color that matches the sport/team",
+  "imageOptions": [
+    { "label": "LeBron James", "query": "LeBron James Lakers action close up" },
+    { "label": "Jalen Green", "query": "Jalen Green Rockets action close up" },
+    { "label": "LeBron vs Green", "query": "LeBron James Jalen Green NBA matchup" },
+    { "label": "Lakers Team", "query": "Los Angeles Lakers team celebration NBA" }
+  ],
+  "accentColor": "#hex color that matches the favored team",
   "caption": "The Instagram ad caption with emojis and hashtags"
 }
 
@@ -759,6 +769,47 @@ async function generateBetSlipCover(betSlipBase64, betSlipMime = "image/png", ov
   }
 }
 
+/**
+ * Render a cover with a specific image search query.
+ * Called after user picks an image option from the analysis.
+ */
+async function renderCoverWithQuery(betSlipBase64, betSlipMime, analysis, imageQuery) {
+  const requestBody = {
+    headline: analysis.headline,
+    betSlipBase64,
+    betSlipMime,
+    bgImageSearch: imageQuery,
+    accentColor: analysis.accentColor || "#FF3B30",
+    brandText: "ODDS",
+    returnFormat: "base64",
+  };
+
+  try {
+    const headers = { "Content-Type": "application/json" };
+    if (DIGI_API_SECRET) headers["Authorization"] = `Bearer ${DIGI_API_SECRET}`;
+
+    console.log(`[brain] Rendering cover with image query: "${imageQuery}"`);
+    const res = await fetch(`${DIGI_API_URL}/api/stake/cover`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      return { success: false, error: `Digi API error: ${res.status} — ${errText}` };
+    }
+
+    const data = await res.json();
+    if (data.success && data.image) {
+      return { success: true, imageBase64: data.image };
+    }
+    return { success: false, error: data.error || "Unknown Digi error" };
+  } catch (e) {
+    return { success: false, error: `Could not reach Digi: ${e.message}` };
+  }
+}
+
 // -- Exports --------------------------------------------------------------
 
 module.exports = {
@@ -772,4 +823,5 @@ module.exports = {
   sendNightlyRecap,
   analyzeBetSlip,
   generateBetSlipCover,
+  renderCoverWithQuery,
 };
