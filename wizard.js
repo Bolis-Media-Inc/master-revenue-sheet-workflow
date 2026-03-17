@@ -945,8 +945,11 @@ bot.on("callback_query", async (ctx) => {
     // Delete all preview photos and picker message
     const chatId = pending.chatId || ctx.chat.id;
     const previewMsgIds = pending.previewMsgIds || [];
+    console.log(`[wizard] Cleaning up ${previewMsgIds.length} preview images in chat ${chatId}`);
     for (const msgId of previewMsgIds) {
-      await ctx.telegram.deleteMessage(chatId, msgId).catch(() => {});
+      await ctx.telegram.deleteMessage(chatId, msgId).catch((e) => {
+        console.log(`[wizard] Failed to delete preview ${msgId}: ${e.message}`);
+      });
     }
     await ctx.telegram.deleteMessage(chatId, ctx.callbackQuery.message.message_id).catch(() => {});
 
