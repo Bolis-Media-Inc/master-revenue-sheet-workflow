@@ -942,12 +942,14 @@ bot.on("callback_query", async (ctx) => {
     const imageResults = pending.imageResults || [];
     const chosen = imageResults[idx];
     if (!chosen) return;
-    // Remove the picker buttons
-    await ctx.telegram.editMessageText(
-      ctx.chat.id, ctx.callbackQuery.message.message_id, undefined,
-      `🖼️ Selected: *${chosen.label}*\n🎨 Generating cover...`,
-      { parse_mode: "Markdown" }
-    ).catch(() => {});
+    // Delete all preview photos and picker message
+    const chatId = pending.chatId || ctx.chat.id;
+    const previewMsgIds = pending.previewMsgIds || [];
+    for (const msgId of previewMsgIds) {
+      await ctx.telegram.deleteMessage(chatId, msgId).catch(() => {});
+    }
+    await ctx.telegram.deleteMessage(chatId, ctx.callbackQuery.message.message_id).catch(() => {});
+
     // Use the pre-fetched full image — no need to search again
     await finalizeBetSlipCover(ctx, ctx.from.id, chosen.fullBase64, null);
     return;
@@ -1658,23 +1660,33 @@ async function processBetSlipPhoto(ctx, photoMsg) {
     });
 
     // Send each image preview as a photo with a numbered label
+    const previewMsgIds = [];
     for (let i = 0; i < imageResults.length; i++) {
       const img = imageResults[i];
       const thumbBuf = Buffer.from(img.base64, "base64");
-      await ctx.replyWithPhoto(
+      const previewMsg = await ctx.replyWithPhoto(
         { source: thumbBuf, filename: `option-${i + 1}.jpg` },
         { caption: `${i + 1}️⃣  ${img.label}` }
       );
+      previewMsgIds.push(previewMsg.message_id);
     }
 
     // Send pick buttons
     const rows = imageResults.map((img, i) =>
       [Markup.button.callback(`${i + 1}️⃣  ${img.label}`, `bsimg:${i}`)]
     );
-    await ctx.reply(
+    const pickerMsg = await ctx.reply(
       `🖼️ *Pick a background image:*`,
       { parse_mode: "Markdown", ...Markup.inlineKeyboard(rows) }
     );
+
+    // Store message IDs so we can clean up after selection
+    const pending = _betslipPending.get(ctx.from.id);
+    if (pending) {
+      pending.previewMsgIds = previewMsgIds;
+      pending.pickerMsgId = pickerMsg.message_id;
+      pending.chatId = ctx.chat.id;
+    }
 
     await ctx.telegram.deleteMessage(ctx.chat.id, progressMsg.message_id).catch(() => {});
 
