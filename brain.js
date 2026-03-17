@@ -770,6 +770,73 @@ async function generateBetSlipCover(betSlipBase64, betSlipMime = "image/png", ov
 }
 
 /**
+ * Search for images via Digi API — returns thumbnails for each query.
+ * @param {Array<{label: string, query: string}>} queries
+ * @returns {Promise<Array<{label, query, base64, fullBase64}>>}
+ */
+async function searchBetSlipImages(queries) {
+  try {
+    const headers = { "Content-Type": "application/json" };
+    if (DIGI_API_SECRET) headers["Authorization"] = `Bearer ${DIGI_API_SECRET}`;
+
+    const res = await fetch(`${DIGI_API_URL}/api/stake/search-images`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ queries }),
+    });
+
+    if (!res.ok) {
+      console.error("[brain] searchBetSlipImages failed:", res.status);
+      return [];
+    }
+
+    const data = await res.json();
+    return data.results || [];
+  } catch (e) {
+    console.error("[brain] searchBetSlipImages error:", e.message);
+    return [];
+  }
+}
+
+/**
+ * Render a cover with a specific pre-fetched image (base64).
+ * Called after user picks from image previews.
+ */
+async function renderCoverWithImage(betSlipBase64, betSlipMime, analysis, bgImageBase64) {
+  const requestBody = {
+    headline: analysis.headline,
+    betSlipBase64,
+    betSlipMime,
+    bgImageBase64,
+    accentColor: analysis.accentColor || "#FF3B30",
+    brandText: "ODDS",
+    returnFormat: "base64",
+  };
+
+  try {
+    const headers = { "Content-Type": "application/json" };
+    if (DIGI_API_SECRET) headers["Authorization"] = `Bearer ${DIGI_API_SECRET}`;
+
+    const res = await fetch(`${DIGI_API_URL}/api/stake/cover`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      return { success: false, error: `Digi API error: ${res.status} — ${errText}` };
+    }
+
+    const data = await res.json();
+    if (data.success && data.image) return { success: true, imageBase64: data.image };
+    return { success: false, error: data.error || "Unknown Digi error" };
+  } catch (e) {
+    return { success: false, error: `Could not reach Digi: ${e.message}` };
+  }
+}
+
+/**
  * Render a cover with a specific image search query.
  * Called after user picks an image option from the analysis.
  */
@@ -824,4 +891,6 @@ module.exports = {
   analyzeBetSlip,
   generateBetSlipCover,
   renderCoverWithQuery,
+  searchBetSlipImages,
+  renderCoverWithImage,
 };

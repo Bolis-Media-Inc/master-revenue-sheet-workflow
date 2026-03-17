@@ -939,8 +939,8 @@ bot.on("callback_query", async (ctx) => {
     const idx = parseInt(data.slice(6), 10);
     const pending = _betslipPending.get(ctx.from.id);
     if (!pending) return;
-    const options = pending.analysis.imageOptions || [];
-    const chosen = options[idx];
+    const imageResults = pending.imageResults || [];
+    const chosen = imageResults[idx];
     if (!chosen) return;
     // Remove the picker buttons
     await ctx.telegram.editMessageText(
@@ -948,7 +948,8 @@ bot.on("callback_query", async (ctx) => {
       `🖼️ Selected: *${chosen.label}*\n🎨 Generating cover...`,
       { parse_mode: "Markdown" }
     ).catch(() => {});
-    await finalizeBetSlipCover(ctx, ctx.from.id, chosen.query);
+    // Use the pre-fetched full image — no need to search again
+    await finalizeBetSlipCover(ctx, ctx.from.id, chosen.fullBase64, null);
     return;
   }
 
@@ -1614,37 +1615,68 @@ async function processBetSlipPhoto(ctx, photoMsg) {
       return;
     }
 
-    // Store pending data for when user picks an image
+    // Step 2: Search for image previews via Digi
+    const options = analysis.imageOptions || [];
+    if (options.length === 0) {
+      // Fallback: no options, auto-generate
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, progressMsg.message_id, undefined,
+        "🎨 Generating cover..."
+      ).catch(() => {});
+      await finalizeBetSlipCover(ctx, ctx.from.id, null, analysis.imageSearchQuery || analysis.headline);
+      return;
+    }
+
+    await ctx.telegram.editMessageText(
+      ctx.chat.id, progressMsg.message_id, undefined,
+      `📊 *${analysis.sport || "Sports"}* — ${analysis.teams?.join(" vs ") || ""}\n` +
+      `📝 *${analysis.headline}*\n\n🔍 Searching for background images...`,
+      { parse_mode: "Markdown" }
+    ).catch(() => {});
+
+    // Call Digi to search for images
+    const imageResults = await brain.searchBetSlipImages(options);
+
+    if (!imageResults.length) {
+      // No images found — fallback to auto-search
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, progressMsg.message_id, undefined,
+        "⚠️ No images found — generating with auto-search..."
+      ).catch(() => {});
+      _betslipPending.set(ctx.from.id, { analysis, betSlipBase64: base64, betSlipMime: mime, photoMsg, imageResults: [] });
+      await finalizeBetSlipCover(ctx, ctx.from.id, null, options[0]?.query || analysis.headline);
+      return;
+    }
+
+    // Store pending data with the fetched image results
     _betslipPending.set(ctx.from.id, {
       analysis,
       betSlipBase64: base64,
       betSlipMime: mime,
       photoMsg,
+      imageResults,
     });
 
-    // Step 2: Show image options as buttons
-    const options = analysis.imageOptions || [];
-    if (options.length === 0) {
-      // Fallback: no options, auto-generate with default query
-      await ctx.telegram.editMessageText(
-        ctx.chat.id, progressMsg.message_id, undefined,
-        "🎨 Generating cover..."
-      ).catch(() => {});
-      await finalizeBetSlipCover(ctx, ctx.from.id, analysis.imageSearchQuery || analysis.headline);
-      return;
+    // Send each image preview as a photo with a numbered label
+    for (let i = 0; i < imageResults.length; i++) {
+      const img = imageResults[i];
+      const thumbBuf = Buffer.from(img.base64, "base64");
+      await ctx.replyWithPhoto(
+        { source: thumbBuf, filename: `option-${i + 1}.jpg` },
+        { caption: `${i + 1}️⃣  ${img.label}` }
+      );
     }
 
-    const rows = options.map((opt, i) =>
-      [Markup.button.callback(opt.label, `bsimg:${i}`)]
+    // Send pick buttons
+    const rows = imageResults.map((img, i) =>
+      [Markup.button.callback(`${i + 1}️⃣  ${img.label}`, `bsimg:${i}`)]
     );
-
-    await ctx.telegram.editMessageText(
-      ctx.chat.id, progressMsg.message_id, undefined,
-      `📊 *${analysis.sport || "Sports"}* — ${analysis.teams?.join(" vs ") || ""}\n` +
-      `📝 *${analysis.headline}*\n\n` +
+    await ctx.reply(
       `🖼️ *Pick a background image:*`,
       { parse_mode: "Markdown", ...Markup.inlineKeyboard(rows) }
     );
+
+    await ctx.telegram.deleteMessage(ctx.chat.id, progressMsg.message_id).catch(() => {});
 
   } catch (err) {
     console.error("[wizard] processBetSlipPhoto error:", err.message);
@@ -1655,7 +1687,7 @@ async function processBetSlipPhoto(ctx, photoMsg) {
 /**
  * Finalize: render cover with chosen image query, then flow into /bulk.
  */
-async function finalizeBetSlipCover(ctx, userId, imageQuery) {
+async function finalizeBetSlipCover(ctx, userId, bgImageBase64, imageQuery) {
   const pending = _betslipPending.get(userId);
   if (!pending) {
     await ctx.reply("❌ No pending bet slip — run /betslip again");
@@ -1667,7 +1699,13 @@ async function finalizeBetSlipCover(ctx, userId, imageQuery) {
   const { analysis, betSlipBase64, betSlipMime, photoMsg } = pending;
 
   try {
-    const result = await brain.renderCoverWithQuery(betSlipBase64, betSlipMime, analysis, imageQuery);
+    // Use pre-fetched image if available, otherwise search by query
+    let result;
+    if (bgImageBase64) {
+      result = await brain.renderCoverWithImage(betSlipBase64, betSlipMime, analysis, bgImageBase64);
+    } else {
+      result = await brain.renderCoverWithQuery(betSlipBase64, betSlipMime, analysis, imageQuery);
+    }
 
     if (!result.success) {
       await ctx.telegram.editMessageText(
