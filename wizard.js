@@ -54,6 +54,13 @@ function saveCampaigns() {
   try { fs.writeFileSync(CAMPAIGNS_PATH, JSON.stringify(KNOWN_CAMPAIGNS, null, 2)); } catch (_) {}
 }
 
+const COLLABS_PATH = path.join(__dirname, "config", "collabs.json");
+let KNOWN_COLLABS = [];
+try { KNOWN_COLLABS = JSON.parse(fs.readFileSync(COLLABS_PATH, "utf8")); } catch (_) {}
+function saveCollabs() {
+  try { fs.writeFileSync(COLLABS_PATH, JSON.stringify(KNOWN_COLLABS, null, 2)); } catch (_) {}
+}
+
 const bot = new Telegraf(WIZARD_TOKEN);
 
 // ── AZ time slot generator ────────────────────────────────────────────────────
@@ -464,6 +471,18 @@ function renderContentStep(session) {
         .map((gr, i) => `${i + 1}. @${gr.host}  ·  ${gr.invites.map((h) => `@${h}`).join(" ")}`)
         .join("\n");
 
+      // Show preset picker if no groups built yet and presets exist
+      if (phase === "host" && gIdx === 0 && !content.collabGroups.length && KNOWN_COLLABS.length) {
+        const presetBtns = KNOWN_COLLABS.map((c) =>
+          [b(`🎭 ${c.name} (${c.groups.length})`, `sc:use:${c.id}`)]
+        );
+        presetBtns.push([b("✏️ Build manually", "sc:manual")]);
+        return {
+          text: `📋 *New Ad Brief*\n\n${sum}\n\n🎭 *Collab Groups*\n_Pick a preset or build manually:_`,
+          keyboard: Markup.inlineKeyboard(presetBtns),
+        };
+      }
+
       if (phase === "host") {
         return {
           text: `📋 *New Ad Brief*\n\n${sum}\n\n` +
@@ -858,6 +877,51 @@ bot.command("editcamp", async (ctx) => {
 // Track which template is being edited and which field is awaiting text input
 const _editSessions = new Map(); // userId → { kind, tplId, field, msgId }
 
+// ── /setcollab — create & manage collab presets ──────────────────────────────
+
+// Collab preset structure:
+// { id: "dank-niche", name: "Dank Niche Collab", groups: [{ host: "handle", invites: ["h1","h2"] }, ...] }
+
+const _collabSessions = new Map(); // userId → { phase, msgId, preset?, groupIdx? }
+
+bot.command("setcollab", async (ctx) => {
+  const existingBtns = KNOWN_COLLABS.map((c) => [
+    b(`✏️ ${c.name} (${c.groups.length} groups)`, `sc:edit:${c.id}`),
+  ]);
+  existingBtns.push([b("➕ New Collab Preset", "sc:new")]);
+  const kb = Markup.inlineKeyboard(existingBtns);
+  const msg = await ctx.reply("🎭 *Collab Presets*\n\n_Manage your predefined collab groupings:_", {
+    parse_mode: "Markdown", ...kb,
+  });
+  _collabSessions.set(ctx.from.id, { phase: "menu", msgId: msg.message_id });
+});
+
+bot.command("collabs", async (ctx) => {
+  if (!KNOWN_COLLABS.length) return ctx.reply("🎭 No collab presets yet. Use /setcollab to create one.");
+  const lines = KNOWN_COLLABS.map((c) => {
+    const groupLines = c.groups.map((g, i) =>
+      `  ${i + 1}. Host: @${g.host} · ${g.invites.map((h) => `@${h}`).join(" ")}`
+    ).join("\n");
+    return `*${c.name}*\n${groupLines}`;
+  });
+  await ctx.reply(`🎭 *Collab Presets*\n\n${lines.join("\n\n")}`, { parse_mode: "Markdown" });
+});
+
+function renderCollabPreset(preset) {
+  if (!preset.groups.length) return "_No groups yet_";
+  return preset.groups.map((g, i) =>
+    `${i + 1}. Host: @${g.host}  ·  ${g.invites.map((h) => `@${h}`).join("  ")}`
+  ).join("\n");
+}
+
+function collabPresetEditKeyboard(presetId) {
+  return Markup.inlineKeyboard([
+    [b("➕ Add Group", `sc:addgrp:${presetId}`), b("🗑️ Remove Last Group", `sc:rmgrp:${presetId}`)],
+    [b("✏️ Rename", `sc:rename:${presetId}`), b("🗑️ Delete Preset", `sc:delete:${presetId}`)],
+    [b("✅ Done", `sc:done:${presetId}`)],
+  ]);
+}
+
 // ── Callback queries ──────────────────────────────────────────────────────────
 
 bot.on("callback_query", async (ctx) => {
@@ -932,6 +996,134 @@ bot.on("callback_query", async (ctx) => {
       `✏️ *Edit Template — ${tpl.name}*\n\n${prompts[field] || "Type new value below ↓"}`,
       { parse_mode: "Markdown" }
     );
+    return;
+  }
+
+  // ── Collab preset callbacks (sc: prefix) ──────────────────────────────────
+  if (data.startsWith("sc:")) {
+    const parts = data.slice(3).split(":");
+    const action = parts[0];
+    const presetId = parts[1];
+    const collabSess = _collabSessions.get(ctx.from.id);
+    const msgId = collabSess?.msgId || ctx.callbackQuery.message?.message_id;
+
+    if (action === "new") {
+      _collabSessions.set(ctx.from.id, { phase: "name", msgId });
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msgId, undefined,
+        "🎭 *New Collab Preset*\n\n📝 *Name?*\n_e.g. Dank Niche Collab · Type below ↓_",
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+
+    if (action === "edit") {
+      const preset = KNOWN_COLLABS.find((c) => c.id === presetId);
+      if (!preset) return;
+      _collabSessions.set(ctx.from.id, { phase: "editing", msgId, presetId });
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msgId, undefined,
+        `🎭 *${preset.name}*\n\n${renderCollabPreset(preset)}\n\n_Edit this preset:_`,
+        { parse_mode: "Markdown", ...collabPresetEditKeyboard(presetId) }
+      );
+      return;
+    }
+
+    if (action === "addgrp") {
+      const preset = KNOWN_COLLABS.find((c) => c.id === presetId);
+      if (!preset) return;
+      _collabSessions.set(ctx.from.id, { phase: "addhost", msgId, presetId });
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msgId, undefined,
+        `🎭 *${preset.name}* — Add Group\n\n${renderCollabPreset(preset)}\n\n` +
+        `🎯 *Host for group ${preset.groups.length + 1}?*\n_Type @handle below ↓_`,
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+
+    if (action === "rmgrp") {
+      const preset = KNOWN_COLLABS.find((c) => c.id === presetId);
+      if (!preset || !preset.groups.length) return;
+      preset.groups.pop();
+      saveCollabs();
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msgId, undefined,
+        `🎭 *${preset.name}*\n\n${renderCollabPreset(preset)}\n\n✅ Last group removed\n_Edit this preset:_`,
+        { parse_mode: "Markdown", ...collabPresetEditKeyboard(presetId) }
+      );
+      return;
+    }
+
+    if (action === "rename") {
+      _collabSessions.set(ctx.from.id, { phase: "rename", msgId, presetId });
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msgId, undefined,
+        "🎭 *Rename Preset*\n\n📝 Type new name below ↓",
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+
+    if (action === "delete") {
+      const idx = KNOWN_COLLABS.findIndex((c) => c.id === presetId);
+      if (idx >= 0) {
+        const name = KNOWN_COLLABS[idx].name;
+        KNOWN_COLLABS.splice(idx, 1);
+        saveCollabs();
+        await ctx.telegram.editMessageText(
+          ctx.chat.id, msgId, undefined,
+          `🗑️ Preset *${name}* deleted.`,
+          { parse_mode: "Markdown" }
+        );
+      }
+      _collabSessions.delete(ctx.from.id);
+      return;
+    }
+
+    if (action === "done") {
+      const preset = KNOWN_COLLABS.find((c) => c.id === presetId);
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msgId, undefined,
+        `✅ *${preset?.name || "Preset"}* saved! (${preset?.groups?.length || 0} groups)`,
+        { parse_mode: "Markdown" }
+      );
+      _collabSessions.delete(ctx.from.id);
+      return;
+    }
+
+    // ── Collab preset selection during campaign run (sc:use:presetId) ──
+    if (action === "use") {
+      const session = sessions.get(ctx.from.id);
+      if (!session) return;
+      const preset = KNOWN_COLLABS.find((c) => c.id === presetId);
+      if (!preset) return;
+
+      // Load preset groups into session content
+      session.content.collabGroups = preset.groups.map((g) => ({
+        host: g.host,
+        invites: [...g.invites],
+        media: [],
+      }));
+      session.content.collabGroupIdx = preset.groups.length - 1;
+      session.content.collabBuildPhase = "more";
+      session.content.collabPhase = "groups";
+      await updateWizard(ctx.telegram, session);
+      return;
+    }
+
+    // ── "Build manually" during campaign collab ──
+    if (action === "manual") {
+      const session = sessions.get(ctx.from.id);
+      if (!session) return;
+      // Just proceed — the default collab flow handles it
+      session.content.collabPhase = "groups";
+      session.content.collabGroupIdx = 0;
+      session.content.collabBuildPhase = "host";
+      await updateWizard(ctx.telegram, session);
+      return;
+    }
+
     return;
   }
 
@@ -1487,6 +1679,71 @@ async function processBetSlipPhoto(ctx, photoMsg) {
 
 bot.on("text", async (ctx) => {
   if (ctx.message.text.startsWith("/")) return;
+
+  // ── Handle collab preset text input ────────────────────────────────────
+  const collabSess = _collabSessions.get(ctx.from.id);
+  if (collabSess && ["name", "rename", "addhost", "addinvites"].includes(collabSess.phase)) {
+    const input = ctx.message.text.trim();
+    try { await ctx.deleteMessage(); } catch (_) {}
+    const { phase, msgId, presetId } = collabSess;
+
+    if (phase === "name") {
+      // Create new preset
+      const id = input.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+      const preset = { id, name: input, groups: [] };
+      KNOWN_COLLABS.push(preset);
+      saveCollabs();
+      _collabSessions.set(ctx.from.id, { phase: "editing", msgId, presetId: id });
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msgId, undefined,
+        `🎭 *${preset.name}*\n\n_No groups yet — add your first collab group:_`,
+        { parse_mode: "Markdown", ...collabPresetEditKeyboard(id) }
+      );
+      return;
+    }
+
+    if (phase === "rename") {
+      const preset = KNOWN_COLLABS.find((c) => c.id === presetId);
+      if (preset) { preset.name = input; saveCollabs(); }
+      _collabSessions.set(ctx.from.id, { phase: "editing", msgId, presetId });
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msgId, undefined,
+        `🎭 *${preset?.name || input}*\n\n${renderCollabPreset(preset)}\n\n✅ Renamed!\n_Edit this preset:_`,
+        { parse_mode: "Markdown", ...collabPresetEditKeyboard(presetId) }
+      );
+      return;
+    }
+
+    if (phase === "addhost") {
+      const host = input.replace(/^@/, "").toLowerCase().trim();
+      _collabSessions.set(ctx.from.id, { phase: "addinvites", msgId, presetId, _host: host });
+      const preset = KNOWN_COLLABS.find((c) => c.id === presetId);
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msgId, undefined,
+        `🎭 *${preset?.name}* — Group ${(preset?.groups?.length || 0) + 1}\n\n` +
+        `Host: @${host}\n\n👥 *Invite pages?*\n_Type @handles separated by spaces below ↓_`,
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+
+    if (phase === "addinvites") {
+      const invites = [...input.matchAll(/@?([\w.]+)/g)]
+        .map((m) => m[1].toLowerCase()).filter((h) => h.length > 1);
+      const preset = KNOWN_COLLABS.find((c) => c.id === presetId);
+      if (preset) {
+        preset.groups.push({ host: collabSess._host, invites });
+        saveCollabs();
+      }
+      _collabSessions.set(ctx.from.id, { phase: "editing", msgId, presetId });
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, msgId, undefined,
+        `🎭 *${preset?.name}*\n\n${renderCollabPreset(preset)}\n\n✅ Group added!\n_Edit this preset:_`,
+        { parse_mode: "Markdown", ...collabPresetEditKeyboard(presetId) }
+      );
+      return;
+    }
+  }
 
   // ── Handle edit template text input ──────────────────────────────────────
   const editSess = _editSessions.get(ctx.from.id);
