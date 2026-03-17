@@ -782,14 +782,161 @@ bot.command("bulk", async (ctx) => {
   sessions.set(ctx.from.id, session);
 });
 
+// ── /editbulk & /editcamp — edit an existing template ────────────────────────
+
+function renderTemplatePreview(tpl, kind) {
+  const icon = kind === "bulk" ? "📦" : "🔁";
+  const lines = [`${icon} *${tpl.name}*`];
+  if (tpl.refPrefix) {
+    const next = (tpl.lastRefNum || 0) + 1;
+    lines.push(`🏷️  Ref: ${tpl.refPrefix} (next #${next})`);
+  }
+  if (tpl.client)   lines.push(`👤  Client: ${tpl.client}`);
+  if (tpl.adType)   lines.push(`📂  Ad type: ${tpl.adType}`);
+  if (tpl.postType) lines.push(`📱  Post type: ${tpl.postType}`);
+  if (tpl.duration) lines.push(`⏳  Duration: ${tpl.duration}`);
+  if (tpl.nif)      lines.push(`⏰  NIF: ${tpl.nif}`);
+  if (tpl.seniors?.length)
+    lines.push(`👥  Seniors: ${tpl.seniors.map((h) => `@${h}`).join("  ")}`);
+  if (tpl.pages?.length)
+    lines.push(`📄  Pages (${tpl.pages.length}): ${tpl.pages.map((h) => `@${h}`).join("  ")}`);
+  if (tpl.priceMode === "per-page" && tpl.perPagePrices) {
+    const total = tpl.pages.reduce((s, h) => s + (parseFloat(tpl.perPagePrices[h]?.price || 0) || 0), 0);
+    lines.push(`💰  Per-page total: $${total}`);
+    tpl.pages.forEach((h) => {
+      const pp = tpl.perPagePrices[h];
+      if (pp) lines.push(`     @${h}: $${pp.price} (${pp.bulk})`);
+    });
+  }
+  if (tpl.format) lines.push(`📐  Format: ${tpl.format}`);
+  return lines.join("\n");
+}
+
+const EDITABLE_FIELDS = [
+  { key: "client",    label: "👤 Client" },
+  { key: "adType",    label: "📂 Ad Type" },
+  { key: "postType",  label: "📱 Post Type" },
+  { key: "duration",  label: "⏳ Duration" },
+  { key: "nif",       label: "⏰ NIF" },
+  { key: "format",    label: "📐 Format" },
+  { key: "refPrefix", label: "🏷️ Ref Prefix" },
+  { key: "lastRefNum",label: "🔢 Run Counter" },
+  { key: "seniors",   label: "👥 Seniors" },
+  { key: "pages",     label: "📄 Pages" },
+  { key: "pagePrices",label: "💰 Page Prices" },
+];
+
+function editTemplateKeyboard(tplId, kind) {
+  const prefix = kind === "bulk" ? "eb" : "ec";
+  const rows = [];
+  for (let i = 0; i < EDITABLE_FIELDS.length; i += 2) {
+    const row = [b(EDITABLE_FIELDS[i].label, `${prefix}:${tplId}:${EDITABLE_FIELDS[i].key}`)];
+    if (EDITABLE_FIELDS[i + 1])
+      row.push(b(EDITABLE_FIELDS[i + 1].label, `${prefix}:${tplId}:${EDITABLE_FIELDS[i + 1].key}`));
+    rows.push(row);
+  }
+  rows.push([b("✅ Done", `${prefix}:${tplId}:done`)]);
+  return Markup.inlineKeyboard(rows);
+}
+
+bot.command("editbulk", async (ctx) => {
+  if (!KNOWN_BULKS.length) return ctx.reply("📦 No bulk templates to edit. Use /newbulk first.");
+  const keyboard = Markup.inlineKeyboard(
+    KNOWN_BULKS.map((t) => [b(t.name, `ebs:${t.id}`)])
+  );
+  await ctx.reply("📦 *Which bulk template to edit?*", { parse_mode: "Markdown", ...keyboard });
+});
+
+bot.command("editcamp", async (ctx) => {
+  if (!KNOWN_CAMPAIGNS.length) return ctx.reply("🔁 No campaign templates to edit. Use /newcamp first.");
+  const keyboard = Markup.inlineKeyboard(
+    KNOWN_CAMPAIGNS.map((t) => [b(t.name, `ecs:${t.id}`)])
+  );
+  await ctx.reply("🔁 *Which campaign template to edit?*", { parse_mode: "Markdown", ...keyboard });
+});
+
+// Track which template is being edited and which field is awaiting text input
+const _editSessions = new Map(); // userId → { kind, tplId, field, msgId }
+
 // ── Callback queries ──────────────────────────────────────────────────────────
 
 bot.on("callback_query", async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
+  const data = ctx.callbackQuery.data || "";
+
+  // ── Edit template selection (ebs: = edit bulk select, ecs: = edit camp select)
+  if (data.startsWith("ebs:") || data.startsWith("ecs:")) {
+    const kind = data.startsWith("ebs:") ? "bulk" : "camp";
+    const tplId = data.slice(4);
+    const list = kind === "bulk" ? KNOWN_BULKS : KNOWN_CAMPAIGNS;
+    const tpl = list.find((t) => t.id === tplId);
+    if (!tpl) return;
+    const preview = renderTemplatePreview(tpl, kind);
+    const kb = editTemplateKeyboard(tplId, kind);
+    const msg = await ctx.telegram.editMessageText(
+      ctx.chat.id, ctx.callbackQuery.message.message_id, undefined,
+      `✏️ *Edit Template*\n\n${preview}\n\n_Tap a field to edit:_`,
+      { parse_mode: "Markdown", ...kb }
+    );
+    return;
+  }
+
+  // ── Edit field selection (eb: = edit bulk field, ec: = edit camp field)
+  if (data.startsWith("eb:") || data.startsWith("ec:")) {
+    const kind = data.startsWith("eb:") ? "bulk" : "camp";
+    const parts = data.slice(3).split(":");
+    const tplId = parts[0];
+    const field = parts[1];
+    const list = kind === "bulk" ? KNOWN_BULKS : KNOWN_CAMPAIGNS;
+    const tpl = list.find((t) => t.id === tplId);
+    if (!tpl) return;
+
+    if (field === "done") {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, ctx.callbackQuery.message.message_id, undefined,
+        `✅ Template *${tpl.name}* saved!`,
+        { parse_mode: "Markdown" }
+      );
+      _editSessions.delete(ctx.from.id);
+      return;
+    }
+
+    // Store edit session for text follow-up
+    _editSessions.set(ctx.from.id, {
+      kind, tplId, field,
+      msgId: ctx.callbackQuery.message.message_id,
+    });
+
+    const currentVal = field === "seniors"    ? (tpl.seniors || []).map((h) => `@${h}`).join(" ")
+                     : field === "pages"      ? (tpl.pages || []).map((h) => `@${h}`).join(" ")
+                     : field === "pagePrices" ? "per-page prices"
+                     : field === "lastRefNum" ? String(tpl.lastRefNum || 0)
+                     : tpl[field] || "not set";
+
+    const prompts = {
+      client:     `👤 *Client name?*\nCurrent: ${currentVal}\n_Type new value below ↓_`,
+      adType:     `📂 *Ad type?*\nCurrent: ${currentVal}\n_Type new value below ↓_`,
+      postType:   `📱 *Post type?* (Feed / Reels / Story)\nCurrent: ${currentVal}\n_Type new value below ↓_`,
+      duration:   `⏳ *Duration?*\nCurrent: ${currentVal}\n_Type new value below ↓_`,
+      nif:        `⏰ *NIF?* (none / 15 min / 30 min / 1hr)\nCurrent: ${currentVal}\n_Type new value below ↓_`,
+      format:     `📐 *Format?* (Standard / Per-creative / Collab)\nCurrent: ${currentVal}\n_Type new value below ↓_`,
+      refPrefix:  `🏷️ *Ref prefix?*\nCurrent: ${currentVal}\n_Type new value below ↓_`,
+      lastRefNum: `🔢 *Last completed run #?*\nCurrent: ${currentVal}\n_Next run will be this + 1_\n_Type number below ↓_`,
+      seniors:    `👥 *Seniors?*\nCurrent: ${currentVal}\n_Type @handles separated by spaces below ↓_`,
+      pages:      `📄 *Pages?*\nCurrent: ${currentVal}\n_Type @handles separated by spaces below ↓_`,
+      pagePrices: `💰 *Page prices?*\nFormat: @handle price bulk/total\nOne per line, e.g.:\n\`@dailyhumor_4u 400 13/15\`\n\`@scooby 120 13/15\`\n_Type below ↓_`,
+    };
+
+    await ctx.telegram.editMessageText(
+      ctx.chat.id, ctx.callbackQuery.message.message_id, undefined,
+      `✏️ *Edit Template — ${tpl.name}*\n\n${prompts[field] || "Type new value below ↓"}`,
+      { parse_mode: "Markdown" }
+    );
+    return;
+  }
+
   const session = sessions.get(ctx.from.id);
   if (!session) return;
-
-  const data = ctx.callbackQuery.data || "";
 
   // ── Action buttons ────────────────────────────────────────────────────────
   if (data.startsWith("a:")) {
@@ -1340,6 +1487,59 @@ async function processBetSlipPhoto(ctx, photoMsg) {
 
 bot.on("text", async (ctx) => {
   if (ctx.message.text.startsWith("/")) return;
+
+  // ── Handle edit template text input ──────────────────────────────────────
+  const editSess = _editSessions.get(ctx.from.id);
+  if (editSess) {
+    const input = ctx.message.text.trim();
+    try { await ctx.deleteMessage(); } catch (_) {}
+
+    const list = editSess.kind === "bulk" ? KNOWN_BULKS : KNOWN_CAMPAIGNS;
+    const tpl = list.find((t) => t.id === editSess.tplId);
+    if (!tpl) { _editSessions.delete(ctx.from.id); return; }
+
+    const { field } = editSess;
+
+    if (field === "seniors") {
+      tpl.seniors = [...input.matchAll(/@?([\w.]+)/g)]
+        .map((m) => m[1].toLowerCase()).filter((h) => h.length > 1);
+    } else if (field === "pages") {
+      tpl.pages = [...input.matchAll(/@?([\w.]+)/g)]
+        .map((m) => m[1].toLowerCase()).filter((h) => h.length > 1);
+    } else if (field === "lastRefNum") {
+      const num = parseInt(input, 10);
+      if (!isNaN(num)) tpl.lastRefNum = num;
+    } else if (field === "pagePrices") {
+      // Parse: @handle price bulk/total  (one per line)
+      const lines = input.split("\n").map((l) => l.trim()).filter(Boolean);
+      for (const line of lines) {
+        const m = line.match(/@?([\w.]+)\s+(\d+)\s+(\d+\/\d+)/);
+        if (m) {
+          const handle = m[1].toLowerCase();
+          tpl.perPagePrices = tpl.perPagePrices || {};
+          tpl.perPagePrices[handle] = { price: m[2], bulk: m[3] };
+        }
+      }
+    } else {
+      tpl[field] = input;
+    }
+
+    // Save
+    if (editSess.kind === "bulk") saveBulks(); else saveCampaigns();
+
+    // Show updated template
+    const preview = renderTemplatePreview(tpl, editSess.kind);
+    const kb = editTemplateKeyboard(editSess.tplId, editSess.kind);
+    _editSessions.delete(ctx.from.id);
+
+    await ctx.telegram.editMessageText(
+      ctx.chat.id, editSess.msgId, undefined,
+      `✏️ *Edit Template*\n\n${preview}\n\n✅ *${EDITABLE_FIELDS.find((f) => f.key === field)?.label || field}* updated!\n_Tap another field or Done:_`,
+      { parse_mode: "Markdown", ...kb }
+    );
+    return;
+  }
+
   const session = sessions.get(ctx.from.id);
   if (!session) return;
 
