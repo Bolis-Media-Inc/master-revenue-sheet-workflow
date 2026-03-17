@@ -1739,9 +1739,9 @@ async function finalizeBetSlipCover(ctx, userId, bgImageBase64, imageQuery) {
       "✅ Cover generated! Setting up bulk ad brief..."
     ).catch(() => {});
 
-    // Send the cover image to chat
+    // Send the cover as a document (file) to retain full quality for IG Ads
     const coverBuffer = Buffer.from(result.imageBase64, "base64");
-    const coverMsg = await ctx.replyWithPhoto(
+    const coverMsg = await ctx.replyWithDocument(
       { source: coverBuffer, filename: "stake-cover.jpg" },
       { caption: `📊 ${analysis.sport || "Sports"} | ${analysis.headline || ""}` }
     );

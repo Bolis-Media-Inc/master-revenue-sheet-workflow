@@ -640,10 +640,11 @@ From the bet slip, extract:
 1. The teams/players involved
 2. The sport (NBA, NFL, UFC, soccer, etc.)
 3. A short, punchy headline (2-12 words) — make it sound like sports media, not a bet description
-4. Exactly 3 image options — the best player photo choices:
+4. Exactly 3 image options — individual player photos ONLY (no "vs" or matchup images):
    - The biggest star from team 1 (e.g. "LeBron James")
    - The biggest star from team 2 (e.g. "Jalen Green")
-   - Both stars facing off (e.g. "LeBron vs Jalen Green")
+   - The 2nd biggest star from either team (e.g. "Anthony Davis")
+   Each query MUST target a single player's HD close-up or action shot from the current season.
 5. An Instagram ad caption — short, engaging, sports-media style with relevant emojis and hashtags
 
 The headline should be written in the style of sports media covers — dramatic, attention-grabbing.
@@ -661,9 +662,9 @@ Return ONLY valid JSON:
   "sport": "NBA",
   "headline": "THE HEADLINE TEXT",
   "imageOptions": [
-    { "label": "LeBron James", "query": "LeBron James portrait photo NBA 2025" },
-    { "label": "Jalen Green", "query": "Jalen Green portrait photo NBA 2025" },
-    { "label": "LeBron vs Jalen", "query": "LeBron James vs Jalen Green NBA 2025" }
+    { "label": "LeBron James", "query": "LeBron James Lakers HD close-up 2026 NBA" },
+    { "label": "Jalen Green", "query": "Jalen Green Rockets HD close-up 2026 NBA" },
+    { "label": "Anthony Davis", "query": "Anthony Davis Lakers HD action shot 2026 NBA" }
   ],
   "accentColor": "#hex color that matches the favored team",
   "caption": "The Instagram ad caption with emojis and hashtags"
