@@ -164,6 +164,33 @@ function nextStep(from, session) {
   return i >= 0 && i < steps.length - 1 ? steps[i + 1] : "preview";
 }
 
+// Skip steps whose answers are already filled (used by betslip auto-flow)
+function skipFilledSteps(session) {
+  const a = session.answers;
+  const filled = (step) => {
+    switch (step) {
+      case "client":     return !!a.client;
+      case "adType":     return !!a.adType;
+      case "price":      return !!a.price;
+      case "postType":   return !!a.postType;
+      case "duration":   return !!a.duration;
+      case "nif":        return !!a.nif;
+      case "time":       return !!a.time;
+      case "seniors":    return a.seniors && a.seniors.length > 0;
+      case "pages":      return a.pages && a.pages.length > 0;
+      case "pageprices": return Object.keys(a.perPagePrices || {}).length > 0;
+      case "format":     return !!a.format;
+      case "caption":    return a.caption != null;
+      case "content":    return session.content.shared.length > 0;
+      default:           return false;
+    }
+  };
+  let safety = 20;
+  while (session.step !== "preview" && filled(session.step) && --safety > 0) {
+    session.step = nextStep(session.step, session);
+  }
+}
+
 function prevStep(from, session) {
   const steps = _stepsFor(session);
   if (from === "pageprices") return "pages";
@@ -896,6 +923,7 @@ bot.on("callback_query", async (ctx) => {
     if (action === "seniorsDone") {
       if (!session.answers.seniors.length) return; // require at least 1
       session.step = nextStep("seniors", session);
+      if (session._bulkTemplateId) skipFilledSteps(session);
       await updateWizard(ctx.telegram, session);
       return;
     }
@@ -1079,6 +1107,8 @@ bot.on("callback_query", async (ctx) => {
 
     session.step          = nextStep(field, session);
     session.awaitingCustom = null;
+    // Skip past any pre-filled steps (betslip auto-flow)
+    if (session._bulkTemplateId) skipFilledSteps(session);
     await updateWizard(ctx.telegram, session);
   }
 });
