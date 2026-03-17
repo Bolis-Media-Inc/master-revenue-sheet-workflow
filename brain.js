@@ -640,7 +640,7 @@ From the bet slip, extract:
 1. The teams/players involved
 2. The sport (NBA, NFL, UFC, soccer, etc.)
 3. A short, punchy headline (2-12 words) — make it sound like sports media, not a bet description
-4. A search query to find a high-quality action photo of the key player(s)
+4. A search query to find a high-quality close-up action photo of the star player — use their full name + team + "close up action" (e.g. "LeBron James Lakers close up action")
 5. An Instagram ad caption — short, engaging, sports-media style with relevant emojis and hashtags
 
 The headline should be written in the style of sports media covers — dramatic, attention-grabbing.
@@ -657,7 +657,7 @@ Return ONLY valid JSON:
   "teams": ["team1", "team2"],
   "sport": "NBA",
   "headline": "THE HEADLINE TEXT",
-  "imageSearchQuery": "player name action photo high quality",
+  "imageSearchQuery": "LeBron James Lakers close up action",
   "accentColor": "#hex color that matches the sport/team",
   "caption": "The Instagram ad caption with emojis and hashtags"
 }
