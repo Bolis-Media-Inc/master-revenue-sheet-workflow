@@ -640,11 +640,11 @@ From the bet slip, extract:
 1. The teams/players involved
 2. The sport (NBA, NFL, UFC, soccer, etc.)
 3. A short, punchy headline (2-12 words) — make it sound like sports media, not a bet description
-4. Exactly 3 image options — individual player photos ONLY (no "vs" or matchup images):
-   - The biggest star from team 1 (e.g. "LeBron James")
-   - The biggest star from team 2 (e.g. "Jalen Green")
-   - The 2nd biggest star from either team (e.g. "Anthony Davis")
-   Each query MUST target a single player's HD close-up or action shot from the current season.
+4. Exactly 3 image options — ALL should show the top star from each team TOGETHER on the court:
+   - Identify the biggest star from team 1 and the biggest star from team 2
+   - All 3 queries search for those SAME two players together, just with different search angles
+   - Example: Lakers vs Rockets → all 3 queries feature "LeBron James" and "Jalen Green" together
+   - Example: Knicks vs Hornets → all 3 queries feature "Jalen Brunson" and "LaMelo Ball" together
 5. An Instagram ad caption — short, engaging, sports-media style with relevant emojis and hashtags
 
 The headline should be written in the style of sports media covers — dramatic, attention-grabbing.
@@ -662,9 +662,9 @@ Return ONLY valid JSON:
   "sport": "NBA",
   "headline": "THE HEADLINE TEXT",
   "imageOptions": [
-    { "label": "LeBron James", "query": "LeBron James Lakers HD close-up 2026 NBA" },
-    { "label": "Jalen Green", "query": "Jalen Green Rockets HD close-up 2026 NBA" },
-    { "label": "Anthony Davis", "query": "Anthony Davis Lakers HD action shot 2026 NBA" }
+    { "label": "LeBron vs Jalen", "query": "LeBron James Jalen Green Lakers Rockets matchup on court 2026 NBA" },
+    { "label": "LeBron & Jalen game", "query": "LeBron James guarding Jalen Green NBA game 2026 HD" },
+    { "label": "Lakers Rockets action", "query": "LeBron James Jalen Green face to face Lakers vs Rockets 2026" }
   ],
   "accentColor": "#hex color that matches the favored team",
   "caption": "The Instagram ad caption with emojis and hashtags"
