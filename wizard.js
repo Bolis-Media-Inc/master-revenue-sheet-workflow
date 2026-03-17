@@ -1716,11 +1716,15 @@ async function finalizeBetSlipCover(ctx, userId, bgImageBase64, imageQuery) {
   try {
     // Use pre-fetched image if available, otherwise search by query
     let result;
+    console.log(`[wizard] finalizeBetSlipCover: bgImageBase64=${bgImageBase64 ? `${Math.round(bgImageBase64.length/1024)}KB` : 'null'}, imageQuery="${imageQuery}"`);
     if (bgImageBase64) {
+      console.log("[wizard] Rendering cover with pre-fetched image...");
       result = await brain.renderCoverWithImage(betSlipBase64, betSlipMime, analysis, bgImageBase64);
     } else {
+      console.log(`[wizard] Rendering cover with search query: "${imageQuery}"`);
       result = await brain.renderCoverWithQuery(betSlipBase64, betSlipMime, analysis, imageQuery);
     }
+    console.log(`[wizard] Cover result: success=${result?.success}, error=${result?.error || 'none'}`);
 
     if (!result.success) {
       await ctx.telegram.editMessageText(

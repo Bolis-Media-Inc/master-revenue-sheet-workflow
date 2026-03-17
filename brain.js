@@ -640,12 +640,10 @@ From the bet slip, extract:
 1. The teams/players involved
 2. The sport (NBA, NFL, UFC, soccer, etc.)
 3. A short, punchy headline (2-12 words) — make it sound like sports media, not a bet description
-4. Player/image options — give 4-5 search suggestions the user can pick from:
-   - The biggest star from team 1 (e.g. "LeBron James Lakers")
-   - The biggest star from team 2 (e.g. "Jalen Green Rockets")
-   - Both stars together or a rivalry shot (e.g. "LeBron James vs Jalen Green NBA")
-   - A team action shot (e.g. "Los Angeles Lakers team celebration")
-   - Optionally a secondary star or coach
+4. Exactly 3 image options — the best player photo choices:
+   - The biggest star from team 1 (e.g. "LeBron James")
+   - The biggest star from team 2 (e.g. "Jalen Green")
+   - Both stars facing off (e.g. "LeBron vs Jalen Green")
 5. An Instagram ad caption — short, engaging, sports-media style with relevant emojis and hashtags
 
 The headline should be written in the style of sports media covers — dramatic, attention-grabbing.
@@ -663,10 +661,9 @@ Return ONLY valid JSON:
   "sport": "NBA",
   "headline": "THE HEADLINE TEXT",
   "imageOptions": [
-    { "label": "LeBron James", "query": "LeBron James Lakers action close up" },
-    { "label": "Jalen Green", "query": "Jalen Green Rockets action close up" },
-    { "label": "LeBron vs Green", "query": "LeBron James Jalen Green NBA matchup" },
-    { "label": "Lakers Team", "query": "Los Angeles Lakers team celebration NBA" }
+    { "label": "LeBron James", "query": "LeBron James portrait photo NBA 2025" },
+    { "label": "Jalen Green", "query": "Jalen Green portrait photo NBA 2025" },
+    { "label": "LeBron vs Jalen", "query": "LeBron James vs Jalen Green NBA 2025" }
   ],
   "accentColor": "#hex color that matches the favored team",
   "caption": "The Instagram ad caption with emojis and hashtags"
@@ -803,6 +800,7 @@ async function searchBetSlipImages(queries) {
  * Called after user picks from image previews.
  */
 async function renderCoverWithImage(betSlipBase64, betSlipMime, analysis, bgImageBase64) {
+  console.log(`[brain] renderCoverWithImage: headline="${analysis.headline}", bgImage=${bgImageBase64 ? `${Math.round(bgImageBase64.length/1024)}KB` : 'null'}, betSlip=${betSlipBase64 ? `${Math.round(betSlipBase64.length/1024)}KB` : 'null'}`);
   const requestBody = {
     headline: analysis.headline,
     betSlipBase64,
@@ -817,6 +815,7 @@ async function renderCoverWithImage(betSlipBase64, betSlipMime, analysis, bgImag
     const headers = { "Content-Type": "application/json" };
     if (DIGI_API_SECRET) headers["Authorization"] = `Bearer ${DIGI_API_SECRET}`;
 
+    console.log(`[brain] Sending cover request to Digi (body ~${Math.round(JSON.stringify(requestBody).length/1024)}KB)...`);
     const res = await fetch(`${DIGI_API_URL}/api/stake/cover`, {
       method: "POST",
       headers,
