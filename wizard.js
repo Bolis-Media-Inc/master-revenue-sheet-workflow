@@ -63,6 +63,9 @@ function saveCollabs() {
 
 const bot = new Telegraf(WIZARD_TOKEN);
 
+// Give brain.js the bot instance so recaps are sent from Greg (bot account)
+brain.setBotInstance(bot);
+
 // ── AZ time slot generator ────────────────────────────────────────────────────
 
 function getAZTimeSlots() {

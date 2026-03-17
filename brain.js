@@ -32,6 +32,26 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+// Bot instance — set by wizard.js so recaps are sent from Greg (bot), not @sales_bolismedia
+let _bot = null;
+const SALES_CHAT = process.env.GREG_SALES_CHAT || "";
+
+function setBotInstance(bot) { _bot = bot; }
+
+async function sendRecapViaBot(text) {
+  if (_bot && SALES_CHAT) {
+    try {
+      await _bot.telegram.sendMessage(SALES_CHAT, text, { parse_mode: "Markdown" });
+      return true;
+    } catch (e) {
+      console.warn("[brain] Bot recap failed, falling back to userClient:", e.message);
+    }
+  }
+  // Fallback to userClient if bot not available
+  await userClient.sendRecap(text);
+  return true;
+}
+
 // ── Auto-capture listener startup ─────────────────────────────────────────────
 // Call once at startup — Greg listens to ALL chats @sales_bolismedia is in.
 
@@ -474,7 +494,7 @@ Write the morning recap.`,
 
     const recap = msg.content[0]?.text?.trim();
     if (recap) {
-      await userClient.sendRecap(`🌅 GOOD MORNING — Daily Sales Recap\n${today}\n\n${recap}`);
+      await sendRecapViaBot(`🌅 GOOD MORNING — Daily Sales Recap\n${today}\n\n${recap}`);
       console.log("[brain] 📬 Morning recap sent");
     }
   } catch (e) {
@@ -598,7 +618,7 @@ Write the nightly revenue recap.`,
 
     const recap = msg.content[0]?.text?.trim();
     if (recap) {
-      await userClient.sendRecap(`🌙 NIGHTLY REVENUE RECAP\n${tonight}\n\n${recap}`);
+      await sendRecapViaBot(`🌙 NIGHTLY REVENUE RECAP\n${tonight}\n\n${recap}`);
       console.log("[brain] 📬 Nightly recap sent");
     }
   } catch (e) {
@@ -742,6 +762,7 @@ async function generateBetSlipCover(betSlipBase64, betSlipMime = "image/png", ov
 // -- Exports --------------------------------------------------------------
 
 module.exports = {
+  setBotInstance,
   startAutoCapture,
   captureMessage,
   getPipelineSummary,
