@@ -733,6 +733,9 @@ async function updateWizard(telegram, session) {
 // ── /ad command ───────────────────────────────────────────────────────────────
 
 bot.command("ad", async (ctx) => {
+  // Clear any stale edit/collab sessions so they don't intercept text
+  _editSessions.delete(ctx.from.id);
+  _collabSessions.delete(ctx.from.id);
   const session = freshSession(ctx.chat.id);
   const { text, keyboard } = renderMsg(session);
   const msg = await ctx.reply(text, { parse_mode: "Markdown", ...(keyboard || {}) });
@@ -1750,7 +1753,7 @@ bot.on("text", async (ctx) => {
 
   // ── Handle edit template text input ──────────────────────────────────────
   const editSess = _editSessions.get(ctx.from.id);
-  if (editSess) {
+  if (editSess && editSess.field) {  // only intercept if actively awaiting a field
     const input = ctx.message.text.trim();
     try { await ctx.deleteMessage(); } catch (_) {}
 
