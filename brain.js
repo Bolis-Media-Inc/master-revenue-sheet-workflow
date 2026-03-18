@@ -652,7 +652,7 @@ You are analyzing a screenshot of a betting slip to create a cover image and ad 
 From the bet slip, extract:
 1. The teams/players involved
 2. The sport (NBA, NFL, UFC, soccer, etc.)
-3. A short, punchy headline (6-12 words) — make it sound like sports media, not a bet description. IMPORTANT: When the headline is split into 3 lines, every line must have at least 3 words. Avoid short 2-word phrases that would create oversized text.
+3. Exactly 3 headline options (6-12 words each) — make them sound like sports media, not a bet description. IMPORTANT: When a headline is split into 3 lines, every line must have at least 3 words. Avoid short 2-word phrases that would create oversized text. Each option should have a different angle or tone (e.g. one dramatic, one stat-focused, one hype/energy).
 4. Exactly 3 image options — ALL should show the top stars from each team TOGETHER:
    - Identify the biggest star from team 1 and the biggest star from team 2
    - Keep queries SHORT and simple — just the two player names + team names. Less is more for image search.
@@ -676,7 +676,11 @@ Return ONLY valid JSON:
 {
   "teams": ["team1", "team2"],
   "sport": "NBA",
-  "headline": "THE HEADLINE TEXT",
+  "headlines": [
+    "DRAMATIC ANGLE HEADLINE HERE",
+    "STAT-FOCUSED HEADLINE HERE",
+    "HYPE ENERGY HEADLINE HERE"
+  ],
   "imageOptions": [
     { "label": "LeBron vs Jalen", "query": "LeBron James Jalen Green Lakers Rockets" },
     { "label": "LeBron & Jalen", "query": "Jalen Green LeBron James NBA basketball" },
@@ -715,7 +719,16 @@ async function analyzeBetSlip(imageBase64, mimeType = "image/png") {
 
     let raw = msg.content[0]?.text?.trim() || "{}";
     raw = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/g, "").trim();
-    return JSON.parse(raw);
+    const result = JSON.parse(raw);
+    // Backward compat: if old format returned single headline, wrap in array
+    if (result.headline && !result.headlines) {
+      result.headlines = [result.headline];
+    }
+    // Set first headline as default
+    if (result.headlines?.length && !result.headline) {
+      result.headline = result.headlines[0];
+    }
+    return result;
   } catch (e) {
     console.error("[brain] analyzeBetSlip error:", e.message);
     return null;

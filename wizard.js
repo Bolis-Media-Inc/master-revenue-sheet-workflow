@@ -934,6 +934,82 @@ bot.on("callback_query", async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const data = ctx.callbackQuery.data || "";
 
+  // ── Betslip headline option pick ────────────────────────────────────────
+  if (data.startsWith("bshl:")) {
+    const idx = parseInt(data.slice(5), 10);
+    const pending = _betslipPending.get(ctx.from.id);
+    if (!pending || pending.step !== "headline") return;
+
+    const chosenHeadline = pending.headlines[idx];
+    if (!chosenHeadline) return;
+
+    // Set the chosen headline
+    pending.analysis.headline = chosenHeadline;
+    pending.step = "image";
+
+    // Clean up headline picker
+    const chatId = pending.chatId || ctx.chat.id;
+    await ctx.telegram.deleteMessage(chatId, ctx.callbackQuery.message.message_id).catch(() => {});
+
+    // Now proceed to image search
+    await ctx.telegram.editMessageText(
+      chatId, pending.progressMsgId, undefined,
+      `📊 *${pending.analysis.sport || "Sports"}* — ${pending.analysis.teams?.join(" vs ") || ""}\n` +
+      `📝 *${chosenHeadline}*\n\n🔍 Searching for background images...`,
+      { parse_mode: "Markdown" }
+    ).catch(() => {});
+
+    const options = pending.analysis.imageOptions || [];
+    if (options.length === 0) {
+      await ctx.telegram.editMessageText(
+        chatId, pending.progressMsgId, undefined,
+        "🎨 Generating cover..."
+      ).catch(() => {});
+      await finalizeBetSlipCover(ctx, ctx.from.id, null, pending.analysis.imageSearchQuery || chosenHeadline);
+      return;
+    }
+
+    // Search for image previews
+    const imageResults = await brain.searchBetSlipImages(options);
+    if (!imageResults.length) {
+      await ctx.telegram.editMessageText(
+        chatId, pending.progressMsgId, undefined,
+        "⚠️ No images found — generating with auto-search..."
+      ).catch(() => {});
+      await finalizeBetSlipCover(ctx, ctx.from.id, null, options[0]?.query || chosenHeadline);
+      return;
+    }
+
+    pending.imageResults = imageResults;
+
+    // Send image previews
+    const previewMsgIds = [];
+    for (let i = 0; i < imageResults.length; i++) {
+      const img = imageResults[i];
+      const thumbBuf = Buffer.from(img.base64, "base64");
+      const previewMsg = await ctx.replyWithPhoto(
+        { source: thumbBuf, filename: `option-${i + 1}.jpg` },
+        { caption: `${i + 1}️⃣  ${img.label}` }
+      );
+      previewMsgIds.push(previewMsg.message_id);
+    }
+
+    // Send pick buttons
+    const rows = imageResults.map((img, i) =>
+      [Markup.button.callback(`${i + 1}️⃣  ${img.label}`, `bsimg:${i}`)]
+    );
+    const pickerMsg = await ctx.reply(
+      `🖼️ *Pick a background image:*`,
+      { parse_mode: "Markdown", ...Markup.inlineKeyboard(rows) }
+    );
+
+    pending.previewMsgIds = previewMsgIds;
+    pending.pickerMsgId = pickerMsg.message_id;
+
+    await ctx.telegram.deleteMessage(chatId, pending.progressMsgId).catch(() => {});
+    return;
+  }
+
   // ── Betslip image option pick ──────────────────────────────────────────
   if (data.startsWith("bsimg:")) {
     const idx = parseInt(data.slice(6), 10);
@@ -1620,10 +1696,43 @@ async function processBetSlipPhoto(ctx, photoMsg) {
       return;
     }
 
-    // Step 2: Search for image previews via Digi
+    // Step 2: Show headline options (if multiple)
+    const headlines = analysis.headlines || [analysis.headline];
+    if (headlines.length > 1) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, progressMsg.message_id, undefined,
+        `📊 *${analysis.sport || "Sports"}* — ${analysis.teams?.join(" vs ") || ""}\n\n📝 *Pick a headline:*`,
+        { parse_mode: "Markdown" }
+      ).catch(() => {});
+
+      const headlineRows = headlines.map((h, i) =>
+        [Markup.button.callback(`${i + 1}️⃣ ${h.slice(0, 50)}`, `bshl:${i}`)]
+      );
+      const hlPickerMsg = await ctx.reply(
+        headlines.map((h, i) => `${i + 1}️⃣  ${h}`).join("\n"),
+        { ...Markup.inlineKeyboard(headlineRows) }
+      );
+
+      // Store pending with headlines, wait for selection
+      _betslipPending.set(ctx.from.id, {
+        analysis,
+        betSlipBase64: base64,
+        betSlipMime: mime,
+        photoMsg,
+        imageResults: [],
+        headlines,
+        headlinePickerMsgId: hlPickerMsg.message_id,
+        progressMsgId: progressMsg.message_id,
+        chatId: ctx.chat.id,
+        step: "headline",
+      });
+      return;
+    }
+
+    // Single headline — skip straight to image search
+    // Step 3: Search for image previews via Digi
     const options = analysis.imageOptions || [];
     if (options.length === 0) {
-      // Fallback: no options, auto-generate
       await ctx.telegram.editMessageText(
         ctx.chat.id, progressMsg.message_id, undefined,
         "🎨 Generating cover..."
