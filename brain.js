@@ -640,11 +640,14 @@ From the bet slip, extract:
 1. The teams/players involved
 2. The sport (NBA, NFL, UFC, soccer, etc.)
 3. A short, punchy headline (6-12 words) — make it sound like sports media, not a bet description. IMPORTANT: When the headline is split into 3 lines, every line must have at least 3 words. Avoid short 2-word phrases that would create oversized text.
-4. Exactly 3 image options — ALL should show the top star from each team TOGETHER on the court:
+4. Exactly 3 image options — ALL should show the top stars from each team TOGETHER:
    - Identify the biggest star from team 1 and the biggest star from team 2
-   - All 3 queries search for those SAME two players together, just with different search angles
-   - Example: Lakers vs Rockets → all 3 queries feature "LeBron James" and "Jalen Green" together
-   - Example: Knicks vs Hornets → all 3 queries feature "Jalen Brunson" and "LaMelo Ball" together
+   - Keep queries SHORT and simple — just the two player names + team names. Less is more for image search.
+   - DO NOT add generic filler words like "matchup", "on court", "face to face", "guarding", "action shot"
+   - DO NOT add the year — image search engines handle recency on their own
+   - Vary queries slightly: use team abbreviations vs full names, swap player order
+   - Example: Lakers vs Rockets → "LeBron James Jalen Green Lakers Rockets", "Jalen Green LeBron James NBA", "LeBron Jalen Green Houston LA"
+   - Example: Knicks vs Hornets → "Jalen Brunson LaMelo Ball Knicks Hornets", "LaMelo Ball Jalen Brunson NBA", "Brunson LaMelo New York Charlotte"
 5. An Instagram ad caption — short, engaging, sports-media style with relevant emojis and hashtags
 
 The headline should be written in the style of sports media covers — dramatic, attention-grabbing.
@@ -662,9 +665,9 @@ Return ONLY valid JSON:
   "sport": "NBA",
   "headline": "THE HEADLINE TEXT",
   "imageOptions": [
-    { "label": "LeBron vs Jalen", "query": "LeBron James Jalen Green Lakers Rockets matchup on court 2026 NBA" },
-    { "label": "LeBron & Jalen game", "query": "LeBron James guarding Jalen Green NBA game 2026 HD" },
-    { "label": "Lakers Rockets action", "query": "LeBron James Jalen Green face to face Lakers vs Rockets 2026" }
+    { "label": "LeBron vs Jalen", "query": "LeBron James Jalen Green Lakers Rockets" },
+    { "label": "LeBron & Jalen", "query": "Jalen Green LeBron James NBA basketball" },
+    { "label": "Lakers Rockets", "query": "LeBron Jalen Green Houston Los Angeles" }
   ],
   "accentColor": "#hex color that matches the favored team",
   "caption": "The Instagram ad caption with emojis and hashtags"
