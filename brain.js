@@ -85,8 +85,15 @@ Return ONLY valid JSON matching this schema:
   "lesson": string | null        // if action==="lesson", the insight to save
 }
 
-Be conservative — only mark relevant=true if the message clearly relates to a sales deal, prospect, or negotiation.
-Ignore operational messages about ad posting, scheduling, content, or internal logistics.
+Be conservative — only mark relevant=true if the message clearly relates to a CLIENT sales deal, prospect, or ad campaign negotiation.
+
+IGNORE and mark as action="ignore" for:
+- Operational messages about ad posting, scheduling, content, or internal logistics
+- Page ACQUISITIONS — discussions about buying, selling, or valuing Instagram/social media pages (e.g. "1.19M followers", "$250K quoted", "get an offer in", "discovery call" for page purchases, "serious asset", follower counts)
+- Internal team discussions about acquiring pages or accounts for the company's portfolio
+- These are NOT client deals — they are internal business acquisitions
+
+Only track deals where Bolis Media is SELLING services (ad campaigns, content, marketing) TO a client.
 Respond with raw JSON only, no markdown formatting or code fences.`;
 
 async function classifyMessage(senderHandle, text) {
