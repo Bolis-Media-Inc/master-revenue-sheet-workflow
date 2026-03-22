@@ -906,6 +906,93 @@ async function renderCoverWithQuery(betSlipBase64, betSlipMime, analysis, imageQ
   }
 }
 
+// ── Image feedback (learning from user corrections) ─────────────────────────
+
+async function storeImageFeedback({ userId, feedbackText, imageQuery, pageHandle, context }) {
+  try {
+    const { error } = await supabase.from("image_feedback").insert({
+      user_id: String(userId),
+      feedback_text: feedbackText,
+      image_query: imageQuery || null,
+      page_handle: pageHandle || null,
+      context: context || null,
+    });
+    if (error) console.warn("[brain] Failed to store image feedback:", error.message);
+    else console.log(`[brain] ✅ Image feedback stored: "${feedbackText.slice(0, 60)}"`);
+    return !error;
+  } catch (e) {
+    console.warn("[brain] storeImageFeedback error:", e.message);
+    return false;
+  }
+}
+
+async function getRecentFeedback(pageHandle, limit = 10) {
+  try {
+    let query = supabase
+      .from("image_feedback")
+      .select("feedback_text, image_query, created_at")
+      .order("created_at", { ascending: false })
+      .limit(limit);
+    if (pageHandle) query = query.eq("page_handle", pageHandle);
+    const { data } = await query;
+    return data || [];
+  } catch (e) {
+    console.warn("[brain] getRecentFeedback error:", e.message);
+    return [];
+  }
+}
+
+// ── /inspire — analyze a competitor cover and generate engagement bait ───────
+
+const INSPIRE_SYSTEM = `You are Greg, a sports media creative director.
+You're analyzing a screenshot of a competitor's social media cover/post.
+
+Extract:
+1. The topic/subject of the post
+2. The headline style (dramatic, factual, list-based, etc.)
+3. The visual composition (photo type, text placement, colors)
+
+Then generate exactly 3 engagement-bait headline variations that:
+- Take the SAME topic but make it more clickbait-y, debatable, or curiosity-driven
+- Use power words: "NOBODY Expected", "Changed Everything", "The Truth About", "What Really Happened"
+- Are 8-12 words each (good for 2-3 line layouts)
+- Would make someone STOP scrolling
+
+Return ONLY valid JSON:
+{
+  "originalTopic": "what the competitor post is about",
+  "style": "their headline style",
+  "variations": [
+    "ENGAGEMENT BAIT HEADLINE 1",
+    "ENGAGEMENT BAIT HEADLINE 2",
+    "ENGAGEMENT BAIT HEADLINE 3"
+  ]
+}
+
+Respond with raw JSON only, no markdown or code fences.`;
+
+async function analyzeCompetitorCover(imageBase64, mimeType = "image/png") {
+  try {
+    const msg = await anthropic.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 400,
+      system: INSPIRE_SYSTEM,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: mimeType, data: imageBase64 } },
+          { type: "text", text: "Analyze this cover and generate engagement bait variations." },
+        ],
+      }],
+    });
+    const raw = msg.content[0].text.trim();
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error("[brain] analyzeCompetitorCover error:", e.message);
+    return null;
+  }
+}
+
 // -- Exports --------------------------------------------------------------
 
 module.exports = {
@@ -922,4 +1009,7 @@ module.exports = {
   renderCoverWithQuery,
   searchBetSlipImages,
   renderCoverWithImage,
+  storeImageFeedback,
+  getRecentFeedback,
+  analyzeCompetitorCover,
 };

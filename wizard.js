@@ -1034,6 +1034,27 @@ bot.on("callback_query", async (ctx) => {
     return;
   }
 
+  // ── Inspire headline pick ─────────────────────────────────────────────
+  if (data.startsWith("insp:")) {
+    const idx = parseInt(data.slice(5), 10);
+    const pending = _inspirePending.get(ctx.from.id);
+    if (!pending) return;
+    const chosen = pending.variations[idx];
+    if (!chosen) return;
+    _inspirePending.delete(ctx.from.id);
+
+    // Clean up picker
+    await ctx.telegram.deleteMessage(pending.chatId || ctx.chat.id, ctx.callbackQuery.message.message_id).catch(() => {});
+
+    // Send the chosen headline as a ready-to-use topic
+    await ctx.reply(
+      `✅ *Headline selected:*\n\n📝 "${chosen}"\n\n` +
+      `_You can now use this with /generate or forward it to Digi for a super post._`,
+      { parse_mode: "Markdown" }
+    );
+    return;
+  }
+
   // ── Edit template selection (ebs: = edit bulk select, ecs: = edit camp select)
   if (data.startsWith("ebs:") || data.startsWith("ecs:")) {
     const kind = data.startsWith("ebs:") ? "bulk" : "camp";
@@ -1663,9 +1684,16 @@ bot.command("betslip", async (ctx) => {
 
 // Listen for photos when awaiting bet slip
 bot.on("photo", async (ctx) => {
-  if (!_awaitingBetSlip.has(ctx.chat.id)) return;
-  _awaitingBetSlip.delete(ctx.chat.id);
-  await processBetSlipPhoto(ctx, ctx.message);
+  // /inspire waiting for a competitor screenshot
+  if (_awaitingInspire.has(ctx.chat.id)) {
+    _awaitingInspire.delete(ctx.chat.id);
+    return await processInspirePhoto(ctx, ctx.message);
+  }
+  // /betslip waiting for a bet slip photo
+  if (_awaitingBetSlip.has(ctx.chat.id)) {
+    _awaitingBetSlip.delete(ctx.chat.id);
+    return await processBetSlipPhoto(ctx, ctx.message);
+  }
 });
 
 // Store pending betslip data while user picks an image option
@@ -1907,10 +1935,103 @@ async function finalizeBetSlipCover(ctx, userId, bgImageBase64, imageQuery) {
   }
 }
 
+// ── /inspire — analyze a competitor cover and generate engagement bait ────────
+// Usage: reply to a competitor's cover image with /inspire
+
+const _awaitingInspire = new Set(); // chat IDs waiting for an inspire photo
+
+bot.command("inspire", async (ctx) => {
+  try {
+    const replyMsg = ctx.message.reply_to_message;
+    if (replyMsg && replyMsg.photo?.length) {
+      return await processInspirePhoto(ctx, replyMsg);
+    }
+
+    _awaitingInspire.add(ctx.chat.id);
+    await ctx.reply("📸 Send me a screenshot of a competitor's cover and I'll generate engagement bait variations.");
+    setTimeout(() => _awaitingInspire.delete(ctx.chat.id), 120000);
+  } catch (err) {
+    console.error("[wizard] /inspire error:", err.message);
+    await ctx.reply("Inspire error: " + err.message);
+  }
+});
+
+// Store pending inspire data
+const _inspirePending = new Map(); // userId → { variations, originalTopic }
+
+async function processInspirePhoto(ctx, photoMsg) {
+  try {
+    const progressMsg = await ctx.reply("🔍 Analyzing competitor cover...");
+
+    const photo = photoMsg.photo[photoMsg.photo.length - 1];
+    const fileLink = await ctx.telegram.getFileLink(photo.file_id);
+    const res = await fetch(fileLink.href);
+    if (!res.ok) throw new Error("Failed to download photo");
+    const buffer = Buffer.from(await res.arrayBuffer());
+    const base64 = buffer.toString("base64");
+    const mime = fileLink.href.includes(".png") ? "image/png" : "image/jpeg";
+
+    const result = await brain.analyzeCompetitorCover(base64, mime);
+    if (!result || !result.variations?.length) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, progressMsg.message_id, undefined,
+        "❌ Could not analyze this cover — try a clearer screenshot."
+      );
+      return;
+    }
+
+    await ctx.telegram.deleteMessage(ctx.chat.id, progressMsg.message_id).catch(() => {});
+
+    const text = `🎯 *Original topic:* ${result.originalTopic}\n` +
+      `📐 *Style:* ${result.style}\n\n` +
+      `🔥 *Engagement bait variations:*\n\n` +
+      result.variations.map((v, i) => `${i + 1}️⃣  ${v}`).join("\n");
+
+    const rows = result.variations.map((v, i) =>
+      [Markup.button.callback(`${i + 1}️⃣ Use this headline`, `insp:${i}`)]
+    );
+
+    const pickerMsg = await ctx.reply(text, {
+      parse_mode: "Markdown",
+      ...Markup.inlineKeyboard(rows),
+    });
+
+    _inspirePending.set(ctx.from.id, {
+      variations: result.variations,
+      originalTopic: result.originalTopic,
+      pickerMsgId: pickerMsg.message_id,
+      chatId: ctx.chat.id,
+    });
+  } catch (err) {
+    console.error("[wizard] processInspirePhoto error:", err.message);
+    await ctx.reply("❌ Inspire error: " + err.message);
+  }
+}
+
 // ── Text messages ─────────────────────────────────────────────────────────────
 
 bot.on("text", async (ctx) => {
   if (ctx.message.text.startsWith("/")) return;
+
+  // ── Reply feedback on sourced/betslip images ──────────────────────────
+  const reply = ctx.message.reply_to_message;
+  if (reply && (reply.photo || reply.document) && ctx.message.text.length > 3) {
+    // User is replying to an image with feedback text
+    const feedbackText = ctx.message.text.trim();
+    const caption = reply.caption || "";
+    // Try to extract context from the caption (image label, query, etc.)
+    const stored = await brain.storeImageFeedback({
+      userId: String(ctx.from.id),
+      feedbackText,
+      imageQuery: caption || null,
+      pageHandle: null, // could be extracted from session context
+      context: `Reply to image: "${caption.slice(0, 100)}"`,
+    });
+    if (stored) {
+      await ctx.reply("👍 Got it — I'll remember that for future searches.", { reply_to_message_id: ctx.message.message_id });
+    }
+    return;
+  }
 
   // ── Handle collab preset text input ────────────────────────────────────
   const collabSess = _collabSessions.get(ctx.from.id);
