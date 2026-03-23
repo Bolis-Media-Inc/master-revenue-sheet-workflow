@@ -47,9 +47,9 @@ function getPrecedingMessages(chatId, beforeMessageId, count = 2) {
   const adIdx = buf.findIndex((m) => m.message_id === beforeMessageId);
 
   if (adIdx <= 0) {
-    // Ad message not found in buffer, or it's the very first — return whatever we have
-    // (this happens if the bot just started and missed earlier messages)
-    return buf.slice(Math.max(0, buf.length - count));
+    // Ad message not found in buffer, or it's the very first — return empty.
+    // Never return random buffer messages as a fallback.
+    return [];
   }
 
   // Return up to `count` messages before the ad
@@ -82,9 +82,9 @@ function getContentBundlesByPage(chatId, adMessageId) {
   const adIdx = buf.findIndex((m) => m.message_id === adMessageId);
 
   // Messages before the ad (oldest … newest, not including the ad itself)
-  const preceding = adIdx > 0
-    ? buf.slice(0, adIdx)
-    : buf.slice(0, Math.max(0, buf.length - 1));
+  // If the ad wasn't found in the buffer, return empty — never scan random buffer contents.
+  if (adIdx <= 0) return new Map();
+  const preceding = buf.slice(0, adIdx);
 
   const result = new Map();
   let pendingContent = []; // media messages collected since the last label (going backwards)
@@ -153,10 +153,9 @@ function getCollabBundlesByPage(chatId, adMessageId) {
   const buf = _buffers.get(String(chatId)) || [];
   const adIdx = buf.findIndex((m) => m.message_id === adMessageId);
 
-  // Messages before the ad (oldest → newest)
-  const preceding = adIdx > 0
-    ? buf.slice(0, adIdx)
-    : buf.slice(0, Math.max(0, buf.length - 1));
+  // If the ad wasn't found in the buffer, return null — never scan random buffer contents.
+  if (adIdx <= 0) return null;
+  const preceding = buf.slice(0, adIdx);
 
   // "Host: @handle, invite: @a @b @c"
   // Handles may appear on separate lines within the same message text.
@@ -167,18 +166,18 @@ function getCollabBundlesByPage(chatId, adMessageId) {
 
   // ── Forward pass (oldest → newest) ──────────────────────────────────────
   // Group messages into {video, hostMsgs[]} blocks.
-  // A new block opens every time we see a video file.
+  // A new block opens every time we see a media file (video, document, photo, animation).
   // Host messages after a video belong to that video's block.
-  // Plain text that isn't a Host: line is treated as shared caption copy
-  // (e.g. "Now he can buy 100,000 new shirts 🥹👕") and forwarded to every page.
-  const groups      = []; // Array<{video: msg|null, hostMsgs: [{msg, handles: string[]}]}>
-  const captionMsgs = []; // Plain-text caption/promo messages shared by all pages
+  // Plain text that isn't a Host: line is IGNORED to avoid forwarding
+  // chat noise (old captions, "Thank you", "." etc) to page channels.
+  const groups  = []; // Array<{video: msg|null, hostMsgs: [{msg, handles: string[]}]}>
   let current = { video: null, hostMsgs: [] };
 
   for (const msg of preceding) {
     const text = (msg.text || "").trim();
+    const hasMedia = !!(msg.video || msg.document || msg.photo || msg.animation);
 
-    if (msg.video || msg.document) {
+    if (hasMedia) {
       // Flush the current block (if it has any host messages) and open a new one
       if (current.hostMsgs.length > 0) groups.push(current);
       current = { video: msg, hostMsgs: [] };
@@ -190,25 +189,22 @@ function getCollabBundlesByPage(chatId, adMessageId) {
         const inviteHandles = (m[2].match(/@([\w.]+)/g) || [])
           .map((h) => h.slice(1).toLowerCase());
         current.hostMsgs.push({ msg, handles: [hostHandle, ...inviteHandles] });
-      } else if (text) {
-        // Plain text that isn't a Host: line — treat as shared caption/promo copy.
-        // Collect it so we can append it to every page's bundle.
-        captionMsgs.push(msg);
       }
+      // All other text (captions, chat noise) is intentionally ignored
+      // to prevent flooding destination channels with old messages.
     }
   }
   // Flush final block
   if (current.hostMsgs.length > 0) groups.push(current);
 
-  // ── Build handle → [video?, hostMsg, ...captionMsgs] map ─────────────────
+  // ── Build handle → [video?, hostMsg] map ──────────────────────────────────
   const result = new Map();
   for (const group of groups) {
     for (const { msg: hostMsg, handles } of group.hostMsgs) {
-      // Order: video → host/invite message → caption copy (same order as the chat)
+      // Order: media → host/invite message (no random text)
       const toForward = [
         ...(group.video ? [group.video] : []),
         hostMsg,
-        ...captionMsgs,
       ];
       for (const handle of handles) {
         result.set(handle, toForward);

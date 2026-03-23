@@ -49,6 +49,11 @@ const isPageEnabled = (handle) =>
 // Placeholder values that haven't been filled in yet (to skip writing to that sheet)
 const PLACEHOLDER_PATTERN = /^(SHEET_ID_|TELEGRAM_CHAT_ID_)/;
 
+// Track recently processed ad message IDs to prevent duplicate forwarding
+// (e.g. from webhook retries or Railway restarts replaying pending updates)
+const _recentlyProcessed = new Set();
+const DEDUP_MAX_SIZE = 200;
+
 /**
  * Build a row for an individual page's "IG Revenue Tracker" tab.
  * Column structure (different from master sheet):
@@ -122,8 +127,14 @@ function buildRow(parsed) {
 async function forwardToPage(telegram, sourceChatId, adMessageId, precedingMsgs, destChatId, pageHandle) {
   const results = [];
 
-  // Forward content messages first (oldest → newest), then the ad brief
-  const messagesToForward = [...precedingMsgs, { message_id: adMessageId, _isAdBrief: true }];
+  // Only forward content messages that have actual media (photo/video/document/animation).
+  // Skip text-only messages to avoid sending empty-looking forwards.
+  const mediaOnly = precedingMsgs.filter((msg) =>
+    msg.photo || msg.video || msg.document || msg.animation
+  );
+
+  // Forward media content first (oldest → newest), then the ad brief
+  const messagesToForward = [...mediaOnly, { message_id: adMessageId, _isAdBrief: true }];
 
   for (const msg of messagesToForward) {
     try {
@@ -215,6 +226,19 @@ async function handleAdMessage(ctx) {
 
     // Not an ad message — ignore silently
     if (!parsed) return;
+
+    // Dedup: skip if we already processed this exact message (webhook retry / restart replay)
+    const msgId = ctx.message.message_id;
+    if (_recentlyProcessed.has(msgId)) {
+      console.log(`[adHandler] ⏭️ Skipping duplicate message ${msgId}`);
+      return;
+    }
+    _recentlyProcessed.add(msgId);
+    if (_recentlyProcessed.size > DEDUP_MAX_SIZE) {
+      // Trim oldest entries (Sets iterate in insertion order)
+      const iter = _recentlyProcessed.values();
+      for (let i = 0; i < 50; i++) _recentlyProcessed.delete(iter.next().value);
+    }
 
     // Normalise to array so multi-page and single-page use the same code path
     const parsedList = Array.isArray(parsed) ? parsed : [parsed];
@@ -321,6 +345,10 @@ async function handleAdMessage(ctx) {
       let forwardOk      = 0;
       let forwardSkipped = 0;
 
+      // Track which destination chats have already received the ad brief
+      // to prevent sending the same brief 3-4x when multiple handles share a channel
+      const forwardedDestinations = new Set();
+
       for (const handle of uniqueHandles) {
         const destChatId = destinations[handle];
 
@@ -329,6 +357,15 @@ async function handleAdMessage(ctx) {
           forwardSkipped++;
           continue;
         }
+
+        // Dedup by destination chat — skip if we already forwarded the ad brief to this channel
+        const destKey = String(destChatId);
+        if (forwardedDestinations.has(destKey)) {
+          console.log(`[adHandler] ⏭️ Skipping @${handle} — ad already forwarded to ${destKey}`);
+          forwardSkipped++;
+          continue;
+        }
+        forwardedDestinations.add(destKey);
 
         // ── Pick the right content messages for this page ──────────────────
         let contentMsgs;
