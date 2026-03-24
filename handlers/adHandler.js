@@ -13,7 +13,7 @@
 
 const { parseAdMessage }       = require("../parser");
 const { appendRow, markForwarded, updateStatusToLive, appendReminder } = require("../sheets");
-const { getPrecedingMessages, getContentBundlesByPage, getCollabBundlesByPage, MAX_BUFFER_PER_CHAT } = require("../messageBuffer");
+const { getPrecedingMessages, getContentBundlesByPage, getCollabBundlesByPage, clearBufferUpTo, MAX_BUFFER_PER_CHAT } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
 const pages                    = require("../config/pages.json");
@@ -124,7 +124,7 @@ function buildRow(parsed) {
  * @param {string} destChatId      Destination Telegram chat ID (page's group/DM)
  * @param {string} pageHandle      For logging
  */
-async function forwardToPage(telegram, sourceChatId, adMessageId, precedingMsgs, destChatId, pageHandle) {
+async function forwardToPage(telegram, sourceChatId, adMessageId, precedingMsgs, destChatId, pageHandle, adCaption) {
   const results = [];
 
   // Only forward content messages that have actual media (photo/video/document/animation).
@@ -133,20 +133,35 @@ async function forwardToPage(telegram, sourceChatId, adMessageId, precedingMsgs,
     msg.photo || msg.video || msg.document || msg.animation
   );
 
-  // Forward media content first (oldest → newest), then the ad brief
-  const messagesToForward = [...mediaOnly, { message_id: adMessageId, _isAdBrief: true }];
-
-  for (const msg of messagesToForward) {
+  // Forward media content first using copyMessage (allows adding a caption),
+  // then forward the ad brief using forwardMessage (preserves "Forwarded from" attribution).
+  for (const msg of mediaOnly) {
     try {
-      await telegram.forwardMessage(
+      const caption = adCaption ? `📎 ${adCaption} — @${pageHandle}` : `📎 Ad content — @${pageHandle}`;
+      await telegram.copyMessage(
         destChatId,       // to
         sourceChatId,     // from chat
-        msg.message_id    // message to forward
+        msg.message_id,   // message to copy
+        { caption, parse_mode: "HTML" }
       );
-      results.push(`✅ msg ${msg.message_id}`);
+      results.push(`✅ media ${msg.message_id}`);
     } catch (err) {
-      results.push(`❌ msg ${msg.message_id}: ${err.message}`);
+      // Fall back to forwardMessage if copyMessage fails (e.g., message too old)
+      try {
+        await telegram.forwardMessage(destChatId, sourceChatId, msg.message_id);
+        results.push(`✅ fwd ${msg.message_id}`);
+      } catch (err2) {
+        results.push(`❌ msg ${msg.message_id}: ${err2.message}`);
+      }
     }
+  }
+
+  // Forward the ad brief itself (forwardMessage preserves sender attribution)
+  try {
+    await telegram.forwardMessage(destChatId, sourceChatId, adMessageId);
+    results.push(`✅ brief ${adMessageId}`);
+  } catch (err) {
+    results.push(`❌ brief ${adMessageId}: ${err.message}`);
   }
 
   console.log(`[adHandler] Forward @${pageHandle} → ${destChatId}: ${results.join(", ")}`);
@@ -320,7 +335,6 @@ async function handleAdMessage(ctx) {
       const hasLabels = contentBundles.size > 0;
       const hasCollab = collabBundles !== null;   // null = not collab, Map = collab
 
-      let fallbackMsgs = [];
       if (hasLabels) {
         console.log(
           `[adHandler] 📤 Per-creative format — ${contentBundles.size} labeled bundle(s): ` +
@@ -331,11 +345,14 @@ async function handleAdMessage(ctx) {
           `[adHandler] 📤 Collab format — ${collabBundles.size} page(s) mapped from Host/invite messages`
         );
       } else {
-        // Standard format — no labeled bundles, no collab.
-        // Send brief only (no preceding content) to avoid forwarding stale
-        // buffer messages (reminders, chat noise, etc.) to page groups.
-        console.log(`[adHandler] 📤 Standard format — brief only, no preceding content`);
+        // Standard format — grab the preceding N messages (media-only filter in forwardToPage)
+        console.log(`[adHandler] 📤 Standard format — forwarding preceding media + brief`);
       }
+
+      // Build ad caption for media messages (client + category)
+      const adCaption = parsedList[0].client
+        ? `${parsedList[0].client}${parsedList[0].category ? ` — ${parsedList[0].category}` : ""}`
+        : null;
 
       // Only forward for pages that are enabled AND have a configured destination
       const uniqueHandles = [...new Set(
@@ -399,8 +416,8 @@ async function handleAdMessage(ctx) {
           }
 
         } else {
-          // Format 3 — standard (brief only, no preceding content)
-          contentMsgs = [];
+          // Format 3 — standard: grab preceding messages, forwardToPage filters to media-only
+          contentMsgs = getPrecedingMessages(sourceChatId, adMessageId, CONTENT_MESSAGES_TO_FORWARD);
         }
 
         try {
@@ -410,7 +427,8 @@ async function handleAdMessage(ctx) {
             adMessageId,
             contentMsgs,
             String(destChatId),
-            handle
+            handle,
+            adCaption
           );
           forwardOk++;
 
@@ -450,6 +468,10 @@ async function handleAdMessage(ctx) {
       console.log(
         `[adHandler] 📤 Forward summary: ${forwardOk} sent, ${forwardSkipped} skipped`
       );
+
+      // Clear the buffer up to and including this ad message so stale
+      // content from this batch doesn't leak into the next ad's scan.
+      clearBufferUpTo(sourceChatId, adMessageId);
     }
 
     // ── Optional: reply in the chat with a status update ──────────────────────

@@ -215,4 +215,23 @@ function getCollabBundlesByPage(chatId, adMessageId) {
   return result;
 }
 
-module.exports = { addMessage, getPrecedingMessages, getContentBundlesByPage, getCollabBundlesByPage, MAX_BUFFER_PER_CHAT };
+/**
+ * Clear all messages in the buffer for a given chat up to (and including)
+ * a specific message ID. Called after an ad is processed so that stale
+ * messages from previous ad batches don't contaminate future scans.
+ *
+ * @param {string} chatId
+ * @param {number} upToMessageId  Clear everything up to and including this message
+ */
+function clearBufferUpTo(chatId, upToMessageId) {
+  const buf = _buffers.get(String(chatId));
+  if (!buf) return;
+
+  const idx = buf.findIndex((m) => m.message_id === upToMessageId);
+  if (idx >= 0) {
+    // Remove everything up to and including the ad message
+    buf.splice(0, idx + 1);
+  }
+}
+
+module.exports = { addMessage, getPrecedingMessages, getContentBundlesByPage, getCollabBundlesByPage, clearBufferUpTo, MAX_BUFFER_PER_CHAT };
