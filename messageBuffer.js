@@ -165,13 +165,12 @@ function getCollabBundlesByPage(chatId, adMessageId) {
   if (!preceding.some((m) => HOST_RE.test((m.text || "").trim()))) return null;
 
   // ── Forward pass (oldest → newest) ──────────────────────────────────────
-  // Group messages into {video, hostMsgs[]} blocks.
+  // Group messages into {video, captionMsgs[], hostMsgs[]} blocks.
   // A new block opens every time we see a media file (video, document, photo, animation).
-  // Host messages after a video belong to that video's block.
-  // Plain text that isn't a Host: line is IGNORED to avoid forwarding
-  // chat noise (old captions, "Thank you", "." etc) to page channels.
-  const groups  = []; // Array<{video: msg|null, hostMsgs: [{msg, handles: string[]}]}>
-  let current = { video: null, hostMsgs: [] };
+  // Text between a video and the next Host: line = caption for that group.
+  // Text BEFORE any video = old noise (ignored).
+  const groups  = []; // Array<{video: msg|null, captionMsgs: msg[], hostMsgs: [{msg, handles: string[]}]}>
+  let current = { video: null, captionMsgs: [], hostMsgs: [] };
 
   for (const msg of preceding) {
     const text = (msg.text || "").trim();
@@ -180,7 +179,7 @@ function getCollabBundlesByPage(chatId, adMessageId) {
     if (hasMedia) {
       // Flush the current block (if it has any host messages) and open a new one
       if (current.hostMsgs.length > 0) groups.push(current);
-      current = { video: msg, hostMsgs: [] };
+      current = { video: msg, captionMsgs: [], hostMsgs: [] };
 
     } else {
       const m = text.match(HOST_RE);
@@ -189,21 +188,25 @@ function getCollabBundlesByPage(chatId, adMessageId) {
         const inviteHandles = (m[2].match(/@([\w.]+)/g) || [])
           .map((h) => h.slice(1).toLowerCase());
         current.hostMsgs.push({ msg, handles: [hostHandle, ...inviteHandles] });
+      } else if (text && current.video && current.hostMsgs.length === 0) {
+        // Text between a video and the first Host: message = caption/promo for this group.
+        // Only collect if we have a video (ignore text before any video = old noise).
+        current.captionMsgs.push(msg);
       }
-      // All other text (captions, chat noise) is intentionally ignored
-      // to prevent flooding destination channels with old messages.
+      // Text before any video or after Host: messages is ignored.
     }
   }
   // Flush final block
   if (current.hostMsgs.length > 0) groups.push(current);
 
-  // ── Build handle → [video?, hostMsg] map ──────────────────────────────────
+  // ── Build handle → [video?, captionMsgs..., hostMsg] map ──────────────────
   const result = new Map();
   for (const group of groups) {
     for (const { msg: hostMsg, handles } of group.hostMsgs) {
-      // Order: media → host/invite message (no random text)
+      // Order: video → caption text → host/invite message (matches how VAs post manually)
       const toForward = [
         ...(group.video ? [group.video] : []),
+        ...group.captionMsgs,
         hostMsg,
       ];
       for (const handle of handles) {
