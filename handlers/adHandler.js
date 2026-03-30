@@ -13,7 +13,7 @@
 
 const { parseAdMessage }       = require("../parser");
 const { appendRow, markForwarded, updateStatusToLive, appendReminder } = require("../sheets");
-const { getPrecedingMessages, getContentBundlesByPage, getCollabBundlesByPage, clearBufferUpTo, MAX_BUFFER_PER_CHAT } = require("../messageBuffer");
+const { clearBufferUpTo } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
 const pages                    = require("../config/pages.json");
@@ -27,9 +27,6 @@ const TARGET_CHAT_IDS = new Set(
 const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
 const TAB_NAME        = process.env.SHEET_TAB_NAME      || "2026 Ad Overview";
 const PAGE_TAB_NAME   = process.env.PAGE_SHEET_TAB_NAME || "IG Revenue Tracker";
-
-// How many messages before the ad brief to grab as content (image / video / copy)
-const CONTENT_MESSAGES_TO_FORWARD = parseInt(process.env.FORWARD_PRECEDING_COUNT || "2");
 
 // Set FORWARDING_ENABLED=true in env to turn on forwarding
 const FORWARDING_ENABLED = (process.env.FORWARDING_ENABLED || "").toLowerCase() === "true";
@@ -112,41 +109,24 @@ function buildRow(parsed) {
 }
 
 /**
- * Forward the ad content (preceding messages) + the ad brief itself
- * to the Telegram destination for a single page handle.
+ * Forward the ad brief to a page's Telegram destination channel.
  *
- * Uses forwardMessage so media + original sender info are preserved.
+ * Content (media/video) is now forwarded directly by Greg (wizard.js) at
+ * submission time — bm_tracking_bot only forwards the brief message itself.
  *
  * @param {object} telegram        ctx.telegram (Telegraf Telegram instance)
  * @param {string} sourceChatId    The group the ad came from
  * @param {number} adMessageId     The ad brief's message_id
- * @param {Array}  precedingMsgs   The content messages (image/video) before the ad
  * @param {string} destChatId      Destination Telegram chat ID (page's group/DM)
  * @param {string} pageHandle      For logging
  */
-async function forwardToPage(telegram, sourceChatId, adMessageId, precedingMsgs, destChatId, pageHandle) {
-  const results = [];
-
-  // Forward all content messages (media + text like captions and Host: messages)
-  // using forwardMessage to preserve original format (video stays as video,
-  // original captions are kept, "Forwarded from" attribution shown).
-  const messagesToForward = [...precedingMsgs, { message_id: adMessageId }];
-
-  for (const msg of messagesToForward) {
-    try {
-      await telegram.forwardMessage(
-        destChatId,       // to
-        sourceChatId,     // from chat
-        msg.message_id    // message to forward
-      );
-      results.push(`✅ msg ${msg.message_id}`);
-    } catch (err) {
-      results.push(`❌ msg ${msg.message_id}: ${err.message}`);
-    }
+async function forwardToPage(telegram, sourceChatId, adMessageId, destChatId, pageHandle) {
+  try {
+    await telegram.forwardMessage(destChatId, sourceChatId, adMessageId);
+    console.log(`[adHandler] ✅ Forward brief @${pageHandle} → ${destChatId}`);
+  } catch (err) {
+    console.error(`[adHandler] ❌ Forward brief @${pageHandle} → ${destChatId}: ${err.message}`);
   }
-
-  console.log(`[adHandler] Forward @${pageHandle} → ${destChatId}: ${results.join(", ")}`);
-  return results;
 }
 
 /**
@@ -304,31 +284,9 @@ async function handleAdMessage(ctx) {
       const adMessageId  = ctx.message.message_id;
       const sourceChatId = chatId;
 
-      // ── Detect which content format this ad uses ──────────────────────────
-      //
-      // Priority 1 — Per-creative ("Thefuck.tv^" label + images per page)
-      // Priority 2 — Collab ("Host: @X, invite: @A @B" + paired video)
-      // Priority 3 — Standard (shared preceding N messages → all pages)
-      //
-      const contentBundles = getContentBundlesByPage(sourceChatId, adMessageId);
-      const collabBundles  = getCollabBundlesByPage(sourceChatId, adMessageId);
-
-      const hasLabels = contentBundles.size > 0;
-      const hasCollab = collabBundles !== null;   // null = not collab, Map = collab
-
-      if (hasLabels) {
-        console.log(
-          `[adHandler] 📤 Per-creative format — ${contentBundles.size} labeled bundle(s): ` +
-          [...contentBundles.keys()].join(", ")
-        );
-      } else if (hasCollab) {
-        console.log(
-          `[adHandler] 📤 Collab format — ${collabBundles.size} page(s) mapped from Host/invite messages`
-        );
-      } else {
-        // Standard format — grab the preceding N messages
-        console.log(`[adHandler] 📤 Standard format — forwarding preceding content + brief`);
-      }
+      // Content (media/video) is now forwarded directly by Greg (wizard.js)
+      // at submission time. bm_tracking_bot only forwards the ad brief.
+      console.log(`[adHandler] 📤 Forwarding brief to page channels (content handled by Greg)`);
 
       // Only forward for pages that are enabled AND have a configured destination
       const uniqueHandles = [...new Set(
@@ -360,48 +318,11 @@ async function handleAdMessage(ctx) {
         }
         forwardedDestinations.add(destKey);
 
-        // ── Pick the right content messages for this page ──────────────────
-        let contentMsgs;
-
-        // Helper: look up a handle in a Map, with a dot/underscore-stripped fallback
-        const lookupHandle = (map, h) => {
-          if (map.has(h)) return map.get(h);
-          const stripped = h.replace(/[._]/g, "");
-          for (const [k, v] of map) {
-            if (k.replace(/[._]/g, "") === stripped) return v;
-          }
-          return null;
-        };
-
-        if (hasLabels) {
-          // Format 1 — per-creative ("Thefuck.tv^" bundles)
-          contentMsgs = lookupHandle(contentBundles, handle);
-          if (!contentMsgs) {
-            console.warn(`[adHandler] ⚠️ No per-creative bundle for @${handle} — skipping forward`);
-            forwardSkipped++;
-            continue;
-          }
-
-        } else if (hasCollab) {
-          // Format 2 — collab ("Host: @X, invite: @A @B" + paired video)
-          contentMsgs = lookupHandle(collabBundles, handle);
-          if (!contentMsgs) {
-            console.warn(`[adHandler] ⚠️ No collab bundle for @${handle} — skipping forward`);
-            forwardSkipped++;
-            continue;
-          }
-
-        } else {
-          // Format 3 — standard: grab preceding messages, forwardToPage filters to media-only
-          contentMsgs = getPrecedingMessages(sourceChatId, adMessageId, CONTENT_MESSAGES_TO_FORWARD);
-        }
-
         try {
           await forwardToPage(
             ctx.telegram,
             sourceChatId,
             adMessageId,
-            contentMsgs,
             String(destChatId),
             handle
           );

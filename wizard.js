@@ -21,6 +21,7 @@ const path            = require("path");
 const { Telegraf, Markup } = require("telegraf");
 const cron            = require("node-cron");
 const brain           = require("./brain");
+const destinations    = require("./config/telegram-destinations.json");
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -714,6 +715,86 @@ async function postToGroup(telegram, session) {
   }
 }
 
+// ── Forward content directly to page channels ────────────────────────────────
+// Greg knows exactly which content goes to which page at submission time,
+// so we forward media directly to each page's destination channel here.
+// bm_tracking_bot only needs to forward the ad brief afterwards.
+
+const PLACEHOLDER_PATTERN = /^(SHEET_ID_|TELEGRAM_CHAT_ID_)/;
+
+async function forwardContentToPages(telegram, session) {
+  const { answers, content } = session;
+  const fmt = answers.format;
+  const pages = answers.pages || [];
+
+  if (!pages.length) return;
+
+  // Resolve unique destination chat IDs (dedup when multiple handles share a channel)
+  const forwardedDests = new Set();
+
+  const fwd = async (destChatId, ref) => {
+    try {
+      await telegram.forwardMessage(destChatId, ref.fromChatId, ref.msgId);
+    } catch (e) {
+      console.error(`[wizard] forwardContent error → ${destChatId}: ${e.message}`);
+    }
+  };
+
+  if (fmt === "Standard") {
+    // Shared content → every page
+    for (const handle of pages) {
+      const dest = destinations[handle] || destinations[handle.replace(/[._]/g, "")];
+      if (!dest || PLACEHOLDER_PATTERN.test(String(dest))) continue;
+      const destKey = String(dest);
+      if (forwardedDests.has(destKey)) continue;
+      forwardedDests.add(destKey);
+
+      for (const ref of content.shared) await fwd(destKey, ref);
+    }
+
+  } else if (fmt === "Per-creative") {
+    // Each page gets its own content
+    for (const handle of pages) {
+      const dest = destinations[handle] || destinations[handle.replace(/[._]/g, "")];
+      if (!dest || PLACEHOLDER_PATTERN.test(String(dest))) continue;
+      const destKey = String(dest);
+      if (forwardedDests.has(destKey)) continue;
+      forwardedDests.add(destKey);
+
+      const msgs = content.byHandle[handle] || [];
+      for (const ref of msgs) await fwd(destKey, ref);
+    }
+
+  } else if (fmt === "Collab") {
+    // Each collab group's media → all handles in that group (host + invites)
+    for (const g of content.collabGroups) {
+      const allHandles = [g.host, ...g.invites];
+      for (const handle of allHandles) {
+        const dest = destinations[handle] || destinations[handle.replace(/[._]/g, "")];
+        if (!dest || PLACEHOLDER_PATTERN.test(String(dest))) continue;
+        const destKey = String(dest);
+        if (forwardedDests.has(destKey)) continue;
+        forwardedDests.add(destKey);
+
+        for (const ref of g.media) await fwd(destKey, ref);
+      }
+    }
+  }
+
+  // Forward caption to all pages if set
+  if (answers.caption && forwardedDests.size > 0) {
+    for (const destKey of forwardedDests) {
+      try {
+        await telegram.sendMessage(destKey, answers.caption);
+      } catch (e) {
+        console.error(`[wizard] caption send error → ${destKey}: ${e.message}`);
+      }
+    }
+  }
+
+  console.log(`[wizard] 📤 Content forwarded to ${forwardedDests.size} destination(s)`);
+}
+
 // ── Edit wizard message in place ──────────────────────────────────────────────
 
 async function updateWizard(telegram, session) {
@@ -1288,6 +1369,7 @@ bot.on("callback_query", async (ctx) => {
     if (action === "post") {
       try {
         await postToGroup(ctx.telegram, session);
+        await forwardContentToPages(ctx.telegram, session);
         const brief = buildBrief(session.answers);
 
         // ── Increment ref counter (persisted in-process; resets on redeploy) ──
