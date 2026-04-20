@@ -138,32 +138,43 @@ async function onNewMessage(callback) {
   const { NewMessage } = require("telegram/events");
 
   client.addEventHandler(async (event) => {
-    const msg = event.message;
-    if (!msg?.message?.trim()) return;
-
-    // Get chat info
-    let chatName = "Unknown";
-    let chatId   = msg.chatId?.toString() || msg.peerId?.toString() || null;
     try {
-      const entity = await client.getEntity(msg.peerId);
-      chatName = entity.title || entity.username || chatName;
-    } catch (_) {}
+      const msg = event.message;
+      if (!msg?.message?.trim()) return;
 
-    const senderId = msg.senderId?.toString() || null;
-    let senderHandle = senderId;
-    try {
-      const sender = await client.getEntity(msg.senderId);
-      senderHandle = sender.username || sender.firstName || senderId;
-    } catch (_) {}
+      // Get chat info
+      let chatName = "Unknown";
+      let chatId   = msg.chatId?.toString() || msg.peerId?.toString() || null;
+      try {
+        const entity = await client.getEntity(msg.peerId);
+        chatName = entity.title || entity.username || chatName;
+      } catch (e) {
+        // CHANNEL_INVALID etc — skip silently, use defaults
+        if (e.errorMessage === 'CHANNEL_INVALID') {
+          console.warn(`[userClient] Skipping invalid channel: ${chatId}`);
+          return; // Don't process messages from channels we can't access
+        }
+      }
 
-    callback({
-      chatId,
-      chatName,
-      msgId:  msg.id,
-      text:   msg.message,
-      sender: senderHandle,
-      date:   new Date(msg.date * 1000),
-    });
+      const senderId = msg.senderId?.toString() || null;
+      let senderHandle = senderId;
+      try {
+        const sender = await client.getEntity(msg.senderId);
+        senderHandle = sender.username || sender.firstName || senderId;
+      } catch (_) {}
+
+      callback({
+        chatId,
+        chatName,
+        msgId:  msg.id,
+        text:   msg.message,
+        sender: senderHandle,
+        date:   new Date(msg.date * 1000),
+      });
+    } catch (e) {
+      // Don't let a single message error crash the entire listener
+      console.warn(`[userClient] Message handler error: ${e.message}`);
+    }
   }, new NewMessage({}));
 
   console.log("[userClient] 👂 Listening for new messages across all chats...");

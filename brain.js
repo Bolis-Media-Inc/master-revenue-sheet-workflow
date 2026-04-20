@@ -411,7 +411,8 @@ async function extractNightlyLessons() {
         }],
       });
 
-      const raw = msg.content[0]?.text?.trim() || "[]";
+      let raw = msg.content[0]?.text?.trim() || "[]";
+      raw = raw.replace(/^```json?\s*/i, '').replace(/```\s*$/g, '').trim();
       const lessons = JSON.parse(raw);
       for (const lesson of lessons) {
         await supabase.from("sales_lessons").insert({
@@ -985,7 +986,8 @@ async function analyzeCompetitorCover(imageBase64, mimeType = "image/png") {
         ],
       }],
     });
-    const raw = msg.content[0].text.trim();
+    let raw = msg.content[0].text.trim();
+    raw = raw.replace(/^```json?\s*/i, '').replace(/```\s*$/g, '').trim();
     return JSON.parse(raw);
   } catch (e) {
     console.error("[brain] analyzeCompetitorCover error:", e.message);
