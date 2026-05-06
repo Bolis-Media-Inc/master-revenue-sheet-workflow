@@ -142,6 +142,11 @@ async function handleAdMessage(ctx) {
     const text = ctx.message?.text || ctx.message?.caption;
     if (!text) return;
 
+    // ── Greg-handled brief → skip forwarding (Greg already forwarded per-page) ─
+    // Greg's API intake adds <!-- greg-handled --> as the first line of the brief
+    // so bm_tracking_bot writes to sheets but doesn't re-forward content.
+    const isGregHandled = /<!--\s*greg-handled\s*-->/i.test(text);
+
     // ── "Posted on" reply → flip matching rows from Scheduled → Live ───────────
     if (/^posted on\b/i.test(text.trim())) {
       const handles = text.split("\n")
@@ -279,7 +284,9 @@ async function handleAdMessage(ctx) {
     }
 
     // ── Forward content + ad brief to each page's Telegram destination ─────────
-    if (FORWARDING_ENABLED && !destinations._forwarding_disabled_globally) {
+    // Skip entirely if this brief was sent by Greg's /api/ad/intake — Greg already
+    // forwarded per-page creatives directly to each destination.
+    if (FORWARDING_ENABLED && !destinations._forwarding_disabled_globally && !isGregHandled) {
 
       const adMessageId  = ctx.message.message_id;
       const sourceChatId = chatId;

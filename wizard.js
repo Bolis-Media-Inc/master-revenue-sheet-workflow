@@ -22,6 +22,9 @@ const { Telegraf, Markup } = require("telegraf");
 const cron            = require("node-cron");
 const brain           = require("./brain");
 const destinations    = require("./config/telegram-destinations.json");
+const postedHandler   = require("./handlers/postedHandler");
+const apiServer       = require("./lib/api");
+const poster          = require("./lib/poster");
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -1012,8 +1015,23 @@ function collabPresetEditKeyboard(presetId) {
 // ── Callback queries ──────────────────────────────────────────────────────────
 
 bot.on("callback_query", async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
   const data = ctx.callbackQuery.data || "";
+
+  // ── Posted-ad disambiguation buttons (handles its own answerCbQuery) ────
+  if (data.startsWith("posted:")) {
+    const handled = await postedHandler.handlePostedCallback(ctx);
+    if (handled) return;
+  }
+
+  // ── Intake cancel button ────────────────────────────────────────────────
+  if (data.startsWith("intake:cancel:")) {
+    const sessionId = data.slice("intake:cancel:".length);
+    await poster.cancelIntake(bot, sessionId);
+    await ctx.answerCbQuery("Cancelled — ad was not sent");
+    return;
+  }
+
+  await ctx.answerCbQuery().catch(() => {});
 
   // ── Betslip headline option pick ────────────────────────────────────────
   if (data.startsWith("bshl:")) {
@@ -2093,6 +2111,14 @@ async function processInspirePhoto(ctx, photoMsg) {
 // ── Text messages ─────────────────────────────────────────────────────────────
 
 bot.on("text", async (ctx) => {
+  // ── Instagram URL in DM → mark posted ad as live ────────────────────
+  // Highest priority: handle BEFORE the slash-command bail since IG URLs
+  // can be pasted with leading text. Only fires for DMs.
+  if (postedHandler.shouldHandle(ctx)) {
+    await postedHandler.handlePostedDM(ctx);
+    return;
+  }
+
   if (ctx.message.text.startsWith("/")) return;
 
   // ── Reply feedback on sourced/betslip images ──────────────────────────
@@ -2412,5 +2438,12 @@ cron.schedule("0 21 * * *", () => {
 // ── Launch ────────────────────────────────────────────────────────────────────
 
 bot.launch().then(() => console.log("✅ Greg (Ad Brief Wizard) running"));
-process.once("SIGINT",  () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+
+// HTTP API for external ad submission (Digi → Greg, etc.)
+const apiHttpServer = apiServer.startServer({
+  bot,
+  handleIntake: poster.handleIntake,
+});
+
+process.once("SIGINT",  () => { try { apiHttpServer?.close(); } catch (_) {} bot.stop("SIGINT"); });
+process.once("SIGTERM", () => { try { apiHttpServer?.close(); } catch (_) {} bot.stop("SIGTERM"); });

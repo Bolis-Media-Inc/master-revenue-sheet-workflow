@@ -30,6 +30,13 @@ function parseAdMessage(text, date) {
   const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
   if (lines.length < 2) return null;
 
+  // Strip the Greg-tag marker if present so it doesn't interfere with parsing.
+  // (Greg adds <!-- greg-handled --> as the first line for ads from /api/ad/intake.)
+  if (/<!--\s*greg-handled\s*-->/i.test(lines[0])) {
+    lines.shift();
+    if (lines.length < 2) return null;
+  }
+
   // ── Line 1: "{Client} - {Category} - ${amount}" ─────────────────────────────
   const headerMatch = lines[0].match(
     /^(.+?)\s*-\s*(.+?)\s*-\s*\$?([\d,]+(?:\.\d{1,2})?)$/
