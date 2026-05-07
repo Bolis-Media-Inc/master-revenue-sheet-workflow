@@ -1,43 +1,44 @@
 /**
  * handlers/postedHandler.js
- * Handles IG URL DMs sent to Greg.
  *
- * Flow:
- *   VA posts an ad to Instagram, copies the URL, DMs Greg the URL.
- *   Greg:
- *     1. Extracts post info from URL
- *     2. Looks up the user's most recent scheduled posted_ads (last 24h)
- *     3. If exactly 1: auto-marks Live + replies "✅ Marked live for @page"
- *     4. If multiple: shows buttons "Which ad? [Ad #1] [Ad #2]"
- *     5. If none: replies "No matching scheduled ads"
- *     6. Falls back to URL-based handle hint or @mention disambiguation
+ * Marks scheduled ads as Live when a VA DMs Greg an Instagram post URL.
  *
- * Side effects:
- *   - Updates Master Revenue Sheet column I: Scheduled → Live
- *   - Updates posted_ads.status = 'live', sets ig_url, ig_post_id, posted_at
+ * Resolution flow:
+ *   1. Extract post info from URL (postId, kind)
+ *   2. Call Digi /api/ig/resolve → { username, caption, postedAt, ... }
+ *      (BrightData scrape of the IG post)
+ *   3. Find candidate scheduled posted_ads where page_handle = username
+ *   4. Pull each candidate's campaign caption + client_name from ad_sessions
+ *   5. Score each candidate (caption similarity + client name + time proximity)
+ *   6. Auto-mark live if best score ≥ 0.55, else show picker
+ *
+ * Fallback chain when Digi resolve fails:
+ *   - If user typed @handle inline → narrow by that handle
+ *   - Else: fall back to "find scheduled ads by submitter" heuristic (legacy)
+ *   - Last resort: ask VA to add @handle inline
+ *
+ * The Digi resolver is best-effort. If Digi is down or BrightData rate
+ * limits, we fail-soft to the legacy heuristic so VAs are never blocked.
  */
 
 const { extractIGPostInfo, hasIGUrl, extractHandleMention } = require("../lib/igUrl");
-const sessions       = require("../lib/sessions");
+const sessions     = require("../lib/sessions");
+const digiClient   = require("../lib/digiClient");
+const captionMatch = require("../lib/captionMatch");
 const { updateStatusToLive } = require("../sheets");
 
 const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
 const TAB_NAME        = process.env.SHEET_TAB_NAME || "2026 Ad Overview";
 
-/**
- * Check if a Telegram message is a DM and contains an IG URL.
- * Returns true if we should handle it.
- */
 function shouldHandle(ctx) {
   if (!ctx.message?.text) return false;
   if (ctx.chat?.type !== "private") return false;
   return hasIGUrl(ctx.message.text);
 }
 
-/**
- * Main handler — wire to bot.on("message") for DMs.
- */
 async function handlePostedDM(ctx) {
+  let resolvingMsg = null;
+
   try {
     const text   = ctx.message.text;
     const userId = ctx.from?.id;
@@ -45,95 +46,167 @@ async function handlePostedDM(ctx) {
 
     const info = extractIGPostInfo(text);
     if (!info) {
-      // hasIGUrl matched but extractIGPostInfo didn't — could be a profile URL
       await ctx.reply("📷 That looks like an Instagram URL but I couldn't find a post ID. Send the link to a specific post or reel.");
       return;
     }
 
-    // Disambiguation hints — first the URL itself, then any @mention in the message
     const explicitHandle = info.handleHint || extractHandleMention(text);
 
-    // Find scheduled ads for this user
-    let candidates = await sessions.findScheduledByUser(userId, {
-      pageHandle: explicitHandle,
-      limit: 5,
-    });
+    // Show "resolving" indicator while BrightData scrape runs (~5-10s)
+    resolvingMsg = await ctx.reply("🔍 Resolving Instagram post…").catch(() => null);
 
-    // If none found for this user but user gave an explicit handle, broaden to
-    // anyone's scheduled ads for that page (covers VAs marking team's ads live)
-    if (candidates.length === 0 && explicitHandle) {
-      candidates = await sessions.findScheduledByHandle(explicitHandle, { limit: 5 });
+    // ── Try Digi resolver first ──────────────────────────────────────────
+    let resolved = null;
+    try {
+      const result = await digiClient.resolveIGPost(info.url);
+      if (result.ok) resolved = result.data;
+      else console.warn(`[postedHandler] Digi resolve failed: ${result.error}`);
+    } catch (e) {
+      console.warn(`[postedHandler] Digi resolve threw: ${e.message}`);
     }
 
-    // ── No matches ────────────────────────────────────────────────────────
+    // Best-source page handle: resolver > URL hint > inline @mention
+    const matchHandle = resolved?.username || explicitHandle;
+
+    if (resolvingMsg) {
+      try { await ctx.telegram.deleteMessage(ctx.chat.id, resolvingMsg.message_id); } catch (_) {}
+      resolvingMsg = null;
+    }
+
+    // ── Find candidates ──────────────────────────────────────────────────
+    let candidates = [];
+    if (matchHandle) {
+      candidates = await sessions.findScheduledByHandle(matchHandle, { limit: 10 });
+    }
+
+    // Fallback: if no handle resolved at all, look at this user's recent
+    // scheduled ads (legacy heuristic — only useful when submitter == poster)
+    if (candidates.length === 0 && !matchHandle) {
+      candidates = await sessions.findScheduledByUser(userId, { limit: 5 });
+    }
+
     if (candidates.length === 0) {
-      const hint = explicitHandle
-        ? `for @${explicitHandle}`
-        : "in your recent submissions";
+      const hint = matchHandle
+        ? `for @${matchHandle}`
+        : "in scheduled ads";
       await ctx.reply(
-        `🤔 I couldn't find a scheduled ad ${hint}.\n\n` +
-        `If this is for someone else's ad, paste again with the page handle, e.g.:\n` +
-        `\`${info.url} @thefuck.tv\``,
+        `🤔 Couldn't find a scheduled ad ${hint}.\n\n` +
+        (matchHandle
+          ? `Either the ad wasn't submitted via Greg, or it's already marked live.`
+          : `Paste again with the page handle, e.g.\n\`${info.url} @thefuck.tv\``),
         { parse_mode: "Markdown" }
       );
       return;
     }
 
-    // ── Exactly 1 match → auto-mark live ──────────────────────────────────
+    // ── If we have caption from resolver, score and auto-pick ───────────
+    if (resolved && resolved.caption) {
+      const enriched = await Promise.all(candidates.map(async (ad) => {
+        const sess = await loadAdSession(ad.ad_session_id);
+        return {
+          ad,
+          matchInputs: {
+            brandedCaption: sess?.payload?.adInfo?.caption || "",
+            clientName:     ad.client_name,
+            scheduledAt:    new Date(ad.created_at),
+          },
+        };
+      }));
+
+      const result = captionMatch.pickBestMatch(enriched, resolved);
+
+      if (result.autoMark && result.best) {
+        await markLive(ctx, result.best.candidate.ad, info, resolved, result.best.score);
+        return;
+      }
+
+      // Mid-confidence: show picker with scores so user picks the right one
+      if (result.best && result.alternatives.length > 0) {
+        await sendPicker(ctx, info, [result.best, ...result.alternatives]);
+        return;
+      }
+
+      // Single candidate, low confidence — just mark with note
+      if (candidates.length === 1) {
+        await markLive(ctx, candidates[0], info, resolved, result.best?.score ?? null);
+        return;
+      }
+    }
+
+    // ── No resolver caption: single candidate auto-marks ─────────────────
     if (candidates.length === 1) {
-      const ad = candidates[0];
-      await markLive(ctx, ad, info);
+      await markLive(ctx, candidates[0], info, resolved, null);
       return;
     }
 
-    // ── Multiple matches → show picker ────────────────────────────────────
-    // Stash the URL info on each button's callback_data
-    const buttons = candidates.map((ad, i) => ([{
-      text: `${i + 1}. @${ad.page_handle} — ${ad.client_name}`,
-      callback_data: `posted:${ad.id}:${info.postId}:${info.kind}`,
-    }]));
+    // ── Multiple candidates, no caption to disambiguate: show picker ─────
+    const scored = candidates.map((ad) => ({ candidate: { ad }, score: 0 }));
+    await sendPicker(ctx, info, scored);
 
-    await ctx.reply(
-      `📍 Multiple scheduled ads match. Which one is this for?\n\n` +
-      candidates.map((a, i) => `${i + 1}. @${a.page_handle} — ${a.client_name} (scheduled ${formatTimeAgo(a.created_at)})`).join("\n"),
-      { reply_markup: { inline_keyboard: buttons } }
-    );
   } catch (e) {
     console.error("[postedHandler] error:", e.message);
-    try { await ctx.reply("⚠️ Something went wrong marking that as posted. Try again or use the manual /posted command."); } catch {}
+    if (resolvingMsg) {
+      try { await ctx.telegram.deleteMessage(ctx.chat.id, resolvingMsg.message_id); } catch (_) {}
+    }
+    try { await ctx.reply("⚠️ Something went wrong marking that as posted."); } catch {}
   }
 }
 
+async function loadAdSession(sessionId) {
+  if (!sessionId) return null;
+  const { data } = await sessions._supabase
+    .from("ad_sessions")
+    .select("payload")
+    .eq("id", sessionId)
+    .maybeSingle();
+  return data || null;
+}
+
 /**
- * Callback handler for the picker buttons.
- * callback_data format: "posted:{adId}:{postId}:{kind}"
+ * Show picker buttons for ambiguous matches. Each button encodes the ad
+ * + post info so the callback handler can mark the chosen ad.
  */
+async function sendPicker(ctx, info, scoredList) {
+  const buttons = scoredList.slice(0, 5).map(({ candidate, score, breakdown }) => {
+    const ad = candidate.ad;
+    const scoreLabel = score && score > 0 ? ` ${Math.round(score * 100)}%` : "";
+    return [{
+      text: `@${ad.page_handle} — ${ad.client_name}${scoreLabel}`,
+      callback_data: `posted:${ad.id}:${info.postId}:${info.kind}`,
+    }];
+  });
+
+  const lines = [`📍 Multiple ads match — pick the right one:`, ""];
+  scoredList.slice(0, 5).forEach(({ candidate, score }, i) => {
+    const ad = candidate.ad;
+    const t  = formatTimeAgo(ad.created_at);
+    const s  = score && score > 0 ? ` (${Math.round(score * 100)}% match)` : "";
+    lines.push(`${i + 1}. @${ad.page_handle} — ${ad.client_name} (scheduled ${t})${s}`);
+  });
+
+  await ctx.reply(lines.join("\n"), { reply_markup: { inline_keyboard: buttons } });
+}
+
 async function handlePostedCallback(ctx) {
   try {
     const parts = ctx.callbackQuery.data.split(":");
-    if (parts[0] !== "posted") return false; // not us
+    if (parts[0] !== "posted") return false;
     const [, adId, postId, kind] = parts;
 
-    // Look up the ad
     const { data: ad } = await sessions._supabase
-      .from("posted_ads")
-      .select("*")
-      .eq("id", adId)
-      .single();
+      .from("posted_ads").select("*").eq("id", adId).single();
 
     if (!ad) {
       await ctx.answerCbQuery("Ad not found", { show_alert: true });
       return true;
     }
-
     if (ad.status !== "scheduled") {
-      await ctx.answerCbQuery(`Ad already marked as ${ad.status}`, { show_alert: true });
+      await ctx.answerCbQuery(`Already ${ad.status}`, { show_alert: true });
       return true;
     }
 
-    // Reconstruct the URL
     const url = `https://www.instagram.com/${kind}/${postId}/`;
-    await markLive(ctx, ad, { url, postId, kind });
+    await markLive(ctx, ad, { url, postId, kind }, null, null);
     await ctx.answerCbQuery("✅ Marked live");
     return true;
   } catch (e) {
@@ -143,36 +216,34 @@ async function handlePostedCallback(ctx) {
   }
 }
 
-/**
- * Mark a posted_ad as live: Supabase + Master Sheet.
- */
-async function markLive(ctx, ad, info) {
-  // Update Supabase
+async function markLive(ctx, ad, info, resolved, score) {
   await sessions.markPostedLive(ad.id, {
     igUrl: info.url,
     igPostId: info.postId,
   });
 
-  // Update Master Sheet status
   let sheetUpdated = 0;
   if (MASTER_SHEET_ID) {
     try {
       sheetUpdated = await updateStatusToLive(
-        MASTER_SHEET_ID,
-        TAB_NAME,
-        [ad.page_handle],
-        ad.client_name
+        MASTER_SHEET_ID, TAB_NAME, [ad.page_handle], ad.client_name
       );
     } catch (e) {
       console.error("[postedHandler] sheet update error:", e.message);
     }
   }
 
-  await ctx.reply(
-    `✅ Marked live for @${ad.page_handle}\n` +
-    `Client: ${ad.client_name}\n` +
-    (sheetUpdated > 0 ? `📊 Master sheet updated (${sheetUpdated} row)` : `⚠️ Sheet update skipped`)
-  );
+  const lines = [
+    `✅ Marked live for @${ad.page_handle}`,
+    `Client: ${ad.client_name}`,
+  ];
+  if (resolved) {
+    lines.push(`Resolver: ${resolved.source} (${resolved.caption?.slice(0, 60) || "(no caption)"}…)`);
+  }
+  if (score != null) lines.push(`Match confidence: ${Math.round(score * 100)}%`);
+  lines.push(sheetUpdated > 0 ? `📊 Master sheet updated (${sheetUpdated} row)` : `⚠️ Sheet update skipped`);
+
+  await ctx.reply(lines.join("\n"));
 }
 
 function formatTimeAgo(isoString) {
