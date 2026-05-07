@@ -46,9 +46,31 @@ try { KNOWN_CLIENTS = require("./config/clients.json"); } catch (_) {}
 
 const BULKS_PATH = path.join(__dirname, "config", "bulks.json");
 let KNOWN_BULKS = [];
-try { KNOWN_BULKS = JSON.parse(fs.readFileSync(BULKS_PATH, "utf8")); } catch (_) {}
+function reloadBulks() {
+  try { KNOWN_BULKS = JSON.parse(fs.readFileSync(BULKS_PATH, "utf8")); }
+  catch (_) { KNOWN_BULKS = []; }
+}
+reloadBulks();
+
+// Watch the file so external mutations (e.g. lib/api.js advancing bulk
+// slots after an HTTP /api/ad/intake post) get reflected in the wizard
+// without a restart. Polls every 2s — Railway file IO is fast enough.
+try {
+  fs.watchFile(BULKS_PATH, { interval: 2000 }, () => reloadBulks());
+} catch (e) {
+  console.warn("[wizard] could not watch bulks.json:", e.message);
+}
+
 function saveBulks() {
-  try { fs.writeFileSync(BULKS_PATH, JSON.stringify(KNOWN_BULKS, null, 2)); } catch (_) {}
+  try { fs.writeFileSync(BULKS_PATH, JSON.stringify(KNOWN_BULKS, null, 2)); }
+  catch (_) {}
+  // Also push to Supabase mirror — fire-and-forget, never blocks the wizard
+  try {
+    const bulkTemplates = require("./lib/bulkTemplates");
+    bulkTemplates.mirrorNow().catch((e) =>
+      console.error("[wizard] supabase mirror error:", e.message)
+    );
+  } catch (_) {}
 }
 
 const CAMPAIGNS_PATH = path.join(__dirname, "config", "campaigns.json");
