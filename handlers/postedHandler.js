@@ -1,7 +1,17 @@
 /**
  * handlers/postedHandler.js
  *
- * Marks scheduled ads as Live when a VA DMs Greg an Instagram post URL.
+ * Marks scheduled ads as Live when a VA sends Greg an Instagram post URL.
+ * Fires in three contexts:
+ *   - Direct message to Greg (always — the original VA flow)
+ *   - Group / supergroup chat where the message is a REPLY to one of
+ *     Greg's previous messages (e.g. replying to the "🚀 Sent" intake
+ *     notification with the IG link)
+ *   - Group / supergroup chat where the message @-mentions Greg's bot
+ *
+ * Bare IG URLs in groups (with neither reply nor mention) are intentionally
+ * ignored so Greg doesn't collide with Digi's manualSubmission listener
+ * that also watches for media URLs.
  *
  * Resolution flow:
  *   1. Extract post info from URL (postId, kind)
@@ -30,10 +40,47 @@ const { updateStatusToLive } = require("../sheets");
 const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
 const TAB_NAME        = process.env.SHEET_TAB_NAME || "2026 Ad Overview";
 
+/**
+ * True if the message is a reply to one of Greg's own messages. Used to
+ * detect "VA pastes IG link in reply to Greg's intake notification" in a
+ * shared sales/ops chat.
+ */
+function isReplyToGreg(ctx) {
+  const replyFromId = ctx.message?.reply_to_message?.from?.id;
+  return !!replyFromId && replyFromId === ctx.botInfo?.id;
+}
+
+/**
+ * True if the message @-mentions Greg's bot username. Case-insensitive.
+ */
+function mentionsGreg(ctx) {
+  const me = ctx.botInfo;
+  if (!me?.username) return false;
+  const text = ctx.message?.text || "";
+  const entities = ctx.message?.entities || [];
+  const target = `@${me.username.toLowerCase()}`;
+  for (const e of entities) {
+    if (e.type !== "mention") continue;
+    const mention = text.slice(e.offset, e.offset + e.length).toLowerCase();
+    if (mention === target) return true;
+  }
+  return false;
+}
+
 function shouldHandle(ctx) {
   if (!ctx.message?.text) return false;
-  if (ctx.chat?.type !== "private") return false;
-  return hasIGUrl(ctx.message.text);
+  if (!hasIGUrl(ctx.message.text)) return false;
+
+  const chatType = ctx.chat?.type;
+  if (chatType === "private") return true;
+
+  // Group / supergroup: only act when the message is unambiguously meant
+  // for Greg. A bare IG URL in a shared chat is left alone so we don't
+  // step on Digi's manual-submission listener.
+  if (chatType === "group" || chatType === "supergroup") {
+    return isReplyToGreg(ctx) || mentionsGreg(ctx);
+  }
+  return false;
 }
 
 async function handlePostedDM(ctx) {
