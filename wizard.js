@@ -978,6 +978,156 @@ bot.command("editbulk", async (ctx) => {
   await ctx.reply("📦 *Which bulk template to edit?*", { parse_mode: "Markdown", ...keyboard });
 });
 
+// ── /bulks — sales-team bulk dashboard (mobile-friendly status view) ──────────
+//
+// Mirrors what /bulks shows on Digi web, but as a Telegram-native message
+// so sales can check progress without opening a laptop. One-line summary
+// per template with completion %, $ spent vs committed, slot count.
+// Tap a template to drill into /bulkstatus.
+
+const PROGRESS_BAR_WIDTH = 10;
+function progressBar(pct) {
+  const filled = Math.max(0, Math.min(PROGRESS_BAR_WIDTH, Math.round((pct / 100) * PROGRESS_BAR_WIDTH)));
+  return "█".repeat(filled) + "░".repeat(PROGRESS_BAR_WIDTH - filled);
+}
+
+bot.command("bulks", async (ctx) => {
+  const bulkTemplates = require("./lib/bulkTemplates");
+  const all = bulkTemplates.list();
+  // Filter to active (status='open' or unset, treat unset as open for legacy rows)
+  const open = all.filter((b) => !b.status || b.status === "open");
+  if (open.length === 0) {
+    return ctx.reply(
+      "📦 No open bulk campaigns.\n\n" +
+      "Use /newbulk to create one, or /editbulk to reopen an archived template.",
+    );
+  }
+
+  const lines = ["📦 *Open bulk campaigns*", ""];
+  const buttons = [];
+  for (const t of open) {
+    const p = bulkTemplates.progress(t.id);
+    if (!p) continue;
+    const pct = p.totals.completionPct;
+    const spent = Math.round(p.totals.dollarsSpent).toLocaleString();
+    const committed = Math.round(p.totals.totalDollarsCommitted).toLocaleString();
+    const refLine = t.refPrefix ? ` · next: \`${t.refPrefix} ${p.nextRefNum}\`` : "";
+    lines.push(
+      `*${t.name}*${refLine}\n` +
+      `\`${progressBar(pct)}\` ${pct.toFixed(0)}%\n` +
+      `${p.totals.usedSlots}/${p.totals.totalSlots} slots · $${spent} of $${committed}` +
+      (p.totals.pagesFull > 0 ? ` · ${p.totals.pagesFull} pages full` : ""),
+      "",
+    );
+    buttons.push([b(`📊 ${t.name}`, `bs:${t.id}`)]);
+  }
+
+  await ctx.reply(lines.join("\n"), {
+    parse_mode: "Markdown",
+    ...Markup.inlineKeyboard(buttons),
+  });
+});
+
+// ── /bulkstatus <slug> — single-bulk drill-down with admin controls ───────────
+
+async function renderBulkStatus(ctx, bulkId, opts = {}) {
+  const bulkTemplates = require("./lib/bulkTemplates");
+  const p = bulkTemplates.progress(bulkId);
+  if (!p) {
+    const msg = `📦 Bulk template not found: \`${bulkId}\``;
+    return opts.edit ? ctx.editMessageText(msg, { parse_mode: "Markdown" }) : ctx.reply(msg, { parse_mode: "Markdown" });
+  }
+
+  const pct = p.totals.completionPct;
+  const spent = Math.round(p.totals.dollarsSpent).toLocaleString();
+  const committed = Math.round(p.totals.totalDollarsCommitted).toLocaleString();
+  const remaining = Math.round(p.totals.dollarsRemaining).toLocaleString();
+  const statusEmoji = p.status === "completed" ? "✅" : p.status === "archived" ? "📁" : "🟢";
+  const refLine = p.refPrefix ? `\n🏷️  Next ref: \`${p.refPrefix} ${p.nextRefNum}\`` : "";
+
+  const lines = [
+    `📦 *${p.name}* ${statusEmoji} _${p.status}_`,
+    p.client ? `👤  ${p.client}${p.adType ? ` · ${p.adType}` : ""}` : "",
+    refLine.trim(),
+    "",
+    `\`${progressBar(pct)}\` *${pct.toFixed(0)}%*`,
+    `📊  ${p.totals.usedSlots}/${p.totals.totalSlots} slots · ${p.totals.pagesFull}/${p.totals.pagesCount} pages full`,
+    `💰  $${spent} spent · $${remaining} remaining of $${committed}`,
+    "",
+    "*Per-page:*",
+  ].filter(Boolean);
+
+  // Page table — sort by remaining slots desc so most-active pages show first
+  const sortedPages = [...p.pages].sort((a, b) => b.remaining - a.remaining);
+  for (const pg of sortedPages.slice(0, 20)) {
+    const tag = pg.full
+      ? "🟢 FULL"
+      : `${pg.used}/${pg.total}`;
+    const price = pg.price ? ` $${pg.price}` : "";
+    lines.push(`\`${tag.padEnd(9)}\` @${pg.handle}${price}`);
+  }
+  if (p.pages.length > 20) {
+    lines.push(`_…and ${p.pages.length - 20} more pages_`);
+  }
+
+  // Status controls — only show when relevant
+  const buttons = [];
+  if (p.status === "open") {
+    if (p.totals.pagesRemaining === 0) {
+      // All pages full → suggest mark complete prominently
+      buttons.push([b("✅ All slots used — mark complete", `bs-complete:${p.id}`)]);
+    } else {
+      buttons.push([
+        b("✅ Mark complete", `bs-complete:${p.id}`),
+        b("📁 Archive", `bs-archive:${p.id}`),
+      ]);
+    }
+  } else if (p.status === "archived") {
+    buttons.push([b("🔄 Reopen", `bs-reopen:${p.id}`)]);
+  }
+  buttons.push([b("🔄 Refresh", `bs:${p.id}`)]);
+
+  const text = lines.join("\n");
+  const replyOpts = { parse_mode: "Markdown", ...Markup.inlineKeyboard(buttons) };
+  return opts.edit ? ctx.editMessageText(text, replyOpts) : ctx.reply(text, replyOpts);
+}
+
+bot.command("bulkstatus", async (ctx) => {
+  const arg = ctx.message.text.replace(/^\/bulkstatus(@\w+)?\s*/i, "").trim();
+  if (!arg) {
+    return ctx.reply(
+      "Usage: `/bulkstatus <slug>`\n\nOr just /bulks to pick from a list.",
+      { parse_mode: "Markdown" },
+    );
+  }
+  await renderBulkStatus(ctx, arg);
+});
+
+// Inline button: drill into a bulk from /bulks
+bot.action(/^bs:(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const bulkId = ctx.match[1];
+  // Fresh status as a NEW message (not edit) — simpler when chained from /bulks
+  await renderBulkStatus(ctx, bulkId);
+});
+
+// Inline buttons: status changes
+bot.action(/^bs-(complete|archive|reopen):(.+)$/, async (ctx) => {
+  const action = ctx.match[1];
+  const bulkId = ctx.match[2];
+  const status = action === "complete" ? "completed" : action === "archive" ? "archived" : "open";
+  const bulkTemplates = require("./lib/bulkTemplates");
+
+  const result = bulkTemplates.setStatus(bulkId, status);
+  if (result.error) {
+    await ctx.answerCbQuery(`Failed: ${result.error}`, { show_alert: true });
+    return;
+  }
+  await ctx.answerCbQuery(`✓ ${action === "complete" ? "Marked completed" : action === "archive" ? "Archived" : "Reopened"}`);
+  // Re-render the same message in place so the user sees the new status + buttons
+  await renderBulkStatus(ctx, bulkId, { edit: true });
+});
+
 bot.command("editcamp", async (ctx) => {
   if (!KNOWN_CAMPAIGNS.length) return ctx.reply("🔁 No campaign templates to edit. Use /newcamp first.");
   const keyboard = Markup.inlineKeyboard(
