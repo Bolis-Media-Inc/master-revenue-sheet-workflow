@@ -1139,6 +1139,16 @@ bot.command("editcamp", async (ctx) => {
 // Track which template is being edited and which field is awaiting text input
 const _editSessions = new Map(); // userId → { kind, tplId, field, msgId }
 
+// ── Sales-contributor review: pending reject prompts ────────────────────────
+// When a sales reviewer taps ❌ Reject on a review card, we send a force_reply
+// prompt asking for a note. The next text message that targets that prompt is
+// consumed as the rejection reason. 10-min TTL; cleanup via fixed interval.
+const _pendingRejectPrompts = new Map(); // promptMessageId → { sessionId, approverTelegramId, chatId, createdAt }
+setInterval(() => {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  for (const [k, v] of _pendingRejectPrompts) if (v.createdAt < cutoff) _pendingRejectPrompts.delete(k);
+}, 60 * 1000).unref();
+
 // ── /setcollab — create & manage collab presets ──────────────────────────────
 
 // Collab preset structure:
@@ -1200,6 +1210,51 @@ bot.on("callback_query", async (ctx) => {
     const sessionId = data.slice("intake:cancel:".length);
     await poster.cancelIntake(bot, sessionId);
     await ctx.answerCbQuery("Cancelled — ad was not sent");
+    return;
+  }
+
+  // ── Sales-contributor review: Approve ───────────────────────────────────
+  if (data.startsWith("review:approve:")) {
+    const sessionId = data.slice("review:approve:".length);
+    try {
+      const result = await poster.approveSession(bot, sessionId, ctx.from?.id || null);
+      if (!result.ok) {
+        await ctx.answerCbQuery(result.error || "Couldn't approve", { show_alert: true });
+        return;
+      }
+      await ctx.answerCbQuery("✅ Approved — sending in 30s");
+    } catch (e) {
+      console.error("[wizard] review approve error:", e.message);
+      await ctx.answerCbQuery("Error — see logs", { show_alert: true });
+    }
+    return;
+  }
+
+  // ── Sales-contributor review: Reject (force-reply for optional reason) ──
+  // Tap → bot replies to the reviewer with a force_reply prompt asking for
+  // a note. The next text reply is interpreted as the rejection reason.
+  // Empty / "skip" / "no reason" → reject without note.
+  if (data.startsWith("review:reject:")) {
+    const sessionId = data.slice("review:reject:".length);
+    try {
+      const prompt = await ctx.reply(
+        `❌ Rejecting session \`${sessionId.slice(0, 8)}…\` — reply to *this* message with a note for the contributor (or "skip" for no note).`,
+        {
+          parse_mode: "Markdown",
+          reply_markup: { force_reply: true, selective: true },
+        },
+      );
+      _pendingRejectPrompts.set(prompt.message_id, {
+        sessionId,
+        approverTelegramId: ctx.from?.id || null,
+        chatId: ctx.chat.id,
+        createdAt: Date.now(),
+      });
+      await ctx.answerCbQuery("Add a note?");
+    } catch (e) {
+      console.error("[wizard] review reject prompt error:", e.message);
+      await ctx.answerCbQuery("Error — see logs", { show_alert: true });
+    }
     return;
   }
 
@@ -2292,6 +2347,30 @@ bot.on("text", async (ctx) => {
   }
 
   if (ctx.message.text.startsWith("/")) return;
+
+  // ── Sales reviewer reply with rejection reason ─────────────────────────
+  // The Reject button sends a force_reply prompt; this consumes the
+  // operator's reply (text only) as the note that's DMed back to the
+  // contributor. "skip" / "no reason" = reject without note.
+  const rejectReplyTo = ctx.message?.reply_to_message?.message_id;
+  if (rejectReplyTo && _pendingRejectPrompts.has(rejectReplyTo)) {
+    const pending = _pendingRejectPrompts.get(rejectReplyTo);
+    _pendingRejectPrompts.delete(rejectReplyTo);
+    const raw = ctx.message.text.trim();
+    const reason = /^(skip|none|no reason|n\/a)$/i.test(raw) ? "" : raw;
+    try {
+      const result = await poster.rejectSession(bot, pending.sessionId, pending.approverTelegramId, reason);
+      if (!result.ok) {
+        await ctx.reply(`⚠️ Reject failed: ${result.error}`).catch(() => {});
+      } else {
+        await ctx.reply(reason ? "❌ Rejected with note." : "❌ Rejected (no note).").catch(() => {});
+      }
+    } catch (e) {
+      console.error("[wizard] reject reply consume error:", e.message);
+      await ctx.reply("⚠️ Reject failed — see logs.").catch(() => {});
+    }
+    return;
+  }
 
   // ── Reply feedback on sourced/betslip images ──────────────────────────
   const reply = ctx.message.reply_to_message;
