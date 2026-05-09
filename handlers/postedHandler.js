@@ -35,10 +35,22 @@ const { extractIGPostInfo, hasIGUrl, extractHandleMention } = require("../lib/ig
 const sessions     = require("../lib/sessions");
 const digiClient   = require("../lib/digiClient");
 const captionMatch = require("../lib/captionMatch");
-const { updateStatusToLive } = require("../sheets");
+const { updateStatusToLive, updateAdDate } = require("../sheets");
+const pages        = require("../config/pages.json");
+const destinations = require("../config/telegram-destinations.json");
 
-const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
-const TAB_NAME        = process.env.SHEET_TAB_NAME || "2026 Ad Overview";
+const MASTER_SHEET_ID    = process.env.MASTER_SHEET_ID;
+const TAB_NAME           = process.env.SHEET_TAB_NAME      || "2026 Ad Overview";
+const PAGE_TAB_NAME      = process.env.PAGE_SHEET_TAB_NAME || "IG Revenue Tracker";
+const TARGET_CHAT_ID     = process.env.WIZARD_TARGET_CHAT_ID;
+const PLACEHOLDER_PATTERN = /^(SHEET_ID_|TELEGRAM_CHAT_ID_)/;
+const GREG_TAG           = "<!-- greg-handled -->";
+
+// "Posted on" pattern detection — matches the reply format VAs already
+// type in Internal Network Ads ("Posted on", "posted on", "Second set
+// posted on"). We accept it in DMs from contributors so Greg can mirror
+// the confirmation into Internal Network Ads.
+const POSTED_ON_RE = /\bposted on\b/i;
 
 /**
  * True if the message is a reply to one of Greg's own messages. Used to
@@ -69,14 +81,19 @@ function mentionsGreg(ctx) {
 
 function shouldHandle(ctx) {
   if (!ctx.message?.text) return false;
-  if (!hasIGUrl(ctx.message.text)) return false;
+  const text = ctx.message.text;
+  const hasUrl = hasIGUrl(text);
+  const hasPostedOn = POSTED_ON_RE.test(text);
+  if (!hasUrl && !hasPostedOn) return false;
 
   const chatType = ctx.chat?.type;
   if (chatType === "private") return true;
 
   // Group / supergroup: only act when the message is unambiguously meant
-  // for Greg. A bare IG URL in a shared chat is left alone so we don't
-  // step on Digi's manual-submission listener.
+  // for Greg. A bare IG URL or "Posted on" in a shared chat is left
+  // alone so we don't step on Digi's manual-submission listener nor
+  // bm_tracking_bot's existing "Posted on" handler in Internal Network
+  // Ads.
   if (chatType === "group" || chatType === "supergroup") {
     return isReplyToGreg(ctx) || mentionsGreg(ctx);
   }
@@ -90,6 +107,16 @@ async function handlePostedDM(ctx) {
     const text   = ctx.message.text;
     const userId = ctx.from?.id;
     if (!userId) return;
+
+    // ── "Posted on @page <date>" without an IG URL ─────────────────────────
+    // Contributors confirming a posted ad in their own Greg DM. Greg
+    // updates the sheet AND mirrors the confirmation back into Internal
+    // Network Ads as a reply to the original brief, so the audit trail
+    // there matches what the chat would have if the contributor had
+    // posted the confirmation directly.
+    if (!hasIGUrl(text) && POSTED_ON_RE.test(text)) {
+      return handlePostedOnConfirmation(ctx);
+    }
 
     const info = extractIGPostInfo(text);
     if (!info) {
@@ -300,6 +327,189 @@ function formatTimeAgo(isoString) {
   const h = Math.floor(min / 60);
   if (h < 24) return `${h}h ago`;
   return `${Math.floor(h / 24)}d ago`;
+}
+
+// ── Posted-on confirmation in contributor DM (no IG URL needed) ──────────────
+//
+// A contributor whose ad was approved + posted by Greg replies in their
+// own Greg DM with a "Posted on @page <date>" message. Greg:
+//   1. Identifies the matching scheduled ad(s) for this user
+//   2. Updates the master sheet (status Live + date) and per-page sheets
+//   3. Mirrors the confirmation text into Internal Network Ads as a
+//      reply to the original brief (with <!-- greg-handled --> so
+//      bm_tracking_bot's own Posted-on handler doesn't double-update
+//      the sheet)
+//   4. Replies to the contributor with confirmation
+//
+// Mirror format matches the human format VAs already type so it reads
+// naturally in the audit trail. Greg-handled marker is appended at the
+// end of the message — invisible in normal Telegram clients.
+
+const { extractPostedOnDate } = require("./adHandler");
+
+async function handlePostedOnConfirmation(ctx) {
+  try {
+    const text   = ctx.message.text;
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    // Extract @handles. Same logic bm_tracking_bot uses for Posted-on
+    // replies — handle lines start with @, page handle is the captured
+    // word. Multi-page replies list one handle per line.
+    const handles = text.split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.startsWith("@"))
+      .map((l) => l.match(/^@([\w.]+)/)?.[1])
+      .filter(Boolean);
+
+    if (handles.length === 0) {
+      await ctx.reply(
+        "🤔 I see a 'Posted on' but no @handles. Reply with the page handles you posted to, e.g.\n" +
+        "```\nPosted on:\n@goal\n@thefuck.tv\nMay 5th\n```",
+        { parse_mode: "Markdown" },
+      );
+      return;
+    }
+
+    const overrideDate = extractPostedOnDate(text);
+
+    // Find this contributor's recent scheduled ads matching ANY of the
+    // handles. We narrow by submitter so we don't accidentally flip
+    // someone else's pending campaigns.
+    const candidates = [];
+    for (const handle of handles) {
+      const found = await sessions.findScheduledByUser(userId, { pageHandle: handle, limit: 5 });
+      candidates.push(...found);
+    }
+
+    if (candidates.length === 0) {
+      await ctx.reply(
+        `🤔 Couldn't find any of your scheduled ads for ${handles.map((h) => "@" + h).join(", ")}.\n\n` +
+        `Possibilities:\n` +
+        `· The ads were already marked live\n` +
+        `· They weren't submitted via Greg (manual post in Internal Network Ads)\n` +
+        `· The submission still hasn't shipped (cancel-window not yet closed)`,
+      );
+      return;
+    }
+
+    // Group candidates by ad_session_id so we can mirror once per session
+    // (multiple handles in one session → single Internal Network Ads
+    // mirror reply listing all the confirmed handles).
+    const bySession = new Map();
+    for (const ad of candidates) {
+      const list = bySession.get(ad.ad_session_id) || [];
+      list.push(ad);
+      bySession.set(ad.ad_session_id, list);
+    }
+
+    let totalSheetRows = 0;
+    let mirroredCount  = 0;
+    const replyParts   = [];
+
+    for (const [sessionId, ads] of bySession) {
+      // Load the session to get internal_brief.messageId and client name
+      const session = await loadAdSession(sessionId);
+      const clientName = ads[0]?.client_name || null;
+      const brief      = session?.internal_brief || null;
+
+      // 1. Mark each ad as Live + record posted_at
+      for (const ad of ads) {
+        try {
+          await sessions.markPostedLive(ad.id, { igUrl: null, igPostId: null });
+        } catch (e) {
+          console.error(`[postedHandler] markPostedLive ${ad.id}: ${e.message}`);
+        }
+      }
+
+      // 2. Update sheets — Greg side does this directly so we have a
+      //    single source of truth and the contributor can immediately
+      //    see "Marked Live for @page" in their reply
+      const sessionHandles = ads.map((a) => a.page_handle);
+      if (MASTER_SHEET_ID) {
+        try {
+          const flipped = await updateStatusToLive(MASTER_SHEET_ID, TAB_NAME, sessionHandles, clientName);
+          totalSheetRows += flipped;
+        } catch (e) { console.error("[postedHandler] master status update:", e.message); }
+
+        if (overrideDate) {
+          try {
+            await updateAdDate(MASTER_SHEET_ID, TAB_NAME, sessionHandles, clientName, overrideDate, true);
+          } catch (e) { console.error("[postedHandler] master date update:", e.message); }
+        }
+      }
+
+      // Per-page sheets: status flip is done via mirror (bm_tracking_bot
+      // would also flip, but it'll skip due to greg-handled marker — see
+      // below). For the page sheet date, do it directly.
+      if (overrideDate) {
+        for (const handle of sessionHandles) {
+          const pageSheetId = pages[handle];
+          if (!pageSheetId || PLACEHOLDER_PATTERN.test(pageSheetId)) continue;
+          try {
+            await updateAdDate(pageSheetId, PAGE_TAB_NAME, [handle], clientName, overrideDate, false);
+          } catch (e) { console.error(`[postedHandler] @${handle} sheet date:`, e.message); }
+        }
+      }
+
+      // 3. Mirror to Internal Network Ads as a reply to the original
+      //    brief (greg-handled marker prevents bm_tracking_bot from
+      //    double-processing this as another Posted-on event).
+      if (brief?.chatId && brief?.messageId) {
+        const mirrorLines = [
+          // Mirror the user's text verbatim — reads naturally in the chat
+          text.trim(),
+          "",
+          GREG_TAG,
+        ];
+        try {
+          await ctx.telegram.sendMessage(
+            brief.chatId,
+            mirrorLines.join("\n"),
+            { reply_to_message_id: brief.messageId, disable_notification: true },
+          );
+          mirroredCount++;
+        } catch (e) {
+          console.error(`[postedHandler] mirror to internal failed for session ${sessionId}: ${e.message}`);
+        }
+      } else if (TARGET_CHAT_ID) {
+        // Older session without internal_brief stashed (pre-migration).
+        // Send as a fresh message rather than a reply — still gets the
+        // audit trail, just without thread context.
+        try {
+          await ctx.telegram.sendMessage(
+            TARGET_CHAT_ID,
+            `${text.trim()}\n\n${GREG_TAG}`,
+            { disable_notification: true },
+          );
+          mirroredCount++;
+        } catch (e) {
+          console.error(`[postedHandler] mirror (no brief ref) failed: ${e.message}`);
+        }
+      }
+
+      replyParts.push(
+        `✅ @${ads.map((a) => a.page_handle).join(", @")} — ${clientName || "unknown client"}` +
+        (overrideDate ? ` (date: ${overrideDate})` : "")
+      );
+    }
+
+    // 4. Reply to the contributor
+    const lines = [
+      `✅ *Marked live for ${replyParts.length} ad${replyParts.length === 1 ? "" : "s"}*`,
+      "",
+      ...replyParts,
+      "",
+      `📊 Master sheet: ${totalSheetRows} row(s) updated`,
+      mirroredCount > 0
+        ? `💬 Confirmation mirrored to Internal Network Ads`
+        : `⚠️ Couldn't mirror to Internal Network Ads (chat not configured)`,
+    ];
+    await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+  } catch (e) {
+    console.error("[postedHandler] confirmation handler error:", e.message);
+    try { await ctx.reply("⚠️ Something went wrong processing that confirmation."); } catch {}
+  }
 }
 
 module.exports = { shouldHandle, handlePostedDM, handlePostedCallback };

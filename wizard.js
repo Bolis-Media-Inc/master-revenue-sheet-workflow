@@ -2665,14 +2665,30 @@ bot.on(["photo", "video", "document", "animation"], async (ctx) => {
 
 brain.startAutoCapture();
 
+// ── Recap cron jobs ───────────────────────────────────────────────────────────
+// Greg's morning + nightly recaps fire to GREG_SALES_CHAT via cron. Default
+// is OFF (Connor turned them off May 2026 — too noisy in the combined sales
+// chat). Re-enable by setting GREG_AUTOMATED_RECAPS_ENABLED=true on Railway.
+// Manual /recap and /nightrecap commands always work regardless of this
+// toggle for on-demand pulls.
+const RECAPS_ENABLED = (process.env.GREG_AUTOMATED_RECAPS_ENABLED || "false").toLowerCase() === "true";
+if (!RECAPS_ENABLED) {
+  console.log("[wizard] ⏸  Auto recaps OFF (set GREG_AUTOMATED_RECAPS_ENABLED=true to enable)");
+} else {
+  console.log("[wizard] 🌅 Auto recaps ON — morning at 8am AZ, nightly at 9pm AZ");
+}
+
 // ── Morning recap — 8:00 AM Arizona time (MST, no DST) ───────────────────────
 
 cron.schedule("0 8 * * *", () => {
+  if (!RECAPS_ENABLED) return;
   brain.sendMorningRecap()
     .catch((e) => console.error("[wizard] morning recap error:", e.message));
 }, { timezone: "America/Phoenix" });
 
 // ── Nightly lesson extraction — 11:00 PM Arizona time ────────────────────────
+// (Lessons are stored in Supabase, no chat send — leaves this enabled even
+// when recaps are off so the knowledge base keeps growing.)
 
 cron.schedule("0 23 * * *", () => {
   brain.extractNightlyLessons()
@@ -2682,6 +2698,7 @@ cron.schedule("0 23 * * *", () => {
 // ── Nightly revenue recap — 9:00 PM Arizona time ─────────────────────────
 
 cron.schedule("0 21 * * *", () => {
+  if (!RECAPS_ENABLED) return;
   brain.sendNightlyRecap()
     .catch((e) => console.error("[wizard] nightly recap error:", e.message));
 }, { timezone: "America/Phoenix" });

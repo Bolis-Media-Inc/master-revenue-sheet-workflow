@@ -268,6 +268,15 @@ async function handleAdMessage(ctx) {
 
     // ── "Posted on" reply → flip matching rows from Scheduled → Live ───────────
     if (/^posted on\b/i.test(text.trim())) {
+      // Greg-mirrored confirmations carry the greg-handled tag — skip
+      // sheet processing here because Greg's postedHandler already
+      // updated the master + per-page sheets when it received the
+      // contributor's DM. We still let the message stay in the chat
+      // for the audit trail.
+      if (isGregHandled) {
+        console.log("[adHandler] ⏭️  Skipping greg-mirrored Posted-on (already handled by Greg)");
+        return;
+      }
       const handles = text.split("\n")
         .map((l) => l.trim())
         .filter((l) => l.startsWith("@"))
@@ -598,4 +607,4 @@ async function handleAdMessage(ctx) {
   }
 }
 
-module.exports = { handleAdMessage };
+module.exports = { handleAdMessage, extractPostedOnDate };
