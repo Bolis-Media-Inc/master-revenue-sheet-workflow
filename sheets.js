@@ -265,6 +265,84 @@ async function updateStatusToLive(spreadsheetId, tabName, pageHandles, clientNam
 }
 
 /**
+ * Update the Date column for rows matching the given page handles + client.
+ *
+ * Master sheet (isMasterSheet = true):
+ *   Read B:I — B=Client(0), F=Page(4). Match client + page → write col D.
+ * Page sheet (isMasterSheet = false):
+ *   Read A:G — A=Client(0). Match client only (page sheets are per-handle
+ *   already), update col D ("Date Posted") on every matching row.
+ *
+ * Used by the "Posted on @page <date>" reply pattern when a VA confirms
+ * a posted ad with a specific date — we update the live date in the
+ * sheet to match what they typed (overrides the brief-posting date).
+ *
+ * Returns the number of cells updated.
+ */
+async function updateAdDate(spreadsheetId, tabName, pageHandles, clientName, newDate, isMasterSheet = true) {
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: "v4", auth: client });
+
+  const normClient = clientName?.toLowerCase().trim() || null;
+
+  if (isMasterSheet) {
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `${tabName}!B:I`,
+    });
+    const rows       = response.data.values || [];
+    const normalised = pageHandles.map((h) => `@${h.toLowerCase().replace(/^@/, "")}`);
+    const updates    = [];
+
+    for (let i = 0; i < rows.length; i++) {
+      const clientCell = (rows[i]?.[0] || "").trim().toLowerCase(); // B
+      const pageCell   = (rows[i]?.[4] || "").trim().toLowerCase(); // F
+
+      const pageMatches   = normalised.includes(pageCell);
+      const clientMatches = !normClient || clientCell === normClient;
+
+      if (pageMatches && clientMatches) {
+        // Master sheet date is column D
+        updates.push({ range: `${tabName}!D${i + 1}`, values: [[newDate]] });
+      }
+    }
+
+    if (updates.length > 0) {
+      await sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId,
+        requestBody: { valueInputOption: "USER_ENTERED", data: updates },
+      });
+    }
+    return updates.length;
+  }
+
+  // Page sheet — match by client only (each page sheet is already per-handle)
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `${tabName}!A:G`,
+  });
+  const rows    = response.data.values || [];
+  const updates = [];
+
+  for (let i = 0; i < rows.length; i++) {
+    const clientCell = (rows[i]?.[0] || "").trim().toLowerCase(); // A
+    if (normClient && clientCell !== normClient) continue;
+    if (!clientCell) continue; // skip blank rows
+    // Page sheet date is column D ("Date Posted")
+    updates.push({ range: `${tabName}!D${i + 1}`, values: [[newDate]] });
+  }
+
+  if (updates.length > 0) {
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId,
+      requestBody: { valueInputOption: "USER_ENTERED", data: updates },
+    });
+  }
+  return updates.length;
+}
+
+/**
  * Update the Ad Price for rows matching the given page handles + client name.
  *
  * Master sheet (isMasterSheet = true):
@@ -528,6 +606,6 @@ async function markReminderSent(spreadsheetId, rowNumber) {
 module.exports = {
   appendRow, markForwarded,
   getLastDate, appendSeparatorRow,
-  updateStatusToLive, updateAdPrice, deleteAdRows,
+  updateStatusToLive, updateAdPrice, updateAdDate, deleteAdRows,
   appendReminder, getPendingReminders, markReminderSent,
 };

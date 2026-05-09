@@ -12,8 +12,8 @@
  */
 
 const { parseAdMessage }       = require("../parser");
-const { appendRow, markForwarded, updateStatusToLive, appendReminder } = require("../sheets");
-const { clearBufferUpTo } = require("../messageBuffer");
+const { appendRow, markForwarded, updateStatusToLive, updateAdDate, appendReminder } = require("../sheets");
+const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getPrecedingMessages } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
 const pages                    = require("../config/pages.json");
@@ -50,6 +50,125 @@ const PLACEHOLDER_PATTERN = /^(SHEET_ID_|TELEGRAM_CHAT_ID_)/;
 // (e.g. from webhook retries or Railway restarts replaying pending updates)
 const _recentlyProcessed = new Set();
 const DEDUP_MAX_SIZE = 200;
+
+/**
+/**
+ * Parse a date written naturally inside a "Posted on" reply.
+ * Accepts: "April 14th", "April 14", "Apr 14 2026", "4/14", "4-14",
+ * "2026-04-14", "today", "yesterday".
+ *
+ * Returns a date string formatted to match the existing sheet column D
+ * style ("Tue 5/5/26" — see parser.js datePosted), or null if no
+ * recognizable date is present.
+ *
+ * Year handling: when the operator omits the year (e.g. "April 14"),
+ * default to the current year UNLESS that yields a future date by
+ * more than 31 days — in which case roll back to last year (catches
+ * Jan-confirmation of a December post).
+ */
+const MONTHS = {
+  jan: 0, january: 0,  feb: 1, february: 1,  mar: 2, march: 2,
+  apr: 3, april: 3,    may: 4,                jun: 5, june: 5,
+  jul: 6, july: 6,     aug: 7, august: 7,     sep: 8, september: 8, sept: 8,
+  oct: 9, october: 9,  nov: 10, november: 10, dec: 11, december: 11,
+};
+
+function extractPostedOnDate(text) {
+  if (!text) return null;
+
+  // Walk each line. For each, both try the line as-is AND a "stripped"
+  // version with "Posted on" headers, @handles, and surrounding noise
+  // removed — that way single-line replies like "Posted on @goal April
+  // 14" still parse, while keeping the original-line check for the
+  // common date-on-its-own-line case.
+  for (const rawLine of text.split("\n")) {
+    const candidates = new Set();
+    const trimmed = rawLine.trim();
+    if (trimmed) candidates.add(trimmed);
+
+    const stripped = trimmed
+      .replace(/^(posted on|second set posted on)\b:?/i, "")
+      .replace(/@[\w.]+/g, "")
+      .replace(/[()–—]/g, " ")  // strip parens + em/en dashes
+      .replace(/\s+/g, " ")
+      .trim();
+    if (stripped && stripped !== trimmed) candidates.add(stripped);
+
+    for (const candidate of candidates) {
+      const result = _parseDateToken(candidate);
+      if (result) return result;
+    }
+  }
+  return null;
+}
+
+function _parseDateToken(s) {
+  const lower = s.toLowerCase();
+
+  // "today" / "yesterday"
+  if (/^today\b/.test(lower)) return formatSheetDate(new Date());
+  if (/^yesterday\b/.test(lower)) {
+    const d = new Date();
+    d.setDate(d.getDate() - 1);
+    return formatSheetDate(d);
+  }
+
+  // "April 14th 2026" / "April 14, 2026" / "April 14"
+  // Allow the date to appear anywhere in the candidate string — VAs
+  // sometimes prefix with extra text like "on April 14".
+  const monthM = lower.match(/\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?(?:[,\s]+(\d{4}))?\b/i);
+  if (monthM) {
+    const month = MONTHS[monthM[1].toLowerCase()];
+    const day   = parseInt(monthM[2], 10);
+    const year  = monthM[3] ? parseInt(monthM[3], 10) : guessYear(month, day);
+    const d = new Date(year, month, day);
+    if (!isNaN(d.getTime())) return formatSheetDate(d);
+  }
+
+  // ISO yyyy-mm-dd
+  const isoM = lower.match(/\b(\d{4})-(\d{1,2})-(\d{1,2})\b/);
+  if (isoM) {
+    const d = new Date(parseInt(isoM[1], 10), parseInt(isoM[2], 10) - 1, parseInt(isoM[3], 10));
+    if (!isNaN(d.getTime())) return formatSheetDate(d);
+  }
+
+  // m/d or m/d/yy or m/d/yyyy  (also m-d-yy style). Anchor to word
+  // boundaries so we don't accidentally pick up a fragment of "$400".
+  const slashM = lower.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);
+  if (slashM) {
+    const month = parseInt(slashM[1], 10) - 1;
+    const day   = parseInt(slashM[2], 10);
+    if (month < 0 || month > 11 || day < 1 || day > 31) return null;
+    let year = slashM[3] ? parseInt(slashM[3], 10) : guessYear(month, day);
+    if (year < 100) year += 2000;
+    const d = new Date(year, month, day);
+    if (!isNaN(d.getTime())) return formatSheetDate(d);
+  }
+
+  return null;
+}
+
+function guessYear(month, day) {
+  const today  = new Date();
+  const tryNow = new Date(today.getFullYear(), month, day);
+  // If it's more than 31 days in the future, the operator probably means
+  // last year (e.g. logging a Dec post in January).
+  if (tryNow.getTime() - today.getTime() > 31 * 24 * 3600 * 1000) {
+    return today.getFullYear() - 1;
+  }
+  return today.getFullYear();
+}
+
+function formatSheetDate(date) {
+  // Match the existing parser.js datePosted format: "Tue 5/5/26" (AZ time)
+  return date.toLocaleDateString("en-US", {
+    timeZone: "America/Phoenix",
+    weekday: "short",
+    month:   "numeric",
+    day:     "numeric",
+    year:    "2-digit",
+  });
+}
 
 /**
  * Build a row for an individual page's "IG Revenue Tracker" tab.
@@ -170,12 +289,42 @@ async function handleAdMessage(ctx) {
         }
       }
 
+      // ── Optional date override ─────────────────────────────────────────────
+      // VAs sometimes confirm a post days late ("Posted on @goal April 14th").
+      // When a date is included in the reply, also update column D in both
+      // the master sheet and the per-page sheet to that date — overrides the
+      // brief-posting date so the sheet reflects the actual go-live day.
+      const overrideDate = extractPostedOnDate(text);
+
       if (handles.length > 0 && MASTER_SHEET_ID) {
         try {
           const updated = await updateStatusToLive(MASTER_SHEET_ID, TAB_NAME, handles, clientName);
           console.log(`[adHandler] ✅ "Posted on" — marked ${updated} row(s) as Live${clientName ? ` for "${clientName}"` : " (no campaign filter)"}`);
         } catch (err) {
           console.error(`[adHandler] ❌ "Posted on" update error: ${err.message}`);
+        }
+
+        if (overrideDate) {
+          // Master sheet: update column D for matching client + handle rows
+          try {
+            const dated = await updateAdDate(MASTER_SHEET_ID, TAB_NAME, handles, clientName, overrideDate, true);
+            console.log(`[adHandler] ✅ "Posted on" date override → "${overrideDate}" on ${dated} master row(s)`);
+          } catch (err) {
+            console.error(`[adHandler] ❌ "Posted on" date update (master): ${err.message}`);
+          }
+
+          // Per-page sheets: update column D where this handle has a sheet
+          for (const handle of handles) {
+            if (!isPageEnabled(handle)) continue;
+            const sheetId = pages[handle];
+            if (!sheetId || PLACEHOLDER_PATTERN.test(sheetId)) continue;
+            try {
+              const dated = await updateAdDate(sheetId, PAGE_TAB_NAME, [handle], clientName, overrideDate, false);
+              console.log(`[adHandler] ✅ "Posted on" date override → "${overrideDate}" on ${dated} @${handle} sheet row(s)`);
+            } catch (err) {
+              console.error(`[adHandler] ❌ "Posted on" date update (@${handle}): ${err.message}`);
+            }
+          }
         }
       }
 
@@ -291,9 +440,39 @@ async function handleAdMessage(ctx) {
       const adMessageId  = ctx.message.message_id;
       const sourceChatId = chatId;
 
-      // Content (media/video) is now forwarded directly by Greg (wizard.js)
-      // at submission time. bm_tracking_bot only forwards the ad brief.
-      console.log(`[adHandler] 📤 Forwarding brief to page channels (content handled by Greg)`);
+      // Pre-compute per-handle creative bundles by reading the messageBuffer
+      // backwards from the ad brief. Three formats supported:
+      //
+      //   1. Collab — videos with "Host: @page, invite: …" attribution.
+      //      getCollabBundlesByPage returns { handle: [video, captionMsgs…, hostMsg] }
+      //      so each page gets only its group's video + host message.
+      //
+      //   2. Per-page — media followed by labels like "@PageHandle^".
+      //      getContentBundlesByPage returns { handle: [media…] } so each
+      //      page gets only its labeled creative(s).
+      //
+      //   3. Standard — no attribution, one creative for everyone. Falls
+      //      back to the last 4 preceding media messages (typical carousel
+      //      slide count) and forwards the same set to every page.
+      //
+      // Both bundle parsers stop scanning at any non-label / non-host text,
+      // so we never pull media from a previous ad's content. clearBufferUpTo
+      // at the end of this handler also keeps cross-ad contamination out.
+      const collabBundles  = getCollabBundlesByPage(sourceChatId, adMessageId);
+      const labelBundles   = collabBundles ? null : getContentBundlesByPage(sourceChatId, adMessageId);
+      const useCollab      = !!collabBundles && collabBundles.size > 0;
+      const useLabels      = !useCollab && !!labelBundles && labelBundles.size > 0;
+      const fallbackMedia  = (!useCollab && !useLabels)
+        ? getPrecedingMessages(sourceChatId, adMessageId, 4)
+            .filter((m) => m.photo || m.video || m.document || m.animation)
+        : [];
+
+      console.log(
+        `[adHandler] 📤 Manual ad — forwarding ` +
+        `(format: ${useCollab ? "collab" : useLabels ? "per-page" : "standard"}, ` +
+        `attributed: ${useCollab ? collabBundles.size : useLabels ? labelBundles.size : 0}, ` +
+        `fallback media: ${fallbackMedia.length})`,
+      );
 
       // Only forward for pages that are enabled AND have a configured destination
       const uniqueHandles = [...new Set(
@@ -324,6 +503,32 @@ async function handleAdMessage(ctx) {
           continue;
         }
         forwardedDestinations.add(destKey);
+
+        // ── Forward the page's attributed creative(s) FIRST, then the brief
+        const attributed = useCollab
+          ? (collabBundles.get(handle.toLowerCase()) || [])
+          : useLabels
+            ? (labelBundles.get(handle.toLowerCase()) || [])
+            : fallbackMedia;
+
+        if (attributed.length === 0 && (useCollab || useLabels)) {
+          // We HAVE per-page attribution data but this specific handle isn't
+          // in it. Means the operator typo'd the label / host line, OR the
+          // page was added to the brief but the creative wasn't included.
+          // Don't forward random media — log and continue with brief only.
+          console.warn(`[adHandler] ⚠️ No attributed creative found for @${handle} — forwarding brief only`);
+        } else {
+          for (const mediaMsg of attributed) {
+            try {
+              await ctx.telegram.forwardMessage(String(destChatId), sourceChatId, mediaMsg.message_id);
+            } catch (err) {
+              console.error(`[adHandler] ❌ Forward creative msg ${mediaMsg.message_id} → @${handle}: ${err.message}`);
+            }
+          }
+          if (attributed.length > 0) {
+            console.log(`[adHandler] ✅ Forwarded ${attributed.length} creative msg(s) → @${handle}`);
+          }
+        }
 
         try {
           await forwardToPage(
