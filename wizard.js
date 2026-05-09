@@ -28,10 +28,27 @@ const poster          = require("./lib/poster");
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const WIZARD_TOKEN  = process.env.WIZARD_BOT_TOKEN;
-const TARGET_CHAT   = process.env.WIZARD_TARGET_CHAT_ID;
-const ADMIN_HANDLES = (process.env.WIZARD_ADMIN_HANDLES || "")
+const WIZARD_TOKEN     = process.env.WIZARD_BOT_TOKEN;
+const TARGET_CHAT      = process.env.WIZARD_TARGET_CHAT_ID;
+const SALES_TEAM_CHAT  = process.env.SALES_TEAM_CHAT_ID || "";
+const WIZARD_ADMIN_ID  = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+const ADMIN_HANDLES    = (process.env.WIZARD_ADMIN_HANDLES || "")
   .split(",").map((h) => h.trim().replace(/^@/, "")).filter(Boolean);
+
+const contributors = require("./lib/contributors");
+const sessionsLib  = require("./lib/sessions");
+
+/**
+ * True if the Telegram user is a sales-admin who can grant/revoke the
+ * sales-contributor role. Today: WIZARD_ADMIN_USER_ID (Connor) only —
+ * we keep this conservative since granting a contributor also grants
+ * them /ad access. Expand later if other senior sales need this.
+ */
+function isSalesAdmin(telegramId) {
+  if (!telegramId) return false;
+  if (WIZARD_ADMIN_ID && Number(telegramId) === WIZARD_ADMIN_ID) return true;
+  return false;
+}
 
 const ALL_SENIORS = [
   "davogabriel", "jazmynecooper", "sales_bolismedia",
@@ -740,6 +757,159 @@ async function postToGroup(telegram, session) {
   }
 }
 
+// ── Sales-contributor review submission ─────────────────────────────────────
+// Routes a contributor's /ad submission to SALES_TEAM_CHAT_ID for sales-team
+// review. The wizard's session content (Telegram message refs from the
+// contributor's DM) is persisted in ad_sessions.payload so the approver can
+// re-run the post against TARGET_CHAT minutes/hours later via copyMessage.
+
+async function submitForSalesReview(ctx, session) {
+  if (!SALES_TEAM_CHAT) {
+    await ctx.telegram.editMessageText(
+      session.chatId, session.wizardMsgId, undefined,
+      "⚠️ Sales review chat not configured (SALES_TEAM_CHAT_ID missing). Ask Connor to set it up.",
+    );
+    sessions.delete(ctx.from.id);
+    return;
+  }
+
+  // 1. Persist wizard state (answers + content refs) in ad_sessions
+  const adSession = await sessionsLib.createSession({
+    userId: ctx.from.id,
+    source: "wizard-contributor",
+    step:   "pending_review",
+    payload: {
+      // Wizard-shaped state — used at approve-time to replay copyMessage
+      // against TARGET_CHAT and run the existing forwardContentToPages
+      // flow.
+      wizard: {
+        answers: session.answers,
+        content: session.content,
+        sourceChatId: session.chatId,    // contributor's DM chat id
+        userInfo: {
+          userId: ctx.from.id,
+          firstName: ctx.from.first_name || null,
+          lastName:  ctx.from.last_name  || null,
+          username:  ctx.from.username   || null,
+        },
+        bulkTemplateId:     session._bulkTemplateId     || null,
+        campaignTemplateId: session._campaignTemplateId || null,
+      },
+      // Mirror enough of the intake-payload shape so other tooling
+      // (poster.js, bm_tracking_bot's parser) can read this session
+      // consistently with HTTP-intake sessions.
+      campaign: {
+        client:    session.answers.client,
+        adType:    session.answers.adType,
+        basePrice: parseFloat(session.answers.price) || 0,
+      },
+      adInfo: {
+        time:     session.answers.time,
+        postType: session.answers.postType,
+        duration: session.answers.duration,
+        nif:      session.answers.nif,
+        seniors:  session.answers.seniors,
+        caption:  session.answers.caption,
+      },
+      pages: (session.answers.pages || []).map((h) => ({ handle: h })),
+    },
+  });
+  if (!adSession) {
+    await ctx.telegram.editMessageText(
+      session.chatId, session.wizardMsgId, undefined,
+      "❌ Couldn't queue submission for review (database error). Try again or ping Connor.",
+    );
+    sessions.delete(ctx.from.id);
+    return;
+  }
+
+  // Mark as pending_review (createSession defaults to 'pending')
+  await sessionsLib.updateSession(adSession.id, {
+    status: "pending_review",
+    step:   "pending_review",
+  });
+
+  // 2. Mirror the creatives + brief into SALES_TEAM_CHAT_ID via copyMessage
+  //    so reviewers see exactly what'll go to Internal Network Ads.
+  await postWizardReviewCard(ctx.telegram, adSession.id, session);
+
+  // 3. Reply to the contributor in their DM
+  await ctx.telegram.editMessageText(
+    session.chatId, session.wizardMsgId, undefined,
+    "🛂 *Submitted for sales review*\n\n" +
+    "Your ad is in the monetization team's review queue. " +
+    "You'll get a DM here when it's approved or rejected.",
+    { parse_mode: "Markdown" },
+  );
+
+  sessions.delete(ctx.from.id);
+}
+
+async function postWizardReviewCard(telegram, sessionId, wizardSession) {
+  const fmt = wizardSession.answers.format;
+  const content = wizardSession.content || {};
+
+  // Forward creatives in the correct format-specific order so the review
+  // chat sees what Internal Network Ads would see.
+  try {
+    if (fmt === "Standard") {
+      for (const ref of content.shared || []) {
+        await telegram.copyMessage(SALES_TEAM_CHAT, ref.fromChatId, ref.msgId).catch(() => {});
+      }
+    } else if (fmt === "Per-creative") {
+      for (const handle of wizardSession.answers.pages || []) {
+        const msgs = content.byHandle?.[handle] || [];
+        if (msgs.length === 0) continue;
+        await telegram.sendMessage(SALES_TEAM_CHAT, `${handle}^`).catch(() => {});
+        for (const ref of msgs) {
+          await telegram.copyMessage(SALES_TEAM_CHAT, ref.fromChatId, ref.msgId).catch(() => {});
+        }
+      }
+    } else if (fmt === "Collab") {
+      for (const g of content.collabGroups || []) {
+        for (const ref of g.media || []) {
+          await telegram.copyMessage(SALES_TEAM_CHAT, ref.fromChatId, ref.msgId).catch(() => {});
+        }
+        const invites = (g.invites || []).map((h) => `@${h}`).join("\n");
+        await telegram.sendMessage(SALES_TEAM_CHAT, `Host: @${g.host}, invite:\n\n${invites}`).catch(() => {});
+      }
+    }
+    if (wizardSession.answers.caption) {
+      await telegram.sendMessage(SALES_TEAM_CHAT, wizardSession.answers.caption).catch(() => {});
+    }
+    await telegram.sendMessage(SALES_TEAM_CHAT, buildBrief(wizardSession.answers)).catch(() => {});
+  } catch (e) {
+    console.error("[wizard] review preview error:", e.message);
+  }
+
+  // Review card with Approve / Reject buttons
+  const submitter = [wizardSession.userInfo?.firstName, wizardSession.userInfo?.lastName]
+    .filter(Boolean).join(" ")
+    || (wizardSession.userInfo?.username ? `@${wizardSession.userInfo.username}` : null)
+    || `user ${wizardSession.userId}`;
+
+  const card = await telegram.sendMessage(
+    SALES_TEAM_CHAT,
+    `🛂 *Pending sales review* — submitted by ${submitter}\n` +
+    `_Approve to post to Internal Network Ads (30s cancel window)_`,
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [[
+          { text: "✅ Approve & post", callback_data: `wreview:approve:${sessionId}` },
+          { text: "❌ Reject",         callback_data: `wreview:reject:${sessionId}`  },
+        ]],
+      },
+    },
+  ).catch((e) => { console.error("[wizard] review card send:", e.message); return null; });
+
+  if (card) {
+    await sessionsLib.updateSession(sessionId, {
+      review_msg: { chatId: card.chat.id, messageId: card.message_id },
+    });
+  }
+}
+
 // ── Forward content directly to page channels ────────────────────────────────
 // Greg knows exactly which content goes to which page at submission time,
 // so we forward media directly to each page's destination channel here.
@@ -1136,6 +1306,80 @@ bot.command("editcamp", async (ctx) => {
   await ctx.reply("🔁 *Which campaign template to edit?*", { parse_mode: "Markdown", ...keyboard });
 });
 
+// ── Sales-contributor management ─────────────────────────────────────────────
+// Reply-based commands for granting + revoking sales-contributor status.
+// Contributors can run /ad in Greg DM but their submissions queue in
+// SALES_TEAM_CHAT_ID for review by core sales — instead of firing direct
+// to Internal Network Ads.
+//
+// Auth: only WIZARD_ADMIN_USER_ID (Connor) can grant/revoke. Anyone with
+// access to that account can extend by setting their telegram_id in env.
+
+bot.command("addcontributor", async (ctx) => {
+  if (!isSalesAdmin(ctx.from?.id)) {
+    return ctx.reply("⛔ Only sales admin can grant contributor status.");
+  }
+  const replyTo = ctx.message?.reply_to_message;
+  if (!replyTo?.from) {
+    return ctx.reply(
+      "👤 Reply to the contributor's message with /addcontributor.\n\n" +
+      "If they haven't messaged this chat yet, ask them to /start me first then run this in our DM.",
+    );
+  }
+  const target = replyTo.from;
+  if (target.is_bot) return ctx.reply("⛔ Can't grant contributor status to a bot.");
+
+  const displayName = [target.first_name, target.last_name].filter(Boolean).join(" ")
+    || (target.username ? `@${target.username}` : null);
+
+  const result = await contributors.addContributor({
+    telegramId: target.id,
+    displayName,
+    grantedBy:  ctx.from.id,
+  });
+  if (!result.ok) return ctx.reply(`⚠️ Failed: ${result.error}`);
+
+  await ctx.reply(
+    `✅ Granted sales-contributor status to ${displayName || target.id}.\n\n` +
+    `They can now run /ad in their DM with me. Their submissions will queue in the monetization team chat for review.`,
+  );
+});
+
+bot.command("removecontributor", async (ctx) => {
+  if (!isSalesAdmin(ctx.from?.id)) {
+    return ctx.reply("⛔ Only sales admin can revoke contributor status.");
+  }
+  const replyTo = ctx.message?.reply_to_message;
+  if (!replyTo?.from) {
+    return ctx.reply("👤 Reply to the contributor's message with /removecontributor.");
+  }
+  const target = replyTo.from;
+  const result = await contributors.removeContributor(target.id);
+  if (!result.ok) return ctx.reply(`⚠️ Failed: ${result.error}`);
+  if (!result.removed) return ctx.reply("ℹ️ That user wasn't a contributor.");
+
+  const displayName = result.removed.display_name || target.id;
+  await ctx.reply(
+    `✅ Revoked sales-contributor status from ${displayName}.\n\n` +
+    `Their pending review submissions stay intact; only future /ad calls will stop queuing for review.`,
+  );
+});
+
+bot.command("listcontributors", async (ctx) => {
+  if (!isSalesAdmin(ctx.from?.id)) return; // silent — others don't need to see it
+  const list = await contributors.listContributors();
+  if (list.length === 0) {
+    return ctx.reply("👥 No active sales contributors.");
+  }
+  const lines = ["👥 *Active sales contributors*", ""];
+  for (const c of list) {
+    const name = c.display_name || `tg:${c.telegram_id}`;
+    const granted = c.granted_at ? new Date(c.granted_at).toLocaleDateString() : "?";
+    lines.push(`· ${name} \`(${c.telegram_id})\` — added ${granted}`);
+  }
+  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+});
+
 // Track which template is being edited and which field is awaiting text input
 const _editSessions = new Map(); // userId → { kind, tplId, field, msgId }
 
@@ -1253,6 +1497,112 @@ bot.on("callback_query", async (ctx) => {
       await ctx.answerCbQuery("Add a note?");
     } catch (e) {
       console.error("[wizard] review reject prompt error:", e.message);
+      await ctx.answerCbQuery("Error — see logs", { show_alert: true });
+    }
+    return;
+  }
+
+  // ── Wizard-contributor review: Approve & post ────────────────────────────
+  // The contributor's wizard ran end-to-end in their DM; we just need to
+  // replay the saved message refs against TARGET_CHAT to post + run the
+  // standard per-page forwarding + sheet logging chain. Then DM the
+  // contributor with a confirmation.
+  if (data.startsWith("wreview:approve:")) {
+    const sessionId = data.slice("wreview:approve:".length);
+    try {
+      const { data: adSession } = await sessionsLib._supabase
+        .from("ad_sessions").select("*").eq("id", sessionId).single();
+      if (!adSession) {
+        await ctx.answerCbQuery("Session not found", { show_alert: true });
+        return;
+      }
+      if (adSession.status !== "pending_review") {
+        await ctx.answerCbQuery(`Already ${adSession.status}`, { show_alert: true });
+        return;
+      }
+
+      const wizardState = adSession.payload?.wizard;
+      if (!wizardState?.answers || !wizardState?.content) {
+        await ctx.answerCbQuery("Missing wizard state — can't post", { show_alert: true });
+        return;
+      }
+
+      // Reconstruct the wizard-shaped session for postToGroup +
+      // forwardContentToPages
+      const replaySession = {
+        answers: wizardState.answers,
+        content: wizardState.content,
+        chatId:  wizardState.sourceChatId,
+      };
+
+      await postToGroup(ctx.telegram, replaySession);
+      await forwardContentToPages(ctx.telegram, replaySession);
+
+      // Bump bulk/campaign template ref counters if the contributor used one
+      if (wizardState.bulkTemplateId) {
+        const bidx = KNOWN_BULKS.findIndex((t) => t.id === wizardState.bulkTemplateId);
+        if (bidx >= 0) { KNOWN_BULKS[bidx].lastRefNum = (KNOWN_BULKS[bidx].lastRefNum || 0) + 1; saveBulks(); }
+      }
+      if (wizardState.campaignTemplateId) {
+        const cidx = KNOWN_CAMPAIGNS.findIndex((t) => t.id === wizardState.campaignTemplateId);
+        if (cidx >= 0) { KNOWN_CAMPAIGNS[cidx].lastRefNum = (KNOWN_CAMPAIGNS[cidx].lastRefNum || 0) + 1; saveCampaigns(); }
+      }
+
+      await sessionsLib.markSent(sessionId);
+
+      // Edit the review card to lock it out
+      if (adSession.review_msg) {
+        try {
+          await ctx.telegram.editMessageText(
+            adSession.review_msg.chatId,
+            adSession.review_msg.messageId,
+            undefined,
+            `✅ *Approved + posted to Internal Network Ads*\n_Approved by ${ctx.from?.first_name || ctx.from?.id}_`,
+            { parse_mode: "Markdown" },
+          );
+        } catch (_) {}
+      }
+
+      // DM the contributor
+      if (adSession.user_id) {
+        try {
+          await ctx.telegram.sendMessage(
+            adSession.user_id,
+            "✅ Your ad was approved and posted to Internal Network Ads.",
+          );
+        } catch (e) {
+          console.warn(`[wizard] approve notify contributor ${adSession.user_id}: ${e.message}`);
+        }
+      }
+
+      await ctx.answerCbQuery("✅ Posted to Internal Network Ads");
+    } catch (e) {
+      console.error("[wizard] wreview approve error:", e.message);
+      await ctx.answerCbQuery("Error — see logs", { show_alert: true });
+    }
+    return;
+  }
+
+  // ── Wizard-contributor review: Reject (force_reply for note) ─────────────
+  if (data.startsWith("wreview:reject:")) {
+    const sessionId = data.slice("wreview:reject:".length);
+    try {
+      const prompt = await ctx.reply(
+        `❌ Rejecting submission \`${sessionId.slice(0, 8)}…\` — reply to *this* message with a note for the contributor (or "skip" for no note).`,
+        { parse_mode: "Markdown", reply_markup: { force_reply: true, selective: true } },
+      );
+      // Re-use _pendingRejectPrompts but tag with kind so the consumer
+      // knows which path to take. Could fork — keeping it simple.
+      _pendingRejectPrompts.set(prompt.message_id, {
+        sessionId,
+        approverTelegramId: ctx.from?.id || null,
+        chatId: ctx.chat.id,
+        createdAt: Date.now(),
+        kind: "wizard",
+      });
+      await ctx.answerCbQuery("Add a note?");
+    } catch (e) {
+      console.error("[wizard] wreview reject prompt error:", e.message);
       await ctx.answerCbQuery("Error — see logs", { show_alert: true });
     }
     return;
@@ -1613,6 +1963,17 @@ bot.on("callback_query", async (ctx) => {
     }
     if (action === "post") {
       try {
+        // ── Sales-contributor intercept ────────────────────────────────────
+        // External contributors can run /ad in Greg DM, but their submissions
+        // don't fire direct to Internal Network Ads — they queue in the
+        // monetization team chat (SALES_TEAM_CHAT_ID) for review by core
+        // sales. Intercept here so the rest of the post path remains
+        // untouched for everyone else.
+        const userIsContributor = await contributors.isContributor(ctx.from.id);
+        if (userIsContributor) {
+          return submitForSalesReview(ctx, session);
+        }
+
         await postToGroup(ctx.telegram, session);
         await forwardContentToPages(ctx.telegram, session);
         const brief = buildBrief(session.answers);
@@ -2358,6 +2719,54 @@ bot.on("text", async (ctx) => {
     _pendingRejectPrompts.delete(rejectReplyTo);
     const raw = ctx.message.text.trim();
     const reason = /^(skip|none|no reason|n\/a)$/i.test(raw) ? "" : raw;
+
+    // Two reject flavors share the prompt map:
+    //   kind = 'wizard'    — wizard-contributor's /ad submission
+    //   kind = undefined   — Digi-bot HTTP-intake review (poster.rejectSession)
+    if (pending.kind === "wizard") {
+      try {
+        await sessionsLib.cancelSession(pending.sessionId);
+        const { data: adSession } = await sessionsLib._supabase
+          .from("ad_sessions")
+          .select("review_msg, user_id, payload")
+          .eq("id", pending.sessionId).single();
+
+        if (adSession?.review_msg) {
+          try {
+            const note = reason ? `\n\n_Note:_ ${reason}` : "";
+            await bot.telegram.editMessageText(
+              adSession.review_msg.chatId,
+              adSession.review_msg.messageId,
+              undefined,
+              `❌ *Rejected* — not posted.\n_Rejected by ${ctx.from?.first_name || pending.approverTelegramId}_${note}`,
+              { parse_mode: "Markdown" },
+            );
+          } catch (_) {}
+        }
+
+        if (adSession?.user_id) {
+          try {
+            const lines = [
+              "❌ Your ad was rejected by sales.",
+              `*Client:* ${adSession.payload?.campaign?.client || "—"}`,
+            ];
+            if (reason) lines.push("", `*Reason:* ${reason}`);
+            lines.push("", "Run /ad again with adjustments and resubmit.");
+            await bot.telegram.sendMessage(adSession.user_id, lines.join("\n"), { parse_mode: "Markdown" });
+          } catch (e) {
+            console.warn(`[wizard] reject notify contributor ${adSession.user_id}: ${e.message}`);
+          }
+        }
+
+        await ctx.reply(reason ? "❌ Rejected with note." : "❌ Rejected (no note).").catch(() => {});
+      } catch (e) {
+        console.error("[wizard] wizard-reject consume error:", e.message);
+        await ctx.reply("⚠️ Reject failed — see logs.").catch(() => {});
+      }
+      return;
+    }
+
+    // Default: Digi-bot HTTP-intake review path (existing behavior)
     try {
       const result = await poster.rejectSession(bot, pending.sessionId, pending.approverTelegramId, reason);
       if (!result.ok) {
