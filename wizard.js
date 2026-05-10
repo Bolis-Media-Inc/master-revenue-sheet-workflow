@@ -725,9 +725,10 @@ function buildBrief(a) {
 async function postToGroup(telegram, session) {
   const { answers, content } = session;
   const fmt = answers.format;
-  const copy = (ref) =>
-    telegram.copyMessage(TARGET_CHAT, ref.fromChatId, ref.msgId)
-      .catch((e) => console.error("[wizard] copyMessage error:", e.message));
+  // All media goes as documents — sales-team convention. sendCapturedAsDocument
+  // uses the captured file_id when available and falls back to copyMessage
+  // for legacy refs that pre-date the file_id capture.
+  const sendDoc = (ref) => sendCapturedAsDocument(telegram, TARGET_CHAT, ref);
 
   // Helper: send caption if one was set
   const sendCaption = async () => {
@@ -735,7 +736,7 @@ async function postToGroup(telegram, session) {
   };
 
   if (fmt === "Standard") {
-    for (const ref of content.shared) await copy(ref);
+    for (const ref of content.shared) await sendDoc(ref);
     await sendCaption();
     await telegram.sendMessage(TARGET_CHAT, buildBrief(answers));
 
@@ -744,7 +745,7 @@ async function postToGroup(telegram, session) {
       const msgs = content.byHandle[handle] || [];
       if (msgs.length) {
         await telegram.sendMessage(TARGET_CHAT, `${handle}^`);
-        for (const ref of msgs) await copy(ref);
+        for (const ref of msgs) await sendDoc(ref);
       }
     }
     await sendCaption();
@@ -752,7 +753,7 @@ async function postToGroup(telegram, session) {
 
   } else if (fmt === "Collab") {
     for (const g of content.collabGroups) {
-      for (const ref of g.media) await copy(ref);
+      for (const ref of g.media) await sendDoc(ref);
       const invites = g.invites.map((h) => `@${h}`).join("\n");
       await telegram.sendMessage(TARGET_CHAT, `Host: @${g.host}, invite:\n\n${invites}`);
     }
@@ -857,12 +858,15 @@ async function postWizardReviewCard(telegram, sessionId, wizardSession) {
   const fmt = wizardSession.answers.format;
   const content = wizardSession.content || {};
 
-  // Forward creatives in the correct format-specific order so the review
-  // chat sees what Internal Network Ads would see.
+  // Forward creatives as documents (sales-team convention) in the
+  // format-specific order so the review chat sees what Internal Network
+  // Ads would see at post time.
+  const sendDoc = (ref) => sendCapturedAsDocument(telegram, SALES_TEAM_CHAT, ref);
+
   try {
     if (fmt === "Standard") {
       for (const ref of content.shared || []) {
-        await telegram.copyMessage(SALES_TEAM_CHAT, ref.fromChatId, ref.msgId).catch(() => {});
+        await sendDoc(ref);
       }
     } else if (fmt === "Per-creative") {
       for (const handle of wizardSession.answers.pages || []) {
@@ -870,13 +874,13 @@ async function postWizardReviewCard(telegram, sessionId, wizardSession) {
         if (msgs.length === 0) continue;
         await telegram.sendMessage(SALES_TEAM_CHAT, `${handle}^`).catch(() => {});
         for (const ref of msgs) {
-          await telegram.copyMessage(SALES_TEAM_CHAT, ref.fromChatId, ref.msgId).catch(() => {});
+          await sendDoc(ref);
         }
       }
     } else if (fmt === "Collab") {
       for (const g of content.collabGroups || []) {
         for (const ref of g.media || []) {
-          await telegram.copyMessage(SALES_TEAM_CHAT, ref.fromChatId, ref.msgId).catch(() => {});
+          await sendDoc(ref);
         }
         const invites = (g.invites || []).map((h) => `@${h}`).join("\n");
         await telegram.sendMessage(SALES_TEAM_CHAT, `Host: @${g.host}, invite:\n\n${invites}`).catch(() => {});
@@ -935,13 +939,9 @@ async function forwardContentToPages(telegram, session) {
   // Resolve unique destination chat IDs (dedup when multiple handles share a channel)
   const forwardedDests = new Set();
 
-  const fwd = async (destChatId, ref) => {
-    try {
-      await telegram.forwardMessage(destChatId, ref.fromChatId, ref.msgId);
-    } catch (e) {
-      console.error(`[wizard] forwardContent error → ${destChatId}: ${e.message}`);
-    }
-  };
+  // All media goes as documents — sales-team convention. Falls back
+  // to forwardMessage for legacy refs without file_id.
+  const fwd = (destChatId, ref) => sendCapturedAsDocument(telegram, destChatId, ref);
 
   if (fmt === "Standard") {
     // Shared content → every page
@@ -3415,12 +3415,38 @@ bot.on("text", async (ctx) => {
 });
 
 // ── Media messages (content upload phase) ────────────────────────────────────
+//
+// At capture time we record both the message reference (chatId + msgId) AND
+// the underlying file_id + media kind. This lets downstream forwarding go
+// through sendDocument (preserves quality, matches the sales-team convention
+// of always shipping creatives as documents) instead of copyMessage (which
+// re-sends as the original media type and is occasionally lossy for photos).
+
+function extractFileRef(message) {
+  if (!message) return null;
+  if (message.photo?.length) {
+    // Telegram stores multiple sizes; pick the largest.
+    const largest = message.photo[message.photo.length - 1];
+    return { kind: "photo", fileId: largest.file_id };
+  }
+  if (message.video)     return { kind: "video",     fileId: message.video.file_id };
+  if (message.document)  return { kind: "document",  fileId: message.document.file_id };
+  if (message.animation) return { kind: "animation", fileId: message.animation.file_id };
+  if (message.audio)     return { kind: "audio",     fileId: message.audio.file_id };
+  return null;
+}
 
 bot.on(["photo", "video", "document", "animation"], async (ctx) => {
   const session = sessions.get(ctx.from.id);
   if (!session || session.step !== "content") return;
 
-  const msgRef      = { fromChatId: ctx.chat.id, msgId: ctx.message.message_id };
+  const fileRef = extractFileRef(ctx.message);
+  const msgRef  = {
+    fromChatId: ctx.chat.id,
+    msgId:      ctx.message.message_id,
+    fileId:     fileRef?.fileId || null,
+    kind:       fileRef?.kind   || null,
+  };
   const fmt         = session.answers.format;
   const { content } = session;
 
@@ -3439,6 +3465,28 @@ bot.on(["photo", "video", "document", "animation"], async (ctx) => {
 
   await updateWizard(ctx.telegram, session);
 });
+
+// Send a captured media reference as a document, preserving the original
+// file. This is the sales-team convention — documents avoid Telegram's
+// re-encoding for photos/videos and keep upload quality intact end to
+// end. Falls back to copyMessage when file_id wasn't captured (older
+// sessions persisted before the schema upgrade).
+async function sendCapturedAsDocument(telegram, chatId, ref) {
+  if (!ref) return;
+  if (ref.fileId) {
+    try {
+      await telegram.sendDocument(chatId, ref.fileId);
+      return;
+    } catch (e) {
+      console.warn(`[wizard] sendDocument(${ref.kind}) failed: ${e.message} — falling back to copyMessage`);
+    }
+  }
+  // Fallback for legacy refs without fileId
+  if (ref.fromChatId && ref.msgId) {
+    try { await telegram.copyMessage(chatId, ref.fromChatId, ref.msgId); }
+    catch (e) { console.error(`[wizard] copyMessage fallback failed: ${e.message}`); }
+  }
+}
 
 // ── Sales intelligence startup ────────────────────────────────────────────────
 // Connects to @sales_bolismedia and listens to all chats automatically.
