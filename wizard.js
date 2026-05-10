@@ -1322,49 +1322,99 @@ function extractPageHandles(text) {
   return Array.from(new Set(matches.map((h) => h.slice(1).toLowerCase())));
 }
 
+// Pull a Telegram-style @username (no `.`, distinct from page handles
+// which can contain dots). First match wins.
+function extractTgUsername(text) {
+  const m = String(text || "").match(/(?:^|\s)@([A-Za-z][A-Za-z0-9_]{4,31})\b/);
+  return m ? m[1].toLowerCase() : null;
+}
+
 bot.command("addcontributor", async (ctx) => {
   if (!isSalesAdmin(ctx.from?.id)) {
     return ctx.reply("⛔ Only sales admin can grant contributor status.");
   }
+
+  const cmdText = ctx.message?.text || "";
   const replyTo = ctx.message?.reply_to_message;
-  if (!replyTo?.from) {
+  const allowedPages = extractPageHandles(cmdText);
+
+  // ── Path 1: replied to the contributor's message — instant grant ────────
+  if (replyTo?.from) {
+    const target = replyTo.from;
+    if (target.is_bot) return ctx.reply("⛔ Can't grant contributor status to a bot.");
+
+    const displayName = [target.first_name, target.last_name].filter(Boolean).join(" ")
+      || (target.username ? `@${target.username}` : null);
+
+    const result = await contributors.addContributor({
+      telegramId:   target.id,
+      displayName,
+      grantedBy:    ctx.from.id,
+      allowedPages: allowedPages.length > 0 ? allowedPages : null,
+    });
+    if (!result.ok) return ctx.reply(`⚠️ Failed: ${result.error}`);
+
+    const scopeLine = allowedPages.length > 0
+      ? `Scoped to: ${allowedPages.map((h) => "@" + h).join(", ")}`
+      : `Unrestricted — can submit for any page.`;
     return ctx.reply(
-      "👤 *How to grant contributor status*\n\n" +
-      "Reply to the contributor's message with:\n" +
-      "`/addcontributor` — they can submit ads for *all* pages\n" +
-      "`/addcontributor @goal @thefuck.tv` — only those pages\n\n" +
-      "If they haven't messaged this chat yet, ask them to /start me first.",
+      `✅ Granted sales-contributor status to ${displayName || target.id}.\n\n` +
+      `${scopeLine}\n\n` +
+      `They can now run /ad in their DM with me. Submissions queue in the monetization team chat for review.\n\n` +
+      `Adjust their page scope anytime with /setcontributorpages (reply to their message + handles).`,
+    );
+  }
+
+  // ── Path 2: @username invite — pending until they DM Greg ──────────────
+  // Telegram bot API can't resolve @username → user_id without the user
+  // having sent a message Greg can see. Store as a pending invite that
+  // auto-activates the moment the user messages Greg.
+  const username = extractTgUsername(cmdText);
+  if (username) {
+    const result = await contributors.createInvite({
+      username,
+      grantedBy: ctx.from.id,
+      allowedPages: allowedPages.length > 0 ? allowedPages : null,
+    });
+    if (!result.ok) return ctx.reply(`⚠️ Failed: ${result.error}`);
+
+    const scopeLine = allowedPages.length > 0
+      ? `Scoped to: ${allowedPages.map((h) => "@" + h).join(", ")}`
+      : `Unrestricted — can submit for any page.`;
+    return ctx.reply(
+      `📌 *Pending invite for @${username}*\n\n` +
+      `${scopeLine}\n\n` +
+      `Once @${username} sends me any message (e.g. \`/start\`), the grant activates automatically. ` +
+      `Tell them to DM me to finish setup — I'll DM you a confirmation when it lands.\n\n` +
+      `Cancel anytime: \`/canceleinvite @${username}\``,
       { parse_mode: "Markdown" },
     );
   }
-  const target = replyTo.from;
-  if (target.is_bot) return ctx.reply("⛔ Can't grant contributor status to a bot.");
 
-  const displayName = [target.first_name, target.last_name].filter(Boolean).join(" ")
-    || (target.username ? `@${target.username}` : null);
-
-  // Parse optional page list from the command text after /addcontributor
-  const cmdText = ctx.message?.text || "";
-  const allowedPages = extractPageHandles(cmdText);
-
-  const result = await contributors.addContributor({
-    telegramId:   target.id,
-    displayName,
-    grantedBy:    ctx.from.id,
-    allowedPages: allowedPages.length > 0 ? allowedPages : null,
-  });
-  if (!result.ok) return ctx.reply(`⚠️ Failed: ${result.error}`);
-
-  const scopeLine = allowedPages.length > 0
-    ? `Scoped to: ${allowedPages.map((h) => "@" + h).join(", ")}`
-    : `Unrestricted — can submit for any page.`;
-
-  await ctx.reply(
-    `✅ Granted sales-contributor status to ${displayName || target.id}.\n\n` +
-    `${scopeLine}\n\n` +
-    `They can now run /ad in their DM with me. Submissions will queue in the monetization team chat for review.\n\n` +
-    `Adjust their page scope anytime with /setcontributorpages (reply to their message + handles).`,
+  // ── Help ──────────────────────────────────────────────────────────────
+  return ctx.reply(
+    "👤 *How to grant contributor status*\n\n" +
+    "*Reply to the contributor's message* with:\n" +
+    "`/addcontributor` — unrestricted (any page)\n" +
+    "`/addcontributor @goal @thefuck.tv` — scoped to those pages\n\n" +
+    "*Or grant by username* (works even if they haven't DM'd me yet):\n" +
+    "`/addcontributor @theiruser` — unrestricted, pending until they DM me\n" +
+    "`/addcontributor @theiruser @goal @thefuck.tv` — scoped, pending\n\n" +
+    "_Telegram usernames are case-insensitive. Page handles can contain dots; usernames can't._",
+    { parse_mode: "Markdown" },
   );
+});
+
+// Cancel a pending invite that hasn't been claimed yet.
+bot.command("canceleinvite", async (ctx) => {
+  if (!isSalesAdmin(ctx.from?.id)) return;
+  const username = extractTgUsername(ctx.message?.text || "");
+  if (!username) {
+    return ctx.reply("Usage: `/canceleinvite @username`", { parse_mode: "Markdown" });
+  }
+  const result = await contributors.deleteInvite(username);
+  if (!result.ok) return ctx.reply(`⚠️ Failed: ${result.error}`);
+  await ctx.reply(`✅ Cancelled pending invite for @${username}.`);
 });
 
 // /setcontributorpages — reply to a contributor's message + supply page
@@ -1418,23 +1468,86 @@ bot.command("removecontributor", async (ctx) => {
 
 bot.command("listcontributors", async (ctx) => {
   if (!isSalesAdmin(ctx.from?.id)) return; // silent — others don't need to see it
-  const list = await contributors.listContributors();
-  if (list.length === 0) {
-    return ctx.reply("👥 No active sales contributors.");
+  const [list, invites] = await Promise.all([
+    contributors.listContributors(),
+    contributors.listInvites(),
+  ]);
+
+  const lines = [];
+  if (list.length === 0 && invites.length === 0) {
+    return ctx.reply("👥 No active sales contributors or pending invites.");
   }
-  const lines = ["👥 *Active sales contributors*", ""];
-  for (const c of list) {
-    const name = c.display_name || `tg:${c.telegram_id}`;
-    const granted = c.granted_at ? new Date(c.granted_at).toLocaleDateString() : "?";
-    const scope = Array.isArray(c.allowed_pages) && c.allowed_pages.length > 0
-      ? c.allowed_pages.map((h) => "@" + h).join(", ")
-      : "_unrestricted_";
-    lines.push(
-      `· ${name} \`(${c.telegram_id})\` — added ${granted}\n` +
-      `   ↳ ${scope}`
-    );
+
+  if (list.length > 0) {
+    lines.push("👥 *Active sales contributors*", "");
+    for (const c of list) {
+      const name = c.display_name || `tg:${c.telegram_id}`;
+      const granted = c.granted_at ? new Date(c.granted_at).toLocaleDateString() : "?";
+      const scope = Array.isArray(c.allowed_pages) && c.allowed_pages.length > 0
+        ? c.allowed_pages.map((h) => "@" + h).join(", ")
+        : "_unrestricted_";
+      lines.push(`· ${name} \`(${c.telegram_id})\` — added ${granted}\n   ↳ ${scope}`);
+    }
   }
+
+  if (invites.length > 0) {
+    if (lines.length > 0) lines.push("");
+    lines.push("📌 *Pending invites* _(activate when user DMs me)_", "");
+    for (const i of invites) {
+      const granted = i.granted_at ? new Date(i.granted_at).toLocaleDateString() : "?";
+      const scope = Array.isArray(i.allowed_pages) && i.allowed_pages.length > 0
+        ? i.allowed_pages.map((h) => "@" + h).join(", ")
+        : "_unrestricted_";
+      lines.push(`· @${i.username} — invited ${granted}\n   ↳ ${scope}`);
+    }
+  }
+
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+});
+
+// ── Auto-materialize pending invites on first contact ─────────────────────
+// When a user with a pending invite sends Greg ANY message (text or media),
+// resolve their telegram_id and convert the invite into a real
+// sales_contributors row. Then DM the grantor a confirmation. Runs as a
+// best-effort middleware — never blocks the rest of the message handling.
+bot.use(async (ctx, next) => {
+  try {
+    const username = ctx.from?.username;
+    if (username && ctx.from?.id) {
+      // Cheap check: skip if username doesn't even start with a letter
+      // (e.g. bot commands sometimes have weird from objects)
+      const result = await contributors.tryConsumeInvite({
+        telegramId: ctx.from.id,
+        username,
+        displayName: [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ") || null,
+      });
+      if (result) {
+        // Notify the user
+        try {
+          const scope = Array.isArray(result.invite.allowed_pages) && result.invite.allowed_pages.length > 0
+            ? `for: ${result.invite.allowed_pages.map((h) => "@" + h).join(", ")}`
+            : "for any page (unrestricted)";
+          await ctx.telegram.sendMessage(
+            result.telegramId,
+            `✅ You've been granted sales-contributor access ${scope}.\n\n` +
+            `Run /ad in this chat to submit your first ad. Submissions go to the monetization team for review before posting.`,
+          );
+        } catch (_) {}
+        // Notify the grantor
+        if (result.invite.granted_by) {
+          try {
+            await ctx.telegram.sendMessage(
+              result.invite.granted_by,
+              `✅ @${result.username} just DM'd me — pending invite activated.`,
+            );
+          } catch (_) {}
+        }
+      }
+    }
+  } catch (e) {
+    console.error("[wizard] invite materialization error:", e.message);
+  }
+  return next();
 });
 
 // Track which template is being edited and which field is awaiting text input
