@@ -36,6 +36,7 @@ const ADMIN_HANDLES    = (process.env.WIZARD_ADMIN_HANDLES || "")
   .split(",").map((h) => h.trim().replace(/^@/, "")).filter(Boolean);
 
 const contributors = require("./lib/contributors");
+const posters      = require("./lib/posters");
 const sessionsLib  = require("./lib/sessions");
 
 /**
@@ -368,7 +369,14 @@ function buildKeyboard(step, session) {
     }
     case "seniors": {
       const selected = session?.answers?.seniors || [];
-      const rows = ALL_SENIORS.map((h) => {
+      // Merge core seniors with registered posters. Posters added via
+      // /addposter @name show up here on next session start (sync cache
+      // refreshes on add/remove + every 5min).
+      const posterUsernames = posters.listActiveSync()
+        .map((p) => p.username)
+        .filter(Boolean);
+      const merged = Array.from(new Set([...ALL_SENIORS, ...posterUsernames]));
+      const rows = merged.map((h) => {
         const label = selected.includes(h) ? `✅ @${h}` : `@${h}`;
         return [b(label, `sr:${h}`)];
       });
@@ -1405,6 +1413,151 @@ bot.command("addcontributor", async (ctx) => {
   );
 });
 
+// ── Poster registry ──────────────────────────────────────────────────────
+// Posters are people responsible for posting ads on Instagram. They
+// show up in the /ad wizard's "Who's responsible for posting?" step
+// alongside ALL_SENIORS — so contributors / VAs can be picked there.
+// Same admin-only auth + pending-invite-by-username pattern as
+// /addcontributor.
+
+bot.command("addposter", async (ctx) => {
+  if (!isSalesAdmin(ctx.from?.id)) {
+    return ctx.reply("⛔ Only sales admin can register posters.");
+  }
+  const cmdText = ctx.message?.text || "";
+  const replyTo = ctx.message?.reply_to_message;
+  const pages   = extractPageHandles(cmdText);
+
+  // Path 1: replied to an existing user's message → instant grant
+  if (replyTo?.from) {
+    const target = replyTo.from;
+    if (target.is_bot) return ctx.reply("⛔ Can't register a bot as a poster.");
+    if (!target.username) {
+      return ctx.reply(
+        "⚠️ That user doesn't have a Telegram @username set.\n\n" +
+        "Posters need a username so the wizard can render them as @handle buttons. " +
+        "Ask them to set one in Telegram → Settings → Username, then retry.",
+      );
+    }
+    const displayName = [target.first_name, target.last_name].filter(Boolean).join(" ")
+      || `@${target.username}`;
+    const result = await posters.addPoster({
+      telegramId:  target.id,
+      username:    target.username,
+      displayName,
+      addedBy:     ctx.from.id,
+      pages:       pages.length > 0 ? pages : null,
+    });
+    if (!result.ok) return ctx.reply(`⚠️ Failed: ${result.error}`);
+
+    const scopeLine = pages.length > 0
+      ? `Scoped to: ${pages.map((h) => "@" + h).join(", ")}`
+      : `Unrestricted — listed for any page.`;
+    return ctx.reply(
+      `✅ Registered @${target.username} as a poster.\n\n${scopeLine}\n\n` +
+      `They'll now appear in /ad's "Who's responsible for posting?" list.`,
+    );
+  }
+
+  // Path 2: invite by username
+  const username = extractTgUsername(cmdText);
+  if (username) {
+    const result = await posters.createInvite({
+      username,
+      addedBy: ctx.from.id,
+      pages: pages.length > 0 ? pages : null,
+    });
+    if (!result.ok) return ctx.reply(`⚠️ Failed: ${result.error}`);
+
+    const scopeLine = pages.length > 0
+      ? `Scoped to: ${pages.map((h) => "@" + h).join(", ")}`
+      : `Unrestricted — listed for any page.`;
+    return ctx.reply(
+      `📌 *Pending poster invite for @${username}*\n\n${scopeLine}\n\n` +
+      `Once @${username} sends me any message, they'll be registered as a poster ` +
+      `and show up in /ad's "Who's responsible for posting?" list.`,
+      { parse_mode: "Markdown" },
+    );
+  }
+
+  return ctx.reply(
+    "📋 *How to register a poster*\n\n" +
+    "*Reply to their message:*\n" +
+    "`/addposter` — listed for any page\n" +
+    "`/addposter @goal @thefuck.tv` — scoped to those pages\n\n" +
+    "*Or by username* (works even if they haven't DM'd me yet):\n" +
+    "`/addposter @theiruser` — pending until they DM me\n" +
+    "`/addposter @theiruser @goal @thefuck.tv` — scoped, pending",
+    { parse_mode: "Markdown" },
+  );
+});
+
+bot.command("setposterpages", async (ctx) => {
+  if (!isSalesAdmin(ctx.from?.id)) return;
+  const replyTo = ctx.message?.reply_to_message;
+  if (!replyTo?.from) {
+    return ctx.reply(
+      "Reply to the poster's message:\n" +
+      "`/setposterpages @goal @thefuck.tv` — restrict to those pages\n" +
+      "`/setposterpages` (no handles) — clear restriction",
+      { parse_mode: "Markdown" },
+    );
+  }
+  const target = replyTo.from;
+  const pages = extractPageHandles(ctx.message?.text || "");
+  const result = await posters.setPosterPages(target.id, pages);
+  if (!result.ok) return ctx.reply(`⚠️ Failed: ${result.error}`);
+  const scopeLine = pages.length > 0
+    ? `Scoped to: ${pages.map((h) => "@" + h).join(", ")}`
+    : `Unrestricted — listed for any page.`;
+  await ctx.reply(`✅ @${result.row.username || target.id} — ${scopeLine}`);
+});
+
+bot.command("removeposter", async (ctx) => {
+  if (!isSalesAdmin(ctx.from?.id)) return;
+  const replyTo = ctx.message?.reply_to_message;
+  if (!replyTo?.from) {
+    return ctx.reply("Reply to the poster's message with `/removeposter`.", { parse_mode: "Markdown" });
+  }
+  const result = await posters.removePoster(replyTo.from.id);
+  if (!result.ok) return ctx.reply(`⚠️ Failed: ${result.error}`);
+  if (!result.removed) return ctx.reply("ℹ️ That user isn't a registered poster.");
+  await ctx.reply(`✅ Removed @${result.removed.display_name || replyTo.from.id} from posters.`);
+});
+
+bot.command("listposters", async (ctx) => {
+  if (!isSalesAdmin(ctx.from?.id)) return;
+  const [list, invites] = await Promise.all([
+    posters.listActive(),
+    posters.listInvites(),
+  ]);
+  if (list.length === 0 && invites.length === 0) {
+    return ctx.reply("📋 No posters registered.");
+  }
+  const lines = [];
+  if (list.length > 0) {
+    lines.push("📋 *Registered posters*", "");
+    for (const p of list) {
+      const handle = p.username ? "@" + p.username : `tg:${p.telegram_id}`;
+      const scope = Array.isArray(p.pages) && p.pages.length > 0
+        ? p.pages.map((h) => "@" + h).join(", ")
+        : "_unrestricted_";
+      lines.push(`· ${handle} ${p.display_name && p.display_name !== p.username ? `(${p.display_name})` : ""}\n   ↳ ${scope}`);
+    }
+  }
+  if (invites.length > 0) {
+    if (lines.length > 0) lines.push("");
+    lines.push("📌 *Pending poster invites* _(activate when user DMs me)_", "");
+    for (const i of invites) {
+      const scope = Array.isArray(i.pages) && i.pages.length > 0
+        ? i.pages.map((h) => "@" + h).join(", ")
+        : "_unrestricted_";
+      lines.push(`· @${i.username}\n   ↳ ${scope}`);
+    }
+  }
+  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+});
+
 // Cancel a pending invite that hasn't been claimed yet.
 bot.command("canceleinvite", async (ctx) => {
   if (!isSalesAdmin(ctx.from?.id)) return;
@@ -1506,39 +1659,63 @@ bot.command("listcontributors", async (ctx) => {
 });
 
 // ── Auto-materialize pending invites on first contact ─────────────────────
-// When a user with a pending invite sends Greg ANY message (text or media),
-// resolve their telegram_id and convert the invite into a real
-// sales_contributors row. Then DM the grantor a confirmation. Runs as a
-// best-effort middleware — never blocks the rest of the message handling.
+// Both contributor and poster invites are keyed by username — when a user
+// with a matching pending invite DMs Greg, we resolve their telegram_id
+// and convert the invite. Both flavors can fire for the same user
+// (relewans is contributor + poster). Runs as best-effort middleware,
+// never blocks the rest of the handler chain.
 bot.use(async (ctx, next) => {
   try {
     const username = ctx.from?.username;
     if (username && ctx.from?.id) {
-      // Cheap check: skip if username doesn't even start with a letter
-      // (e.g. bot commands sometimes have weird from objects)
-      const result = await contributors.tryConsumeInvite({
-        telegramId: ctx.from.id,
-        username,
-        displayName: [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ") || null,
+      const tgId = ctx.from.id;
+      const display = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ") || null;
+
+      // 1. Contributor invite
+      const contribResult = await contributors.tryConsumeInvite({
+        telegramId: tgId, username, displayName: display,
       });
-      if (result) {
-        // Notify the user
+      if (contribResult) {
         try {
-          const scope = Array.isArray(result.invite.allowed_pages) && result.invite.allowed_pages.length > 0
-            ? `for: ${result.invite.allowed_pages.map((h) => "@" + h).join(", ")}`
+          const scope = Array.isArray(contribResult.invite.allowed_pages) && contribResult.invite.allowed_pages.length > 0
+            ? `for: ${contribResult.invite.allowed_pages.map((h) => "@" + h).join(", ")}`
             : "for any page (unrestricted)";
           await ctx.telegram.sendMessage(
-            result.telegramId,
+            contribResult.telegramId,
             `✅ You've been granted sales-contributor access ${scope}.\n\n` +
             `Run /ad in this chat to submit your first ad. Submissions go to the monetization team for review before posting.`,
           );
         } catch (_) {}
-        // Notify the grantor
-        if (result.invite.granted_by) {
+        if (contribResult.invite.granted_by) {
           try {
             await ctx.telegram.sendMessage(
-              result.invite.granted_by,
-              `✅ @${result.username} just DM'd me — pending invite activated.`,
+              contribResult.invite.granted_by,
+              `✅ @${contribResult.username} just DM'd me — sales-contributor invite activated.`,
+            );
+          } catch (_) {}
+        }
+      }
+
+      // 2. Poster invite (independent of contributor — both can fire)
+      const posterResult = await posters.tryConsumeInvite({
+        telegramId: tgId, username, displayName: display,
+      });
+      if (posterResult) {
+        try {
+          const scope = Array.isArray(posterResult.invite.pages) && posterResult.invite.pages.length > 0
+            ? `for: ${posterResult.invite.pages.map((h) => "@" + h).join(", ")}`
+            : "for any page";
+          await ctx.telegram.sendMessage(
+            posterResult.telegramId,
+            `📋 You're now listed as a poster ${scope}. ` +
+            `When the team submits ads, you'll be selectable in the "Who's responsible for posting?" step.`,
+          );
+        } catch (_) {}
+        if (posterResult.invite.added_by) {
+          try {
+            await ctx.telegram.sendMessage(
+              posterResult.invite.added_by,
+              `✅ @${posterResult.username} just DM'd me — poster invite activated.`,
             );
           } catch (_) {}
         }
