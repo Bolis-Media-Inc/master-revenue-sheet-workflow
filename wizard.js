@@ -1315,6 +1315,13 @@ bot.command("editcamp", async (ctx) => {
 // Auth: only WIZARD_ADMIN_USER_ID (Connor) can grant/revoke. Anyone with
 // access to that account can extend by setting their telegram_id in env.
 
+// Pull @handles out of arbitrary text (e.g. command args). Normalised to
+// lowercase, no leading @. Returns [] when nothing matches.
+function extractPageHandles(text) {
+  const matches = String(text || "").match(/@([\w.]+)/g) || [];
+  return Array.from(new Set(matches.map((h) => h.slice(1).toLowerCase())));
+}
+
 bot.command("addcontributor", async (ctx) => {
   if (!isSalesAdmin(ctx.from?.id)) {
     return ctx.reply("⛔ Only sales admin can grant contributor status.");
@@ -1322,8 +1329,12 @@ bot.command("addcontributor", async (ctx) => {
   const replyTo = ctx.message?.reply_to_message;
   if (!replyTo?.from) {
     return ctx.reply(
-      "👤 Reply to the contributor's message with /addcontributor.\n\n" +
-      "If they haven't messaged this chat yet, ask them to /start me first then run this in our DM.",
+      "👤 *How to grant contributor status*\n\n" +
+      "Reply to the contributor's message with:\n" +
+      "`/addcontributor` — they can submit ads for *all* pages\n" +
+      "`/addcontributor @goal @thefuck.tv` — only those pages\n\n" +
+      "If they haven't messaged this chat yet, ask them to /start me first.",
+      { parse_mode: "Markdown" },
     );
   }
   const target = replyTo.from;
@@ -1332,17 +1343,57 @@ bot.command("addcontributor", async (ctx) => {
   const displayName = [target.first_name, target.last_name].filter(Boolean).join(" ")
     || (target.username ? `@${target.username}` : null);
 
+  // Parse optional page list from the command text after /addcontributor
+  const cmdText = ctx.message?.text || "";
+  const allowedPages = extractPageHandles(cmdText);
+
   const result = await contributors.addContributor({
-    telegramId: target.id,
+    telegramId:   target.id,
     displayName,
-    grantedBy:  ctx.from.id,
+    grantedBy:    ctx.from.id,
+    allowedPages: allowedPages.length > 0 ? allowedPages : null,
   });
   if (!result.ok) return ctx.reply(`⚠️ Failed: ${result.error}`);
 
+  const scopeLine = allowedPages.length > 0
+    ? `Scoped to: ${allowedPages.map((h) => "@" + h).join(", ")}`
+    : `Unrestricted — can submit for any page.`;
+
   await ctx.reply(
     `✅ Granted sales-contributor status to ${displayName || target.id}.\n\n` +
-    `They can now run /ad in their DM with me. Their submissions will queue in the monetization team chat for review.`,
+    `${scopeLine}\n\n` +
+    `They can now run /ad in their DM with me. Submissions will queue in the monetization team chat for review.\n\n` +
+    `Adjust their page scope anytime with /setcontributorpages (reply to their message + handles).`,
   );
+});
+
+// /setcontributorpages — reply to a contributor's message + supply page
+// handles (or no handles, to clear the restriction).
+bot.command("setcontributorpages", async (ctx) => {
+  if (!isSalesAdmin(ctx.from?.id)) {
+    return ctx.reply("⛔ Only sales admin can update contributor scope.");
+  }
+  const replyTo = ctx.message?.reply_to_message;
+  if (!replyTo?.from) {
+    return ctx.reply(
+      "👤 *How to update contributor scope*\n\n" +
+      "Reply to the contributor's message:\n" +
+      "`/setcontributorpages @goal @thefuck.tv` — restrict to those pages\n" +
+      "`/setcontributorpages` (no handles) — clear restriction (any page)",
+      { parse_mode: "Markdown" },
+    );
+  }
+  const target = replyTo.from;
+  const allowedPages = extractPageHandles(ctx.message?.text || "");
+
+  const result = await contributors.setAllowedPages(target.id, allowedPages);
+  if (!result.ok) return ctx.reply(`⚠️ Failed: ${result.error}`);
+
+  const displayName = result.row?.display_name || `tg:${target.id}`;
+  const scopeLine = allowedPages.length > 0
+    ? `Scoped to: ${allowedPages.map((h) => "@" + h).join(", ")}`
+    : `Unrestricted — can submit for any page.`;
+  await ctx.reply(`✅ ${displayName} — ${scopeLine}`);
 });
 
 bot.command("removecontributor", async (ctx) => {
@@ -1375,7 +1426,13 @@ bot.command("listcontributors", async (ctx) => {
   for (const c of list) {
     const name = c.display_name || `tg:${c.telegram_id}`;
     const granted = c.granted_at ? new Date(c.granted_at).toLocaleDateString() : "?";
-    lines.push(`· ${name} \`(${c.telegram_id})\` — added ${granted}`);
+    const scope = Array.isArray(c.allowed_pages) && c.allowed_pages.length > 0
+      ? c.allowed_pages.map((h) => "@" + h).join(", ")
+      : "_unrestricted_";
+    lines.push(
+      `· ${name} \`(${c.telegram_id})\` — added ${granted}\n` +
+      `   ↳ ${scope}`
+    );
   }
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
 });
@@ -1969,8 +2026,32 @@ bot.on("callback_query", async (ctx) => {
         // monetization team chat (SALES_TEAM_CHAT_ID) for review by core
         // sales. Intercept here so the rest of the post path remains
         // untouched for everyone else.
-        const userIsContributor = await contributors.isContributor(ctx.from.id);
-        if (userIsContributor) {
+        //
+        // Per-contributor page scoping: if the contributor has a non-empty
+        // allowed_pages list, every page in this submission must be in
+        // that list. Reject up-front so the contributor doesn't get
+        // "submitted for review" only to have a sales user reject it
+        // for a scope reason.
+        const contributor = await contributors.getContributor(ctx.from.id);
+        if (contributor) {
+          const requestedHandles = (session.answers.pages || []).map((h) =>
+            String(h || "").toLowerCase().replace(/^@/, "")
+          );
+          const { allowed, denied } = contributors.isAllowedForPages(contributor, requestedHandles);
+          if (!allowed) {
+            const allowedDisplay = (contributor.allowedPages || []).map((h) => "@" + h).join(", ") || "(none)";
+            const deniedDisplay  = denied.map((h) => "@" + h).join(", ");
+            await ctx.telegram.editMessageText(
+              session.chatId, session.wizardMsgId, undefined,
+              `❌ *Not authorized for some pages*\n\n` +
+              `You can submit ads for: *${allowedDisplay}*\n` +
+              `This submission included: *${deniedDisplay}*\n\n` +
+              `Remove the unauthorized handles and resubmit, or ask sales admin to extend your scope with /setcontributorpages.`,
+              { parse_mode: "Markdown" },
+            );
+            sessions.delete(ctx.from.id);
+            return;
+          }
           return submitForSalesReview(ctx, session);
         }
 
