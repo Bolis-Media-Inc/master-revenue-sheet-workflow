@@ -840,23 +840,83 @@ async function submitForSalesReview(ctx, session) {
 
   // 2. Mirror the creatives + brief into SALES_TEAM_CHAT_ID via copyMessage
   //    so reviewers see exactly what'll go to Internal Network Ads.
-  await postWizardReviewCard(ctx.telegram, adSession.id, session);
+  const mirrorResult = await postWizardReviewCard(ctx.telegram, adSession.id, session);
 
-  // 3. Reply to the contributor in their DM
-  await ctx.telegram.editMessageText(
-    session.chatId, session.wizardMsgId, undefined,
-    "🛂 *Submitted for sales review*\n\n" +
-    "Your ad is in the monetization team's review queue. " +
-    "You'll get a DM here when it's approved or rejected.",
-    { parse_mode: "Markdown" },
-  );
+  // 3. Reply to the contributor in their DM. If the mirror failed, surface
+  //    the real reason so we don't silently tell them "submitted" when
+  //    nothing actually landed in the review chat.
+  if (!mirrorResult.ok) {
+    await ctx.telegram.editMessageText(
+      session.chatId, session.wizardMsgId, undefined,
+      `⚠️ *Submission incomplete*\n\n` +
+      `I saved your ad to the queue but couldn't post the review card to the monetization chat:\n\n` +
+      `_${mirrorResult.error}_\n\n` +
+      `Connor — please check that:\n` +
+      `· \`SALES_TEAM_CHAT_ID\` is set on Greg's Railway service\n` +
+      `· Greg is a member of that chat\n` +
+      `· The chat ID is correct (groups are negative, e.g. \`-1003547231643\`)`,
+      { parse_mode: "Markdown" },
+    );
+    // Also DM the admin so they see the failure even if the contributor doesn't ping
+    if (WIZARD_ADMIN_ID && ctx.from.id !== WIZARD_ADMIN_ID) {
+      try {
+        await ctx.telegram.sendMessage(
+          WIZARD_ADMIN_ID,
+          `⚠️ *Contributor submission failed to mirror*\n\n` +
+          `From: ${ctx.from?.first_name || ctx.from?.id}\n` +
+          `Session: \`${adSession.id}\`\n` +
+          `Error: ${mirrorResult.error}`,
+          { parse_mode: "Markdown" },
+        );
+      } catch (_) {}
+    }
+  } else {
+    await ctx.telegram.editMessageText(
+      session.chatId, session.wizardMsgId, undefined,
+      "🛂 *Submitted for sales review*\n\n" +
+      "Your ad is in the monetization team's review queue. " +
+      "You'll get a DM here when it's approved or rejected.",
+      { parse_mode: "Markdown" },
+    );
+  }
 
   sessions.delete(ctx.from.id);
 }
 
 async function postWizardReviewCard(telegram, sessionId, wizardSession) {
+  if (!SALES_TEAM_CHAT) {
+    return { ok: false, error: "SALES_TEAM_CHAT_ID is not set on Greg's Railway service" };
+  }
+
   const fmt = wizardSession.answers.format;
   const content = wizardSession.content || {};
+
+  // Probe the chat first — if Greg can't post even a tiny message, we
+  // know the issue (chat ID wrong, bot not a member, etc.) and can
+  // surface a single clean error instead of streaming media into the
+  // void and only failing on the brief at the end.
+  let probeOk = true;
+  let probeError = null;
+  try {
+    // Send a leading "starting" marker so reviewers see something even
+    // if a later step fails. This also doubles as our connectivity probe.
+    await telegram.sendMessage(SALES_TEAM_CHAT, "🛂 *Incoming submission for review…*", { parse_mode: "Markdown" });
+  } catch (e) {
+    probeOk = false;
+    probeError = e.message || String(e);
+    console.error(`[wizard] cannot post to SALES_TEAM_CHAT_ID=${SALES_TEAM_CHAT}: ${probeError}`);
+  }
+
+  if (!probeOk) {
+    // Translate raw Telegram errors into something actionable
+    let hint = probeError;
+    if (/chat not found/i.test(probeError)) {
+      hint = `chat not found — verify SALES_TEAM_CHAT_ID is the correct chat ID (Monetization Team + AI's chat is -1003547231643)`;
+    } else if (/forbidden|bot was kicked|not enough rights/i.test(probeError)) {
+      hint = `Greg isn't a member of that chat (or got kicked). Add @${BOT_USERNAME_HINT} to the chat first.`;
+    }
+    return { ok: false, error: hint };
+  }
 
   // Forward creatives as documents (sales-team convention) in the
   // format-specific order so the review chat sees what Internal Network
@@ -900,27 +960,37 @@ async function postWizardReviewCard(telegram, sessionId, wizardSession) {
     || (wizardSession.userInfo?.username ? `@${wizardSession.userInfo.username}` : null)
     || `user ${wizardSession.userId}`;
 
-  const card = await telegram.sendMessage(
-    SALES_TEAM_CHAT,
-    `🛂 *Pending sales review* — submitted by ${submitter}\n` +
-    `_Approve to post to Internal Network Ads (30s cancel window)_`,
-    {
-      parse_mode: "Markdown",
-      reply_markup: {
-        inline_keyboard: [[
-          { text: "✅ Approve & post", callback_data: `wreview:approve:${sessionId}` },
-          { text: "❌ Reject",         callback_data: `wreview:reject:${sessionId}`  },
-        ]],
+  let card = null;
+  try {
+    card = await telegram.sendMessage(
+      SALES_TEAM_CHAT,
+      `🛂 *Pending sales review* — submitted by ${submitter}\n` +
+      `_Approve to post to Internal Network Ads (30s cancel window)_`,
+      {
+        parse_mode: "Markdown",
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "✅ Approve & post", callback_data: `wreview:approve:${sessionId}` },
+            { text: "❌ Reject",         callback_data: `wreview:reject:${sessionId}`  },
+          ]],
+        },
       },
-    },
-  ).catch((e) => { console.error("[wizard] review card send:", e.message); return null; });
+    );
+  } catch (e) {
+    console.error("[wizard] review card send:", e.message);
+    return { ok: false, error: `Posted creative + brief but the Approve/Reject card failed: ${e.message}` };
+  }
 
   if (card) {
     await sessionsLib.updateSession(sessionId, {
       review_msg: { chatId: card.chat.id, messageId: card.message_id },
     });
   }
+  return { ok: true };
 }
+
+// Best-effort placeholder — populated after bot.launch() resolves
+let BOT_USERNAME_HINT = "the bot";
 
 // ── Forward content directly to page channels ────────────────────────────────
 // Greg knows exactly which content goes to which page at submission time,
@@ -2741,8 +2811,12 @@ bot.command("betslip", async (ctx) => {
   }
 });
 
-// Listen for photos when awaiting bet slip
-bot.on("photo", async (ctx) => {
+// Listen for photos when awaiting /inspire or /betslip. CRITICAL: when
+// neither flow claims the photo, fall through to the next handler via
+// `next()` — otherwise the wizard's content-step media capture (later
+// in this file) never sees the photo, and the contributor's /ad
+// upload silently drops them ("2 file(s) received" when 5 were sent).
+bot.on("photo", async (ctx, next) => {
   // /inspire waiting for a competitor screenshot
   if (_awaitingInspire.has(ctx.chat.id)) {
     _awaitingInspire.delete(ctx.chat.id);
@@ -2753,6 +2827,8 @@ bot.on("photo", async (ctx) => {
     _awaitingBetSlip.delete(ctx.chat.id);
     return await processBetSlipPhoto(ctx, ctx.message);
   }
+  // Pass through so the wizard's content media handler can capture it
+  return next();
 });
 
 // Store pending betslip data while user picks an image option
@@ -3533,7 +3609,14 @@ cron.schedule("0 21 * * *", () => {
 
 // ── Launch ────────────────────────────────────────────────────────────────────
 
-bot.launch().then(() => console.log("✅ Greg (Ad Brief Wizard) running"));
+bot.launch().then(async () => {
+  console.log("✅ Greg (Ad Brief Wizard) running");
+  // Cache the bot's @username so error messages can reference it concretely
+  try {
+    const me = await bot.telegram.getMe();
+    if (me?.username) BOT_USERNAME_HINT = me.username;
+  } catch (_) {}
+});
 
 // HTTP API for external ad submission (Digi → Greg, etc.)
 const apiHttpServer = apiServer.startServer({
