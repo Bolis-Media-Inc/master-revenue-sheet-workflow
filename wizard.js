@@ -496,7 +496,7 @@ function renderContentStep(session) {
     const n = content.shared.length;
     return {
       text: `📋 *New Ad Brief*\n\n${sum}\n\n📎  *Upload shared content*\n` +
-            `${n > 0 ? `✅  ${n} file(s) received` : "_Send files here, then tap Done_"}`,
+            `${n > 0 ? `✅  ${n} file(s) received` : "_Send files here, then tap Done_\n💡  Tip: tap 📎 → *File* to keep full quality"}`,
       keyboard: Markup.inlineKeyboard([[b("✅  Done", "cnt:done")]]),
     };
   }
@@ -510,7 +510,7 @@ function renderContentStep(session) {
     const isLast = idx === pages.length - 1;
     return {
       text: `📋 *New Ad Brief*\n\n${sum}\n\n📎  *Content for @${handle}*  (${idx + 1} / ${pages.length})\n` +
-            `${n > 0 ? `✅  ${n} file(s) received` : "_Send files for this page_"}`,
+            `${n > 0 ? `✅  ${n} file(s) received` : "_Send files for this page_\n💡  Tip: tap 📎 → *File* to keep full quality"}`,
       keyboard: Markup.inlineKeyboard([[b(isLast ? "✅  Done" : "➡️  Next page", "cnt:next")]]),
     };
   }
@@ -576,7 +576,7 @@ function renderContentStep(session) {
         text: `📋 *New Ad Brief*\n\n${sum}\n\n` +
               `📎  *Content for Group ${gIdx + 1}*  (${gIdx + 1} / ${content.collabGroups.length})\n` +
               `Host: @${g.host}  ·  ${g.invites.map((h) => `@${h}`).join(" ")}\n` +
-              `${n > 0 ? `✅  ${n} file(s) received` : "_Send video or images below ↓_"}`,
+              `${n > 0 ? `✅  ${n} file(s) received` : "_Send video or images below ↓_\n💡  Tip: tap 📎 → *File* to keep full quality"}`,
         keyboard: n > 0
           ? Markup.inlineKeyboard([[b(isLast ? "✅  Done" : "➡️  Next group", "clb:nextVideo")]])
           : null,
@@ -3542,22 +3542,56 @@ bot.on(["photo", "video", "document", "animation"], async (ctx) => {
   await updateWizard(ctx.telegram, session);
 });
 
-// Send a captured media reference as a document, preserving the original
-// file. This is the sales-team convention — documents avoid Telegram's
-// re-encoding for photos/videos and keep upload quality intact end to
-// end. Falls back to copyMessage when file_id wasn't captured (older
-// sessions persisted before the schema upgrade).
+// Send a captured media reference as a document. Three-tier strategy:
+//
+//   1. If the user uploaded as a document/animation → file_id works
+//      directly with sendDocument (true zero-loss passthrough).
+//   2. If the user uploaded as a photo or video (Telegram compresses
+//      these client-side, then assigns a typed file_id) → sendDocument
+//      with that file_id is rejected. Download the file via the Bot API
+//      and re-upload as a Buffer with sendDocument. We only get the
+//      compressed bytes (originals were lost at upload time), but the
+//      output arrives as a document attachment which is the sales-team
+//      convention for the audit trail.
+//   3. Final fallback: copyMessage. Used when (a) we have no file_id
+//      (legacy session refs from before the file_id capture upgrade),
+//      or (b) download+re-upload itself fails.
+//
+// Operators get the highest fidelity by uploading via "Send as File"
+// (the prompt at the content step now mentions this).
 async function sendCapturedAsDocument(telegram, chatId, ref) {
   if (!ref) return;
-  if (ref.fileId) {
+
+  // Path 1: already a document → file_id passthrough
+  if (ref.fileId && (ref.kind === "document" || ref.kind === "animation")) {
     try {
       await telegram.sendDocument(chatId, ref.fileId);
       return;
     } catch (e) {
-      console.warn(`[wizard] sendDocument(${ref.kind}) failed: ${e.message} — falling back to copyMessage`);
+      console.warn(`[wizard] sendDocument(${ref.kind}) passthrough failed: ${e.message}`);
     }
   }
-  // Fallback for legacy refs without fileId
+
+  // Path 2: photo/video/audio captured by Telegram → download + re-upload
+  if (ref.fileId && (ref.kind === "photo" || ref.kind === "video" || ref.kind === "audio")) {
+    try {
+      const fileLink = await telegram.getFileLink(ref.fileId);
+      const res = await fetch(fileLink.toString());
+      if (!res.ok) throw new Error(`fetch ${res.status} ${res.statusText}`);
+      const buffer = Buffer.from(await res.arrayBuffer());
+      const ext = ref.kind === "photo" ? "jpg"
+                : ref.kind === "video" ? "mp4"
+                : ref.kind === "audio" ? "mp3"
+                : "bin";
+      const filename = `${ref.kind}-${String(ref.fileId).slice(-8)}.${ext}`;
+      await telegram.sendDocument(chatId, { source: buffer, filename });
+      return;
+    } catch (e) {
+      console.warn(`[wizard] download+reupload(${ref.kind}) failed: ${e.message} — falling back to copyMessage`);
+    }
+  }
+
+  // Path 3: copyMessage fallback (preserves original media type, last resort)
   if (ref.fromChatId && ref.msgId) {
     try { await telegram.copyMessage(chatId, ref.fromChatId, ref.msgId); }
     catch (e) { console.error(`[wizard] copyMessage fallback failed: ${e.message}`); }
