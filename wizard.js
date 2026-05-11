@@ -968,13 +968,8 @@ async function postWizardReviewCard(telegram, sessionId, wizardSession, submitte
   // user identity. Fall back to the persisted payload's wizard.userInfo
   // for any legacy callers that don't pass submitterInfo yet.
   const u = submitterInfo || wizardSession.userInfo || {};
-  const fullName = [u.firstName, u.lastName].filter(Boolean).join(" ");
-  const submitter = u.username && fullName
-    ? `${fullName} (@${u.username})`
-    : u.username
+  const submitter = u.username
     ? `@${u.username}`
-    : fullName
-    ? fullName
     : u.userId
     ? `user ${u.userId}`
     : "unknown submitter";
@@ -1906,7 +1901,8 @@ bot.on("callback_query", async (ctx) => {
   if (data.startsWith("review:approve:")) {
     const sessionId = data.slice("review:approve:".length);
     try {
-      const result = await poster.approveSession(bot, sessionId, ctx.from?.id || null);
+      const approverLabel = ctx.from?.username ? `@${ctx.from.username}` : null;
+      const result = await poster.approveSession(bot, sessionId, ctx.from?.id || null, approverLabel);
       if (!result.ok) {
         await ctx.answerCbQuery(result.error || "Couldn't approve", { show_alert: true });
         return;
@@ -1936,6 +1932,7 @@ bot.on("callback_query", async (ctx) => {
       _pendingRejectPrompts.set(prompt.message_id, {
         sessionId,
         approverTelegramId: ctx.from?.id || null,
+        approverUsername: ctx.from?.username || null,
         chatId: ctx.chat.id,
         createdAt: Date.now(),
       });
@@ -2002,7 +1999,7 @@ bot.on("callback_query", async (ctx) => {
             adSession.review_msg.chatId,
             adSession.review_msg.messageId,
             undefined,
-            `✅ *Approved + posted to Internal Network Ads*\n_Approved by ${ctx.from?.first_name || ctx.from?.id}_`,
+            `✅ *Approved + posted to Internal Network Ads*\n_Approved by ${ctx.from?.username ? "@" + ctx.from.username : (ctx.from?.first_name || `user ${ctx.from?.id}`)}_`,
             { parse_mode: "Markdown" },
           );
         } catch (_) {}
@@ -2041,6 +2038,7 @@ bot.on("callback_query", async (ctx) => {
       _pendingRejectPrompts.set(prompt.message_id, {
         sessionId,
         approverTelegramId: ctx.from?.id || null,
+        approverUsername: ctx.from?.username || null,
         chatId: ctx.chat.id,
         createdAt: Date.now(),
         kind: "wizard",
@@ -3213,7 +3211,7 @@ bot.on("text", async (ctx) => {
               adSession.review_msg.chatId,
               adSession.review_msg.messageId,
               undefined,
-              `❌ *Rejected* — not posted.\n_Rejected by ${ctx.from?.first_name || pending.approverTelegramId}_${note}`,
+              `❌ *Rejected* — not posted.\n_Rejected by ${ctx.from?.username ? "@" + ctx.from.username : (ctx.from?.first_name || `user ${pending.approverTelegramId}`)}_${note}`,
               { parse_mode: "Markdown" },
             );
           } catch (_) {}
@@ -3243,7 +3241,8 @@ bot.on("text", async (ctx) => {
 
     // Default: Digi-bot HTTP-intake review path (existing behavior)
     try {
-      const result = await poster.rejectSession(bot, pending.sessionId, pending.approverTelegramId, reason);
+      const approverLabel = pending.approverUsername ? `@${pending.approverUsername}` : null;
+      const result = await poster.rejectSession(bot, pending.sessionId, pending.approverTelegramId, reason, approverLabel);
       if (!result.ok) {
         await ctx.reply(`⚠️ Reject failed: ${result.error}`).catch(() => {});
       } else {
