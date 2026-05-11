@@ -688,7 +688,22 @@ function renderMsg(session) {
 // ── Brief builder ─────────────────────────────────────────────────────────────
 
 function buildBrief(a) {
-  const header  = `${a.client} - ${a.adType} - $${a.price ?? 0}`;
+  // Header dollar amount:
+  //   same-price mode → a.price (the single base price)
+  //   per-page mode   → sum of perPagePrices (e.g. $400 + $300 + $300 = $1000)
+  // Live wizard runs in per-page mode leave a.price null; the bulk-template
+  // load path already sums for its summary, but the live brief needs it too.
+  let headerPrice;
+  if (a.priceMode === "per-page") {
+    const total = (a.pages || []).reduce((sum, h) => {
+      const p = parseFloat(a.perPagePrices?.[h]?.price || "0");
+      return sum + (isNaN(p) ? 0 : p);
+    }, 0);
+    headerPrice = total;
+  } else {
+    headerPrice = a.price ?? 0;
+  }
+  const header  = `${a.client} - ${a.adType} - $${headerPrice}`;
   const seniorList = (a.seniors && a.seniors.length > 0) ? a.seniors : ADMIN_HANDLES;
   const topTags = seniorList.map((h) => `@${h}`).join("\n");
 
