@@ -714,10 +714,14 @@ function buildBrief(a) {
       return prefix ? `(${prefix}) @${h} - $${price}` : `@${h} - $${price}`;
     }).join("\n");
   } else {
-    // Same price — prefix every page with campaign #NUM if set
-    pageLines = a.pages.map((h) =>
-      campaignNumPrefix ? `(${campaignNumPrefix}) @${h}` : `@${h}`
-    ).join("\n");
+    // Same price across all pages — render `@handle - $price` per line so
+    // each row in PAGE INFO carries the dollar amount (matches the sales
+    // team's brief convention). Skip the suffix if no price was set.
+    const samePrice = a.price != null && a.price !== "" ? a.price : null;
+    pageLines = a.pages.map((h) => {
+      const handlePart = campaignNumPrefix ? `(${campaignNumPrefix}) @${h}` : `@${h}`;
+      return samePrice != null ? `${handlePart} - $${samePrice}` : handlePart;
+    }).join("\n");
   }
 
   return [
