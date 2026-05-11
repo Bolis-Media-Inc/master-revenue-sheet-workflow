@@ -1091,8 +1091,24 @@ async function forwardContentToPages(telegram, session) {
 }
 
 // ── Edit wizard message in place ──────────────────────────────────────────────
+//
+// Coalesced edits: when a user sends a media group of 8 photos, Telegram
+// fires 8 separate updates ~50-200ms apart. Each one calls updateWizard,
+// which calls editMessageText — but Telegram rate-limits edits to roughly
+// 1/sec per message, silently dropping the rest. The result is a frozen
+// "4 file(s) received" display even though the wizard array has all 8.
+//
+// We debounce per session: each call schedules a trailing-edge edit ~600ms
+// out. If another update comes in before that fires, cancel and re-schedule.
+// After the burst settles, exactly one edit fires with the final count.
+// _flushPending(sessionId) forces an immediate flush — used by callback
+// handlers (Done button, step transitions) so the UI is current the
+// moment the user takes an action.
 
-async function updateWizard(telegram, session) {
+const _pendingEdits = new Map(); // sessionId → { timer, telegram, session }
+const EDIT_DEBOUNCE_MS = 600;
+
+async function _doEdit(telegram, session) {
   const { text, keyboard } = renderMsg(session);
   const opts = { parse_mode: "Markdown", ...(keyboard || {}) };
   try {
@@ -1104,6 +1120,26 @@ async function updateWizard(telegram, session) {
       console.error("[wizard] edit error:", e.message);
     }
   }
+}
+
+async function updateWizard(telegram, session, { immediate = false } = {}) {
+  const key = session.chatId; // one wizard message per chat
+  // Cancel any pending edit for this session
+  const pending = _pendingEdits.get(key);
+  if (pending) clearTimeout(pending.timer);
+
+  if (immediate) {
+    _pendingEdits.delete(key);
+    return _doEdit(telegram, session);
+  }
+
+  // Schedule a trailing-edge edit. If another updateWizard fires before
+  // EDIT_DEBOUNCE_MS, we'll cancel this timer above.
+  const timer = setTimeout(() => {
+    _pendingEdits.delete(key);
+    _doEdit(telegram, session).catch(() => {});
+  }, EDIT_DEBOUNCE_MS);
+  _pendingEdits.set(key, { timer, telegram, session });
 }
 
 // ── /ad command ───────────────────────────────────────────────────────────────
