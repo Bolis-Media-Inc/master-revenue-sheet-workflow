@@ -39,6 +39,14 @@ const contributors = require("./lib/contributors");
 const posters      = require("./lib/posters");
 const sessionsLib  = require("./lib/sessions");
 
+// Escape Telegram Markdown V1 specials so user-controlled strings
+// (especially usernames containing "_") can't break entity parsing
+// in a message we render with parse_mode: "Markdown". V1's reserved
+// characters outside an entity are: _ * ` [
+function escapeMd(s) {
+  return String(s == null ? "" : s).replace(/([_*`\[])/g, "\\$1");
+}
+
 /**
  * True if the Telegram user is a sales-admin who can grant/revoke the
  * sales-contributor role. Today: WIZARD_ADMIN_USER_ID (Connor) only —
@@ -969,7 +977,7 @@ async function postWizardReviewCard(telegram, sessionId, wizardSession, submitte
   // for any legacy callers that don't pass submitterInfo yet.
   const u = submitterInfo || wizardSession.userInfo || {};
   const submitter = u.username
-    ? `@${u.username}`
+    ? `@${escapeMd(u.username)}`
     : u.userId
     ? `user ${u.userId}`
     : "unknown submitter";
@@ -1901,7 +1909,7 @@ bot.on("callback_query", async (ctx) => {
   if (data.startsWith("review:approve:")) {
     const sessionId = data.slice("review:approve:".length);
     try {
-      const approverLabel = ctx.from?.username ? `@${ctx.from.username}` : null;
+      const approverLabel = ctx.from?.username ? `@${escapeMd(ctx.from.username)}` : null;
       const result = await poster.approveSession(bot, sessionId, ctx.from?.id || null, approverLabel);
       if (!result.ok) {
         await ctx.answerCbQuery(result.error || "Couldn't approve", { show_alert: true });
@@ -1999,7 +2007,7 @@ bot.on("callback_query", async (ctx) => {
             adSession.review_msg.chatId,
             adSession.review_msg.messageId,
             undefined,
-            `✅ *Approved + posted to Internal Network Ads*\n_Approved by ${ctx.from?.username ? "@" + ctx.from.username : (ctx.from?.first_name || `user ${ctx.from?.id}`)}_`,
+            `✅ *Approved + posted to Internal Network Ads*\n_Approved by ${ctx.from?.username ? "@" + escapeMd(ctx.from.username) : escapeMd(ctx.from?.first_name || `user ${ctx.from?.id}`)}_`,
             { parse_mode: "Markdown" },
           );
         } catch (_) {}
@@ -3211,7 +3219,7 @@ bot.on("text", async (ctx) => {
               adSession.review_msg.chatId,
               adSession.review_msg.messageId,
               undefined,
-              `❌ *Rejected* — not posted.\n_Rejected by ${ctx.from?.username ? "@" + ctx.from.username : (ctx.from?.first_name || `user ${pending.approverTelegramId}`)}_${note}`,
+              `❌ *Rejected* — not posted.\n_Rejected by ${ctx.from?.username ? "@" + escapeMd(ctx.from.username) : escapeMd(ctx.from?.first_name || `user ${pending.approverTelegramId}`)}_${note}`,
               { parse_mode: "Markdown" },
             );
           } catch (_) {}
@@ -3241,7 +3249,7 @@ bot.on("text", async (ctx) => {
 
     // Default: Digi-bot HTTP-intake review path (existing behavior)
     try {
-      const approverLabel = pending.approverUsername ? `@${pending.approverUsername}` : null;
+      const approverLabel = pending.approverUsername ? `@${escapeMd(pending.approverUsername)}` : null;
       const result = await poster.rejectSession(bot, pending.sessionId, pending.approverTelegramId, reason, approverLabel);
       if (!result.ok) {
         await ctx.reply(`⚠️ Reject failed: ${result.error}`).catch(() => {});
