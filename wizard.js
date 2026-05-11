@@ -840,7 +840,15 @@ async function submitForSalesReview(ctx, session) {
 
   // 2. Mirror the creatives + brief into SALES_TEAM_CHAT_ID via copyMessage
   //    so reviewers see exactly what'll go to Internal Network Ads.
-  const mirrorResult = await postWizardReviewCard(ctx.telegram, adSession.id, session);
+  //    Pass ctx.from explicitly — the in-memory wizard session doesn't carry
+  //    Telegram user info, so the review card needs it threaded through.
+  const submitterInfo = {
+    userId:    ctx.from.id,
+    firstName: ctx.from.first_name || null,
+    lastName:  ctx.from.last_name  || null,
+    username:  ctx.from.username   || null,
+  };
+  const mirrorResult = await postWizardReviewCard(ctx.telegram, adSession.id, session, submitterInfo);
 
   // 3. Reply to the contributor in their DM. If the mirror failed, surface
   //    the real reason so we don't silently tell them "submitted" when
@@ -883,7 +891,7 @@ async function submitForSalesReview(ctx, session) {
   sessions.delete(ctx.from.id);
 }
 
-async function postWizardReviewCard(telegram, sessionId, wizardSession) {
+async function postWizardReviewCard(telegram, sessionId, wizardSession, submitterInfo = null) {
   if (!SALES_TEAM_CHAT) {
     return { ok: false, error: "SALES_TEAM_CHAT_ID is not set on Greg's Railway service" };
   }
@@ -954,11 +962,22 @@ async function postWizardReviewCard(telegram, sessionId, wizardSession) {
     console.error("[wizard] review preview error:", e.message);
   }
 
-  // Review card with Approve / Reject buttons
-  const submitter = [wizardSession.userInfo?.firstName, wizardSession.userInfo?.lastName]
-    .filter(Boolean).join(" ")
-    || (wizardSession.userInfo?.username ? `@${wizardSession.userInfo.username}` : null)
-    || `user ${wizardSession.userId}`;
+  // Review card with Approve / Reject buttons.
+  // Submitter info comes from the caller's ctx.from (threaded in as
+  // submitterInfo) — the in-memory wizard session doesn't carry Telegram
+  // user identity. Fall back to the persisted payload's wizard.userInfo
+  // for any legacy callers that don't pass submitterInfo yet.
+  const u = submitterInfo || wizardSession.userInfo || {};
+  const fullName = [u.firstName, u.lastName].filter(Boolean).join(" ");
+  const submitter = u.username && fullName
+    ? `${fullName} (@${u.username})`
+    : u.username
+    ? `@${u.username}`
+    : fullName
+    ? fullName
+    : u.userId
+    ? `user ${u.userId}`
+    : "unknown submitter";
 
   let card = null;
   try {
