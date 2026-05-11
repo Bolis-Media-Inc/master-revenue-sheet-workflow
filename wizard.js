@@ -1734,10 +1734,19 @@ bot.command("listcontributors", async (ctx) => {
 // and convert the invite. Both flavors can fire for the same user
 // (relewans is contributor + poster). Runs as best-effort middleware,
 // never blocks the rest of the handler chain.
+//
+// CRITICAL: short-circuit for users we've already processed this session.
+// Without this, every photo/video in a media-group upload fires two
+// Supabase round-trips, which slows the webhook response enough that
+// Telegram drops some updates mid-burst (observed: 5 of 8 photos
+// captured on Marcell's submission). Once-per-process per user is
+// sufficient — invite consumption is one-shot anyway.
+const _inviteCheckSeen = new Set(); // telegram_id of users we've already processed
 bot.use(async (ctx, next) => {
   try {
     const username = ctx.from?.username;
-    if (username && ctx.from?.id) {
+    if (username && ctx.from?.id && !_inviteCheckSeen.has(ctx.from.id)) {
+      _inviteCheckSeen.add(ctx.from.id);
       const tgId = ctx.from.id;
       const display = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ") || null;
 
