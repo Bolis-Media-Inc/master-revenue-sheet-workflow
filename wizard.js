@@ -3523,7 +3523,24 @@ function extractFileRef(message) {
 
 bot.on(["photo", "video", "document", "animation"], async (ctx) => {
   const session = sessions.get(ctx.from.id);
-  if (!session || session.step !== "content") return;
+  // Telemetry to debug "5 of 8 received" media-group drops — logs every
+  // wizard-bound media update with media_group_id, current count, and
+  // why we returned early (if we did). When it recurs, grep logs for
+  // [wizard-content] mg=<id> to see how many updates actually arrived.
+  const mgid = ctx.message?.media_group_id || "single";
+  const kind = ctx.message?.photo ? "photo"
+             : ctx.message?.video ? "video"
+             : ctx.message?.document ? "document"
+             : ctx.message?.animation ? "animation"
+             : "other";
+  if (!session) {
+    console.log(`[wizard-content] mg=${mgid} kind=${kind} user=${ctx.from.id} DROPPED: no session`);
+    return;
+  }
+  if (session.step !== "content") {
+    console.log(`[wizard-content] mg=${mgid} kind=${kind} user=${ctx.from.id} DROPPED: step=${session.step}`);
+    return;
+  }
 
   const fileRef = extractFileRef(ctx.message);
   const msgRef  = {
@@ -3547,6 +3564,17 @@ bot.on(["photo", "video", "document", "animation"], async (ctx) => {
     const g = content.collabGroups[content.collabVideoIdx];
     if (g) g.media.push(msgRef);
   }
+
+  // Count after the push, so we can detect if pushes are happening but
+  // updateWizard's edit is what's stale.
+  const totalNow = fmt === "Standard"
+    ? content.shared.length
+    : fmt === "Per-creative"
+    ? Object.values(content.byHandle).reduce((s, a) => s + (a?.length || 0), 0)
+    : fmt === "Collab"
+    ? content.collabGroups.reduce((s, g) => s + (g?.media?.length || 0), 0)
+    : 0;
+  console.log(`[wizard-content] mg=${mgid} kind=${kind} user=${ctx.from.id} fmt=${fmt} captured total=${totalNow}`);
 
   await updateWizard(ctx.telegram, session);
 });
