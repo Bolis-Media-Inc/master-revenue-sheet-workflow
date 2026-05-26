@@ -12,6 +12,21 @@ const MAX_BUFFER_PER_CHAT = 30; // keep last 30 messages per group
 // Map<chatId (string), Array<TelegramMessage>>
 const _buffers = new Map();
 
+// Strong markers that a text message is a brief (not a caption / admin
+// chatter). Used by the bundle scanners as a STOP signal — if we hit one
+// of these while scanning backwards from the current ad, we've crossed
+// into a previous ad's content and must not pull any further media.
+//
+// Captions and random text between brief and media should be SKIPPED, not
+// treated as boundaries — that's the whole point of this list. False
+// positives here are dangerous (premature stop = no attribution); false
+// negatives are mildly dangerous (over-scan = pull previous ad's media,
+// but clearBufferUpTo usually cleans these out before we get there).
+function _looksLikePreviousBrief(text) {
+  if (!text) return false;
+  return /\bPAGE INFO\b/i.test(text) || /\bINSTRUCTIONS:/i.test(text);
+}
+
 /**
  * Store a message in the rolling buffer for its chat.
  * Call this on EVERY incoming message before any other handler fires.
@@ -117,10 +132,14 @@ function getContentBundlesByPage(chatId, adMessageId) {
       // Empty / service message — skip
       continue;
 
-    } else {
-      // Plain text that is NOT a label — likely a previous ad brief or admin note.
-      // Stop scanning so we don't accidentally pull in content from an earlier ad.
+    } else if (_looksLikePreviousBrief(text)) {
+      // Strong signal we've crossed into a previous ad — stop.
       break;
+
+    } else {
+      // Random text (Instagram caption, admin chatter, "13 Covers ^" annotation
+      // that wasn't a label, etc). Skip — keep scanning for media + labels.
+      continue;
     }
   }
 
@@ -286,10 +305,13 @@ function getFilenameBundlesByPage(chatId, adMessageId) {
 
     } else if (!text) {
       continue; // empty / service
-    } else {
-      // Plain non-empty text (likely the previous ad's brief or admin
-      // chatter). Stop so we don't bleed across ads.
+    } else if (_looksLikePreviousBrief(text)) {
+      // Strong "previous ad" signal — stop here, don't pull from earlier ad
       break;
+    } else {
+      // Caption text, "13 Covers ^" annotation, admin chatter — skip and
+      // keep scanning. The strong-marker check above is the real boundary.
+      continue;
     }
   }
 
