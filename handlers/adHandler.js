@@ -575,13 +575,18 @@ async function handleAdMessage(ctx) {
         forwardedDestinations.add(destKey);
 
         // ── Forward the page's attributed creative(s) FIRST, then the brief
-        const attributed = useCollab
-          ? (collabBundles.get(handle.toLowerCase()) || [])
+        // bundle shape (for collab / filename / labels): { media: [...], caption: string|null }
+        // For standard fallback we wrap the raw array in the same shape so
+        // downstream forwarding doesn't have to branch.
+        const bundle = useCollab
+          ? (collabBundles.get(handle.toLowerCase()) || { media: [], caption: null })
           : useFilenames
-            ? (filenameBundles.get(handle.toLowerCase()) || [])
+            ? (filenameBundles.get(handle.toLowerCase()) || { media: [], caption: null })
             : useLabels
-              ? (labelBundles.get(handle.toLowerCase()) || [])
-              : fallbackMedia;
+              ? (labelBundles.get(handle.toLowerCase()) || { media: [], caption: null })
+              : { media: fallbackMedia, caption: null };
+        const attributed = bundle.media;
+        const perPageCaption = bundle.caption;
 
         if (attributed.length === 0 && (useCollab || useFilenames || useLabels)) {
           // We HAVE per-page attribution data but this specific handle isn't
@@ -599,6 +604,20 @@ async function handleAdMessage(ctx) {
           }
           if (attributed.length > 0) {
             console.log(`[adHandler] ✅ Forwarded ${attributed.length} creative msg(s) → @${handle}`);
+          }
+        }
+
+        // ── Per-page caption (label format) ──────────────────────────────
+        // If the label was "@thefuck.tv NEO just dropped! Read bio ^" OR
+        // the file's Telegram caption had per-page text, send that as a
+        // separate message after the media so the VA can copy/paste it
+        // into the IG post. Brief still gets sent below (separate flow).
+        if (perPageCaption) {
+          try {
+            await ctx.telegram.sendMessage(String(destChatId), perPageCaption);
+            console.log(`[adHandler] 💬 Per-page caption sent → @${handle} (${perPageCaption.length} chars)`);
+          } catch (err) {
+            console.error(`[adHandler] ❌ Per-page caption → @${handle}: ${err.message}`);
           }
         }
 

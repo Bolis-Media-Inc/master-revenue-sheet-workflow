@@ -116,12 +116,21 @@ function getContentBundlesByPage(chatId, adMessageId) {
     const isLabel = !hasMedia && text.endsWith("^") && text.length > 1;
 
     if (isLabel) {
-      // Strip leading @ so "@thefuck.tv^" and "thefuck.tv^" both match the
-      // handle key the caller looks up with (which is always sans-@).
-      // Without this normalization, labels written with @ would never match
-      // and the page would silently get the standard fallback set.
-      const label = text.slice(0, -1).trim().toLowerCase().replace(/^@/, "");
-      result.set(label, [...pendingContent]); // pendingContent is already oldest-first
+      // Label format options:
+      //   "@thefuck.tv ^"                              → handle only
+      //   "@thefuck.tv ^"  (no @)                      → handle only
+      //   "@thefuck.tv NEO just dropped! Read bio ^"   → handle + per-page caption
+      //
+      // First token (sans @, lowercased) is the handle. Anything between
+      // handle and trailing ^ becomes the per-page caption text that will
+      // be forwarded as a separate message after the media in that
+      // page's IG Ads chat — useful when each page gets unique copy.
+      const labelText = text.slice(0, -1).trim();
+      const firstSpace = labelText.search(/\s/);
+      const handlePart = (firstSpace === -1 ? labelText : labelText.slice(0, firstSpace))
+        .toLowerCase().replace(/^@/, "");
+      const captionPart = firstSpace === -1 ? null : labelText.slice(firstSpace + 1).trim() || null;
+      result.set(handlePart, { media: [...pendingContent], caption: captionPart });
       pendingContent = [];
 
     } else if (hasMedia) {
@@ -222,18 +231,24 @@ function getCollabBundlesByPage(chatId, adMessageId) {
   // Flush final block
   if (current.hostMsgs.length > 0) groups.push(current);
 
-  // ── Build handle → [video?, captionMsgs..., hostMsg] map ──────────────────
+  // ── Build handle → {media, caption} map ──────────────────
+  // Shape mirrors getContentBundlesByPage / getFilenameBundlesByPage so
+  // the caller can read all three uniformly. Collab posts don't carry
+  // per-page caption text today (captionMsgs are forwarded as media-
+  // sibling messages, not as text the VA copies into IG) — so caption is
+  // always null. Could revisit if Bolis ever needs unique IG copy per
+  // collab member.
   const result = new Map();
   for (const group of groups) {
     for (const { msg: hostMsg, handles } of group.hostMsgs) {
-      // Order: video → caption text → host/invite message (matches how VAs post manually)
+      // Order: video → caption text messages → host/invite message
       const toForward = [
         ...(group.video ? [group.video] : []),
         ...group.captionMsgs,
         hostMsg,
       ];
       for (const handle of handles) {
-        result.set(handle, toForward);
+        result.set(handle, { media: toForward, caption: null });
       }
     }
   }
@@ -295,8 +310,20 @@ function getFilenameBundlesByPage(chatId, adMessageId) {
       const m = fileName.match(/^@([\w.]+?)(?:\s*\(\d+\))?\s*\.[a-zA-Z0-9]+$/);
       if (m && m[1]) {
         const handle = m[1].toLowerCase().replace(/\.$/, "");
-        if (!result.has(handle)) result.set(handle, [msg]);
-        else result.get(handle).unshift(msg); // multiple files per page → chronological
+        // Telegram's media `caption` field — if Danielson typed something
+        // under the file in his client, it surfaces here. Becomes the
+        // per-page caption forwarded as a separate text after the cover.
+        const mediaCaption = (msg.caption || "").trim() || null;
+        if (!result.has(handle)) {
+          result.set(handle, { media: [msg], caption: mediaCaption });
+        } else {
+          // Multiple files for the same page — keep chronological order
+          // and prefer the most recent non-null caption (first iteration =
+          // newest since we're walking backwards).
+          const entry = result.get(handle);
+          entry.media.unshift(msg);
+          if (!entry.caption && mediaCaption) entry.caption = mediaCaption;
+        }
         foundAny = true;
       }
       // Media without an @-filename is fine — could be a shared "slides
