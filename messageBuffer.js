@@ -226,6 +226,72 @@ function getCollabBundlesByPage(chatId, adMessageId) {
  * @param {string} chatId
  * @param {number} upToMessageId  Clear everything up to and including this message
  */
+/**
+ * Detect per-page content bundles from FILENAME attribution.
+ *
+ * Convention: each cover is uploaded as a document with the filename
+ * starting with "@<handle>" (e.g. "@i_have_no_memes96_v2.jpg",
+ * "@thefuck.tv.jpg"). Trailing " (1)", " (2)" duplicate-suffixes are
+ * tolerated since Telegram clients sometimes append them when files
+ * collide on the user's device.
+ *
+ * Returns Map<handle, Array<message>> where each entry is just [coverMsg]
+ * (one message per page). Returns null when no filename-attributed media
+ * is found, so the caller can fall through to text-label detection.
+ *
+ * Stops scanning at the first non-media, non-empty message (typically
+ * the previous ad's brief) so we don't pull covers from earlier ads.
+ *
+ * @param {string} chatId
+ * @param {number} adMessageId
+ * @returns {Map<string, Array>|null}
+ */
+function getFilenameBundlesByPage(chatId, adMessageId) {
+  const buf = _buffers.get(String(chatId)) || [];
+  const adIdx = buf.findIndex((m) => m.message_id === adMessageId);
+  if (adIdx <= 0) return null;
+  const preceding = buf.slice(0, adIdx);
+
+  const result = new Map();
+  let foundAny = false;
+
+  for (let i = preceding.length - 1; i >= 0; i--) {
+    const msg = preceding[i];
+    const fileName =
+      msg.document?.file_name ||
+      msg.video?.file_name    ||
+      msg.audio?.file_name    || "";
+    const text = (msg.text || msg.caption || "").trim();
+    const hasMedia = !!(msg.photo || msg.video || msg.document ||
+                        msg.animation || msg.audio);
+
+    if (hasMedia) {
+      // Match "@<handle>" at the start, allow optional " (N)" duplicate
+      // suffix and any extension. \w covers letters/digits/underscore;
+      // we add `.` for handles like "thefuck.tv".
+      const m = fileName.match(/^@([\w.]+?)(?:\s*\(\d+\))?\s*\.[a-zA-Z0-9]+$/);
+      if (m && m[1]) {
+        const handle = m[1].toLowerCase().replace(/\.$/, "");
+        if (!result.has(handle)) result.set(handle, [msg]);
+        else result.get(handle).unshift(msg); // multiple files per page → chronological
+        foundAny = true;
+      }
+      // Media without an @-filename is fine — could be a shared "slides
+      // 2-4" attachment that doesn't get per-page-routed by filename.
+      // We just don't attribute it.
+
+    } else if (!text) {
+      continue; // empty / service
+    } else {
+      // Plain non-empty text (likely the previous ad's brief or admin
+      // chatter). Stop so we don't bleed across ads.
+      break;
+    }
+  }
+
+  return foundAny ? result : null;
+}
+
 function clearBufferUpTo(chatId, upToMessageId) {
   const buf = _buffers.get(String(chatId));
   if (!buf) return;
@@ -237,4 +303,4 @@ function clearBufferUpTo(chatId, upToMessageId) {
   }
 }
 
-module.exports = { addMessage, getPrecedingMessages, getContentBundlesByPage, getCollabBundlesByPage, clearBufferUpTo, MAX_BUFFER_PER_CHAT };
+module.exports = { addMessage, getPrecedingMessages, getContentBundlesByPage, getCollabBundlesByPage, getFilenameBundlesByPage, clearBufferUpTo, MAX_BUFFER_PER_CHAT };

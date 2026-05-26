@@ -13,7 +13,7 @@
 
 const { parseAdMessage }       = require("../parser");
 const { appendRow, markForwarded, updateStatusToLive, updateAdDate, appendReminder } = require("../sheets");
-const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getPrecedingMessages } = require("../messageBuffer");
+const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getPrecedingMessages } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
 const pagesRegistry            = require("../lib/pages");
@@ -496,36 +496,51 @@ async function handleAdMessage(ctx) {
       const sourceChatId = chatId;
 
       // Pre-compute per-handle creative bundles by reading the messageBuffer
-      // backwards from the ad brief. Three formats supported:
+      // backwards from the ad brief. Four formats supported (checked in order):
       //
       //   1. Collab — videos with "Host: @page, invite: …" attribution.
-      //      getCollabBundlesByPage returns { handle: [video, captionMsgs…, hostMsg] }
-      //      so each page gets only its group's video + host message.
+      //      getCollabBundlesByPage returns { handle: [video, captionMsgs…, hostMsg] }.
       //
-      //   2. Per-page — media followed by labels like "@PageHandle^".
-      //      getContentBundlesByPage returns { handle: [media…] } so each
-      //      page gets only its labeled creative(s).
+      //   2. Filename — covers uploaded as documents with "@<handle>.jpg"
+      //      filenames (e.g. "@thefuck.tv.jpg", "@moist.jpg"). The handle
+      //      lives in the file metadata, not surrounding text. Cheapest
+      //      attribution for the team — no inline labels needed, no
+      //      copy-paste mistakes. getFilenameBundlesByPage.
       //
-      //   3. Standard — no attribution, one creative for everyone. Falls
-      //      back to the last 4 preceding media messages (typical carousel
-      //      slide count) and forwards the same set to every page.
+      //   3. Per-page text labels — media followed by "@PageHandle^" lines.
+      //      getContentBundlesByPage.
       //
-      // Both bundle parsers stop scanning at any non-label / non-host text,
-      // so we never pull media from a previous ad's content. clearBufferUpTo
+      //   4. Standard fallback — no attribution detected. Take the last 4
+      //      preceding media messages and forward the same set to every
+      //      page. Right answer for true shared-creative ads, wrong for
+      //      "13 unique covers" ads that didn't use a per-page convention
+      //      (logs visible at FORMAT_DETECTED line below).
+      //
+      // Each parser stops scanning at any unrecognized non-empty text so
+      // we never pull media from a previous ad's content. clearBufferUpTo
       // at the end of this handler also keeps cross-ad contamination out.
-      const collabBundles  = getCollabBundlesByPage(sourceChatId, adMessageId);
-      const labelBundles   = collabBundles ? null : getContentBundlesByPage(sourceChatId, adMessageId);
-      const useCollab      = !!collabBundles && collabBundles.size > 0;
-      const useLabels      = !useCollab && !!labelBundles && labelBundles.size > 0;
-      const fallbackMedia  = (!useCollab && !useLabels)
+      const collabBundles    = getCollabBundlesByPage(sourceChatId, adMessageId);
+      const filenameBundles  = collabBundles ? null : getFilenameBundlesByPage(sourceChatId, adMessageId);
+      const labelBundles     = (collabBundles || filenameBundles) ? null : getContentBundlesByPage(sourceChatId, adMessageId);
+      const useCollab        = !!collabBundles && collabBundles.size > 0;
+      const useFilenames     = !useCollab && !!filenameBundles && filenameBundles.size > 0;
+      const useLabels        = !useCollab && !useFilenames && !!labelBundles && labelBundles.size > 0;
+      const fallbackMedia  = (!useCollab && !useFilenames && !useLabels)
         ? getPrecedingMessages(sourceChatId, adMessageId, 4)
             .filter((m) => m.photo || m.video || m.document || m.animation)
         : [];
 
+      const detectedFormat = useCollab ? "collab"
+                           : useFilenames ? "filename-attributed"
+                           : useLabels ? "per-page-label"
+                           : "standard";
+      const attributedCount = useCollab    ? collabBundles.size
+                            : useFilenames ? filenameBundles.size
+                            : useLabels    ? labelBundles.size
+                            : 0;
       console.log(
         `[adHandler] 📤 Manual ad — forwarding ` +
-        `(format: ${useCollab ? "collab" : useLabels ? "per-page" : "standard"}, ` +
-        `attributed: ${useCollab ? collabBundles.size : useLabels ? labelBundles.size : 0}, ` +
+        `(format: ${detectedFormat}, attributed: ${attributedCount}, ` +
         `fallback media: ${fallbackMedia.length})`,
       );
 
@@ -562,11 +577,13 @@ async function handleAdMessage(ctx) {
         // ── Forward the page's attributed creative(s) FIRST, then the brief
         const attributed = useCollab
           ? (collabBundles.get(handle.toLowerCase()) || [])
-          : useLabels
-            ? (labelBundles.get(handle.toLowerCase()) || [])
-            : fallbackMedia;
+          : useFilenames
+            ? (filenameBundles.get(handle.toLowerCase()) || [])
+            : useLabels
+              ? (labelBundles.get(handle.toLowerCase()) || [])
+              : fallbackMedia;
 
-        if (attributed.length === 0 && (useCollab || useLabels)) {
+        if (attributed.length === 0 && (useCollab || useFilenames || useLabels)) {
           // We HAVE per-page attribution data but this specific handle isn't
           // in it. Means the operator typo'd the label / host line, OR the
           // page was added to the brief but the creative wasn't included.
