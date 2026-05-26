@@ -53,6 +53,16 @@ function scheduleNifReminder(telegram, destChatId, client, handle, nifMs) {
   console.log(`[scheduler] ⏰ NIF reminder scheduled for @${handle} in ${mins} min (${client})`);
 
   setTimeout(async () => {
+    // Lazy-require to avoid a circular-import surprise if scheduler is
+    // pulled in early. Gate at FIRING time, not scheduling time, so a
+    // page toggled off mid-window doesn't fire its queued NIF.
+    let pagesRegistry;
+    try { pagesRegistry = require("./lib/pages"); } catch (_) {}
+    if (pagesRegistry && !pagesRegistry.getAutoForward(handle)) {
+      console.log(`[scheduler] ⏭️  Skipped NIF reminder for @${handle} (auto_forward = false at fire time)`);
+      return;
+    }
+
     try {
       await telegram.sendMessage(
         destChatId,
