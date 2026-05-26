@@ -15,6 +15,7 @@
  */
 
 const { getPendingReminders, markReminderSent } = require("./sheets");
+const pagesRegistry = require("./lib/pages");
 
 const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
 
@@ -97,6 +98,19 @@ async function checkAndFireReminders(telegram) {
   console.log(`[reminders] 🔔 ${pending.length} reminder(s) due`);
 
   for (const r of pending) {
+    // Gate by current auto_forward state — a page that's been toggled OFF
+    // shouldn't get noisy reminders fired into its chat (Connor reported a
+    // backlog of 16 reminders hitting @thefuck.tv after a redeploy even
+    // though he'd disabled forwarding). The destChatId on the reminder is
+    // baked in at scheduling time, so toggling the registry didn't gate it
+    // before. We mark these as sent so they don't keep retrying — re-enable
+    // the page first if you want fresh reminders.
+    if (!pagesRegistry.getAutoForward(r.handle)) {
+      await markReminderSent(MASTER_SHEET_ID, r.rowNumber).catch(() => {});
+      console.log(`[reminders] ⏭️  Skipped ${r.type} reminder for @${r.handle} (auto_forward = false) — marked sent`);
+      continue;
+    }
+
     const message = r.type === "timed"
       ? `📸 *${r.client}* post is expiring on @${r.handle} — take analytics screenshots then delete the post.`
       : `📊 *7-day analytics check-in* — ${r.client} on @${r.handle}.\nDo NOT delete this post — just log your analytics.`;
