@@ -34,6 +34,55 @@ bot.on("message", (ctx) => {
   handleAdMessage(ctx);    // new ad detection + sheet logging + forwarding
 });
 
+// ── Auto-capture chat IDs when bot is added to a new chat ────────────────────
+// Telegram fires my_chat_member whenever the bot's membership status changes
+// in a chat — including being added. We listen, then DM Connor with the chat
+// ID + title so he can paste it into /admin/page-registry without ever
+// having to look up the ID manually. Replaces the user-account search flow
+// that kept getting SESSION_REVOKED.
+//
+// Filter: only on "joined" transitions (was outsider, now a member) — not on
+// every routine permission change. Bot can only be added by a human, so this
+// fires at most once per chat onboarding.
+bot.on("my_chat_member", async (ctx) => {
+  try {
+    const upd     = ctx.myChatMember;
+    const oldS    = upd?.old_chat_member?.status;
+    const newS    = upd?.new_chat_member?.status;
+    const isJoin  = (oldS === "left" || oldS === "kicked") &&
+                    (newS === "member" || newS === "administrator");
+    if (!isJoin) return;
+
+    const chat    = upd.chat;
+    const adder   = upd.from;
+    const title   = chat.title || chat.username || "(untitled chat)";
+    const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+    if (!adminId) {
+      console.warn(`[my_chat_member] Bot added to "${title}" (${chat.id}) but WIZARD_ADMIN_USER_ID not set — can't DM`);
+      return;
+    }
+
+    const adderTag = adder?.username
+      ? `@${adder.username}`
+      : [adder?.first_name, adder?.last_name].filter(Boolean).join(" ") || `user ${adder?.id}`;
+
+    await ctx.telegram.sendMessage(
+      adminId,
+      `📥 *Added to a new chat*\n\n` +
+      `*Title:* ${title.replace(/[_*`\[]/g, (c) => "\\" + c)}\n` +
+      `*Chat ID:* \`${chat.id}\`\n` +
+      `*Type:* ${chat.type}\n` +
+      `*Added by:* ${adderTag.replace(/[_*`\[]/g, (c) => "\\" + c)}\n\n` +
+      `→ Paste \`${chat.id}\` into the page-registry row for whatever handle this is.\n` +
+      `Or visit https://app.bolismedia.com/admin/page-registry to link it now.`,
+      { parse_mode: "Markdown" },
+    );
+    console.log(`[my_chat_member] Bot joined "${title}" (${chat.id}) — DM'd admin ${adminId}`);
+  } catch (e) {
+    console.error(`[my_chat_member] error: ${e.message}`);
+  }
+});
+
 // ── Persistent reminders — poll every 15 minutes ─────────────────────────────
 // Fires overdue post-expiry / analytics check-in reminders stored in the
 // "Reminders" tab on the master sheet (survives Railway restarts).
