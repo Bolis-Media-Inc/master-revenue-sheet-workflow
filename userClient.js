@@ -91,6 +91,39 @@ async function listChats() {
   }));
 }
 
+// ── Search chats by name substring ───────────────────────────────────────────
+// Powers Digi's /admin/page-registry "Find chat by handle" lookup. The
+// @sales_bolismedia user account is a member of every page's IG Ads
+// channel, so we just need to filter the dialog list by the page handle
+// (which is the substring naming convention we use — e.g. "[goal] IG
+// Ads", "thefuck.tv ig ads", etc.).
+//
+// Higher dialog limit than listChats() (500) since the account is in
+// ~100+ chats and a stale cap would silently miss matches.
+async function searchChats(query, { limit = 20 } = {}) {
+  if (!query) return [];
+  const q = String(query).trim().toLowerCase();
+  if (!q) return [];
+  const client = await getClient();
+  const dialogs = await client.getDialogs({ limit: 500 });
+  const matches = [];
+  for (const d of dialogs) {
+    const name = d.title || d.name || "";
+    if (!name) continue;
+    if (!name.toLowerCase().includes(q)) continue;
+    matches.push({
+      id:   d.id?.toString(),
+      name,
+      type: d.isGroup ? "group" : d.isChannel ? "channel" : "private",
+    });
+    if (matches.length >= limit) break;
+  }
+  // Rank: shorter names first (more specific matches usually win), then
+  // alphabetical for stable ordering.
+  matches.sort((a, b) => a.name.length - b.name.length || a.name.localeCompare(b.name));
+  return matches;
+}
+
 // ── Get messages from all chats since a given date ───────────────────────────
 // Used for the daily recap — pulls the last N hours across all relevant chats.
 
@@ -189,4 +222,4 @@ async function disconnect() {
   }
 }
 
-module.exports = { getClient, sendMessage, sendRecap, getRecentMessages, listChats, getMessagesSince, onNewMessage, disconnect };
+module.exports = { getClient, sendMessage, sendRecap, getRecentMessages, listChats, searchChats, getMessagesSince, onNewMessage, disconnect };
