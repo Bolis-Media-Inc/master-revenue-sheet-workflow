@@ -145,8 +145,35 @@ async function searchChats(query, { limit = 20 } = {}) {
   if (!query) return [];
   const q = String(query).trim().toLowerCase();
   if (!q) return [];
-  const client = (await getOpsClient()) || (await getClient());
-  const dialogs = await client.getDialogs({ limit: 500 });
+
+  // Try ops first; if anything fails (SESSION_REVOKED, AUTH_KEY_*, etc.)
+  // null out the cached client so the next attempt re-reads env vars
+  // and reconnects, then fall back to sales for this request.
+  let client;
+  let dialogs;
+  try {
+    client = (await getOpsClient()) || (await getClient());
+    dialogs = await client.getDialogs({ limit: 500 });
+  } catch (e) {
+    const msg = e?.message || String(e);
+    console.error(`[userClient] searchChats via ops failed: ${msg}`);
+    // Force a fresh connect on next call. If ops env vars are still
+    // bad, getOpsClient will throw again and we'll fall back to sales
+    // again — but at least we won't keep returning the same dead handle.
+    if (_opsClient) {
+      try { await _opsClient.disconnect(); } catch (_) {}
+      _opsClient = null;
+    }
+    // Retry once explicitly via the sales client so this request still
+    // returns useful results instead of the operator seeing the error.
+    try {
+      const sales = await getClient();
+      dialogs = await sales.getDialogs({ limit: 500 });
+    } catch (e2) {
+      throw new Error(`ops dialog fetch failed (${msg}); sales fallback also failed (${e2.message})`);
+    }
+  }
+
   const matches = [];
   for (const d of dialogs) {
     const name = d.title || d.name || "";
