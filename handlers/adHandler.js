@@ -16,8 +16,7 @@ const { appendRow, markForwarded, updateStatusToLive, updateAdDate, appendRemind
 const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getPrecedingMessages } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
-const pages                    = require("../config/pages.json");
-const destinations             = require("../config/telegram-destinations.json");
+const pagesRegistry            = require("../lib/pages");
 
 // Supports comma-separated chat IDs so a test group can run alongside production.
 // e.g. TARGET_CHAT_ID=-1001111111111,-1002222222222
@@ -31,17 +30,13 @@ const PAGE_TAB_NAME   = process.env.PAGE_SHEET_TAB_NAME || "IG Revenue Tracker";
 // Set FORWARDING_ENABLED=true in env to turn on forwarding
 const FORWARDING_ENABLED = (process.env.FORWARDING_ENABLED || "").toLowerCase() === "true";
 
-// Comma-separated list of page handles to enable individual sheet writes + forwarding for.
-// e.g. ENABLED_PAGES=artistswithoutautotune
-// Leave empty / unset to disable all individual page writes (master sheet only).
-// Set to "*" to enable for all pages.
-const ENABLED_PAGES_RAW = process.env.ENABLED_PAGES || "";
-const ENABLED_PAGES_ALL = ENABLED_PAGES_RAW.trim() === "*";
-const ENABLED_PAGES_SET = new Set(
-  ENABLED_PAGES_RAW.split(",").map((h) => h.trim().toLowerCase().replace(/^@/, "")).filter(Boolean)
-);
+// Per-page forwarding gate now lives on the `pages` table (auto_forward column),
+// driven by the Digi /admin/pages UI. The legacy ENABLED_PAGES env var was
+// retired in favor of a per-row toggle — see migrations/010_pages.sql.
+// A "*" env override still wins for ad-hoc all-on testing.
+const ENABLED_PAGES_ALL = (process.env.ENABLED_PAGES || "").trim() === "*";
 const isPageEnabled = (handle) =>
-  handle && (ENABLED_PAGES_ALL || ENABLED_PAGES_SET.has(handle.toLowerCase()));
+  !!handle && (ENABLED_PAGES_ALL || pagesRegistry.getAutoForward(handle));
 
 // Placeholder values that haven't been filled in yet (to skip writing to that sheet)
 const PLACEHOLDER_PATTERN = /^(SHEET_ID_|TELEGRAM_CHAT_ID_)/;
@@ -325,7 +320,7 @@ async function handleAdMessage(ctx) {
           // Per-page sheets: update column D where this handle has a sheet
           for (const handle of handles) {
             if (!isPageEnabled(handle)) continue;
-            const sheetId = pages[handle];
+            const sheetId = pagesRegistry.getSheetId(handle);
             if (!sheetId || PLACEHOLDER_PATTERN.test(sheetId)) continue;
             try {
               const dated = await updateAdDate(sheetId, PAGE_TAB_NAME, [handle], clientName, overrideDate, false);
@@ -344,7 +339,7 @@ async function handleAdMessage(ctx) {
         const nifMs  = parseNifMs(item?.nif);
         if (!nifMs) continue;
 
-        const destChatId = destinations[handle];
+        const destChatId = pagesRegistry.getChatId(handle);
         if (!destChatId || PLACEHOLDER_PATTERN.test(String(destChatId))) continue;
 
         scheduleNifReminder(
@@ -422,7 +417,7 @@ async function handleAdMessage(ctx) {
     for (const item of parsedList) {
       if (!item.pageHandle || !isPageEnabled(item.pageHandle)) continue;
 
-      const sheetId = pages[item.pageHandle];
+      const sheetId = pagesRegistry.getSheetId(item.pageHandle);
       if (!sheetId || PLACEHOLDER_PATTERN.test(sheetId)) {
         console.warn(`[adHandler] ⚠️ No sheet ID for @${item.pageHandle} — add to pages.json`);
         continue;
@@ -444,7 +439,7 @@ async function handleAdMessage(ctx) {
     // ── Forward content + ad brief to each page's Telegram destination ─────────
     // Skip entirely if this brief was sent by Greg's /api/ad/intake — Greg already
     // forwarded per-page creatives directly to each destination.
-    if (FORWARDING_ENABLED && !destinations._forwarding_disabled_globally && !isGregHandled) {
+    if (FORWARDING_ENABLED && !pagesRegistry.isForwardingDisabledGlobally() && !isGregHandled) {
 
       const adMessageId  = ctx.message.message_id;
       const sourceChatId = chatId;
@@ -496,7 +491,7 @@ async function handleAdMessage(ctx) {
       const forwardedDestinations = new Set();
 
       for (const handle of uniqueHandles) {
-        const destChatId = destinations[handle];
+        const destChatId = pagesRegistry.getChatId(handle);
 
         if (!destChatId || PLACEHOLDER_PATTERN.test(String(destChatId))) {
           console.warn(`[adHandler] ⚠️ No Telegram destination configured for @${handle} — skipping forward`);

@@ -21,7 +21,7 @@ const path            = require("path");
 const { Telegraf, Markup } = require("telegraf");
 const cron            = require("node-cron");
 const brain           = require("./brain");
-const destinations    = require("./config/telegram-destinations.json");
+const pagesRegistry   = require("./lib/pages");
 const postedHandler   = require("./handlers/postedHandler");
 const apiServer       = require("./lib/api");
 const poster          = require("./lib/poster");
@@ -1057,7 +1057,7 @@ async function forwardContentToPages(telegram, session) {
   if (fmt === "Standard") {
     // Shared content → every page
     for (const handle of pages) {
-      const dest = destinations[handle] || destinations[handle.replace(/[._]/g, "")];
+      const dest = pagesRegistry.getChatId(handle) || pagesRegistry.getChatId(handle.replace(/[._]/g, ""));
       if (!dest || PLACEHOLDER_PATTERN.test(String(dest))) continue;
       const destKey = String(dest);
       if (forwardedDests.has(destKey)) continue;
@@ -1069,7 +1069,7 @@ async function forwardContentToPages(telegram, session) {
   } else if (fmt === "Per-creative") {
     // Each page gets its own content
     for (const handle of pages) {
-      const dest = destinations[handle] || destinations[handle.replace(/[._]/g, "")];
+      const dest = pagesRegistry.getChatId(handle) || pagesRegistry.getChatId(handle.replace(/[._]/g, ""));
       if (!dest || PLACEHOLDER_PATTERN.test(String(dest))) continue;
       const destKey = String(dest);
       if (forwardedDests.has(destKey)) continue;
@@ -1084,7 +1084,7 @@ async function forwardContentToPages(telegram, session) {
     for (const g of content.collabGroups) {
       const allHandles = [g.host, ...g.invites];
       for (const handle of allHandles) {
-        const dest = destinations[handle] || destinations[handle.replace(/[._]/g, "")];
+        const dest = pagesRegistry.getChatId(handle) || pagesRegistry.getChatId(handle.replace(/[._]/g, ""));
         if (!dest || PLACEHOLDER_PATTERN.test(String(dest))) continue;
         const destKey = String(dest);
         if (forwardedDests.has(destKey)) continue;

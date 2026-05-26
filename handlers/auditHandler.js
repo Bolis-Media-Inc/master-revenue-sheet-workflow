@@ -32,8 +32,7 @@
 
 const { parseAdMessage }          = require("../parser");
 const { updateAdPrice, deleteAdRows } = require("../sheets");
-const pages                       = require("../config/pages.json");
-const destinations                = require("../config/telegram-destinations.json");
+const pagesRegistry               = require("../lib/pages");
 
 const TARGET_CHAT_ID = process.env.TARGET_CHAT_ID;
 const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
@@ -162,7 +161,7 @@ async function handleAuditCommand(ctx) {
 
           try {
             if (isPageEnabled(handle)) {
-              const sheetId = pages[handle];
+              const sheetId = pagesRegistry.getSheetId(handle);
               if (sheetId && !PLACEHOLDER_PATTERN.test(sheetId)) {
                 pageUpdated = await updateAdPrice(
                   sheetId, PAGE_TAB_NAME, [handle], clientName, cmd.price, false
@@ -205,7 +204,7 @@ async function handleAuditCommand(ctx) {
 
           try {
             if (isPageEnabled(handle)) {
-              const sheetId = pages[handle];
+              const sheetId = pagesRegistry.getSheetId(handle);
               if (sheetId && !PLACEHOLDER_PATTERN.test(sheetId)) {
                 pageDeleted = await deleteAdRows(
                   sheetId, PAGE_TAB_NAME, [handle], clientName, false
@@ -248,7 +247,7 @@ async function handleAuditCommand(ctx) {
         }
 
         for (const handle of cmd.handles) {
-          const destChatId = destinations[handle];
+          const destChatId = pagesRegistry.getChatId(handle);
 
           if (!destChatId || PLACEHOLDER_PATTERN.test(String(destChatId))) {
             replyLines.push(`⚠️ No Telegram destination configured for @${handle}`);

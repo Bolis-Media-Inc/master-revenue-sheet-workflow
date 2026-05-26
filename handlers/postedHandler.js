@@ -36,8 +36,7 @@ const sessions     = require("../lib/sessions");
 const digiClient   = require("../lib/digiClient");
 const captionMatch = require("../lib/captionMatch");
 const { updateStatusToLive, updateAdDate } = require("../sheets");
-const pages        = require("../config/pages.json");
-const destinations = require("../config/telegram-destinations.json");
+const pagesRegistry = require("../lib/pages");
 
 const MASTER_SHEET_ID    = process.env.MASTER_SHEET_ID;
 const TAB_NAME           = process.env.SHEET_TAB_NAME      || "2026 Ad Overview";
@@ -444,7 +443,7 @@ async function handlePostedOnConfirmation(ctx) {
       // below). For the page sheet date, do it directly.
       if (overrideDate) {
         for (const handle of sessionHandles) {
-          const pageSheetId = pages[handle];
+          const pageSheetId = pagesRegistry.getSheetId(handle);
           if (!pageSheetId || PLACEHOLDER_PATTERN.test(pageSheetId)) continue;
           try {
             await updateAdDate(pageSheetId, PAGE_TAB_NAME, [handle], clientName, overrideDate, false);
