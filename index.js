@@ -56,9 +56,27 @@ bot.on("my_chat_member", async (ctx) => {
     const chat    = upd.chat;
     const adder   = upd.from;
     const title   = chat.title || chat.username || "(untitled chat)";
-    const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
-    if (!adminId) {
-      console.warn(`[my_chat_member] Bot added to "${title}" (${chat.id}) but WIZARD_ADMIN_USER_ID not set — can't DM`);
+
+    // Two ways to address the admin(s):
+    //   1. WIZARD_ADMIN_USER_ID   — numeric ID (preferred, no DM-history dependency)
+    //   2. WIZARD_ADMIN_HANDLES   — comma list of @usernames (existing convention)
+    //
+    // For (2), Telegram's sendMessage will only deliver to a @username if
+    // the user has DM'd the bot at least once. If they haven't, Telegram
+    // returns "Forbidden: bot can't initiate conversation with a user" and
+    // we surface that in the logs so the admin knows to /start the bot.
+    const adminIdRaw = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+    const adminHandles = (process.env.WIZARD_ADMIN_HANDLES || "")
+      .split(",")
+      .map((h) => h.trim().replace(/^@/, ""))
+      .filter(Boolean);
+
+    let recipients = [];
+    if (adminIdRaw) recipients.push(adminIdRaw);
+    else if (adminHandles.length) recipients = adminHandles.map((h) => `@${h}`);
+
+    if (recipients.length === 0) {
+      console.warn(`[my_chat_member] Bot added to "${title}" (${chat.id}) — no WIZARD_ADMIN_USER_ID or WIZARD_ADMIN_HANDLES, can't DM`);
       return;
     }
 
@@ -66,18 +84,32 @@ bot.on("my_chat_member", async (ctx) => {
       ? `@${adder.username}`
       : [adder?.first_name, adder?.last_name].filter(Boolean).join(" ") || `user ${adder?.id}`;
 
-    await ctx.telegram.sendMessage(
-      adminId,
+    const text =
       `📥 *Added to a new chat*\n\n` +
       `*Title:* ${title.replace(/[_*`\[]/g, (c) => "\\" + c)}\n` +
       `*Chat ID:* \`${chat.id}\`\n` +
       `*Type:* ${chat.type}\n` +
       `*Added by:* ${adderTag.replace(/[_*`\[]/g, (c) => "\\" + c)}\n\n` +
       `→ Paste \`${chat.id}\` into the page-registry row for whatever handle this is.\n` +
-      `Or visit https://app.bolismedia.com/admin/page-registry to link it now.`,
-      { parse_mode: "Markdown" },
-    );
-    console.log(`[my_chat_member] Bot joined "${title}" (${chat.id}) — DM'd admin ${adminId}`);
+      `Or visit https://app.bolismedia.com/admin/page-registry to link it now.`;
+
+    for (const recipient of recipients) {
+      try {
+        await ctx.telegram.sendMessage(recipient, text, { parse_mode: "Markdown" });
+        console.log(`[my_chat_member] Bot joined "${title}" (${chat.id}) — DM'd ${recipient}`);
+      } catch (err) {
+        // Bots can't initiate conversation with users who've never DM'd them.
+        // Surface this clearly so the admin knows the fix.
+        if (/can't initiate conversation|chat not found|user not found/i.test(err.message)) {
+          console.warn(
+            `[my_chat_member] Couldn't DM ${recipient} for chat "${title}" (${chat.id}): ${err.message}\n` +
+            `   → Have ${recipient} send /start to @bm_tracking_bot once, then retry.`,
+          );
+        } else {
+          console.error(`[my_chat_member] DM ${recipient} failed: ${err.message}`);
+        }
+      }
+    }
   } catch (e) {
     console.error(`[my_chat_member] error: ${e.message}`);
   }
