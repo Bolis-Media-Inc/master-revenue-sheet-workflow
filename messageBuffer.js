@@ -101,7 +101,11 @@ function getContentBundlesByPage(chatId, adMessageId) {
     const isLabel = !hasMedia && text.endsWith("^") && text.length > 1;
 
     if (isLabel) {
-      const label = text.slice(0, -1).trim().toLowerCase();
+      // Strip leading @ so "@thefuck.tv^" and "thefuck.tv^" both match the
+      // handle key the caller looks up with (which is always sans-@).
+      // Without this normalization, labels written with @ would never match
+      // and the page would silently get the standard fallback set.
+      const label = text.slice(0, -1).trim().toLowerCase().replace(/^@/, "");
       result.set(label, [...pendingContent]); // pendingContent is already oldest-first
       pendingContent = [];
 
