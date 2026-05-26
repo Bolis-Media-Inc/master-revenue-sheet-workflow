@@ -519,12 +519,25 @@ async function handleAdMessage(ctx) {
       // Each parser stops scanning at any unrecognized non-empty text so
       // we never pull media from a previous ad's content. clearBufferUpTo
       // at the end of this handler also keeps cross-ad contamination out.
+      // All three scanners now return { byHandle, shared } or null. The
+      // `shared` bundle carries unattributed media (e.g. "slides 2-4 for
+      // ALL pages" videos) and the IG caption text Danielson types right
+      // above the brief — every page receives shared content alongside
+      // its per-page attributed cover.
       const collabBundles    = getCollabBundlesByPage(sourceChatId, adMessageId);
       const filenameBundles  = collabBundles ? null : getFilenameBundlesByPage(sourceChatId, adMessageId);
       const labelBundles     = (collabBundles || filenameBundles) ? null : getContentBundlesByPage(sourceChatId, adMessageId);
-      const useCollab        = !!collabBundles && collabBundles.size > 0;
-      const useFilenames     = !useCollab && !!filenameBundles && filenameBundles.size > 0;
-      const useLabels        = !useCollab && !useFilenames && !!labelBundles && labelBundles.size > 0;
+      const useCollab        = !!collabBundles    && collabBundles.byHandle.size    > 0;
+      const useFilenames     = !useCollab && !!filenameBundles && filenameBundles.byHandle.size > 0;
+      const useLabels        = !useCollab && !useFilenames && !!labelBundles && labelBundles.byHandle.size > 0;
+      // Pick the active bundle source so we read byHandle + shared from
+      // one place below. When no attribution detected, sharedBundle is
+      // empty and we fall through to the legacy 4-preceding-media path.
+      const activeBundle     = useCollab    ? collabBundles
+                             : useFilenames ? filenameBundles
+                             : useLabels    ? labelBundles
+                             : null;
+      const sharedBundle     = activeBundle?.shared || { media: [], caption: null };
       const fallbackMedia  = (!useCollab && !useFilenames && !useLabels)
         ? getPrecedingMessages(sourceChatId, adMessageId, 4)
             .filter((m) => m.photo || m.video || m.document || m.animation)
@@ -534,13 +547,12 @@ async function handleAdMessage(ctx) {
                            : useFilenames ? "filename-attributed"
                            : useLabels ? "per-page-label"
                            : "standard";
-      const attributedCount = useCollab    ? collabBundles.size
-                            : useFilenames ? filenameBundles.size
-                            : useLabels    ? labelBundles.size
-                            : 0;
+      const attributedCount = activeBundle?.byHandle.size || 0;
       console.log(
         `[adHandler] 📤 Manual ad — forwarding ` +
         `(format: ${detectedFormat}, attributed: ${attributedCount}, ` +
+        `shared media: ${sharedBundle.media.length}, ` +
+        `shared caption: ${sharedBundle.caption ? "yes" : "no"}, ` +
         `fallback media: ${fallbackMedia.length})`,
       );
 
@@ -574,50 +586,60 @@ async function handleAdMessage(ctx) {
         }
         forwardedDestinations.add(destKey);
 
-        // ── Forward the page's attributed creative(s) FIRST, then the brief
-        // bundle shape (for collab / filename / labels): { media: [...], caption: string|null }
-        // For standard fallback we wrap the raw array in the same shape so
-        // downstream forwarding doesn't have to branch.
-        const bundle = useCollab
-          ? (collabBundles.get(handle.toLowerCase()) || { media: [], caption: null })
-          : useFilenames
-            ? (filenameBundles.get(handle.toLowerCase()) || { media: [], caption: null })
-            : useLabels
-              ? (labelBundles.get(handle.toLowerCase()) || { media: [], caption: null })
-              : { media: fallbackMedia, caption: null };
-        const attributed = bundle.media;
-        const perPageCaption = bundle.caption;
+        // ── Per-page attributed bundle (cover etc.) ──────────────────────
+        // When attribution detected, look up this handle's specific bundle.
+        // Pages NOT in the attribution map get an empty per-page bundle —
+        // they still receive shared media + brief below.
+        const perPageBundle = activeBundle
+          ? (activeBundle.byHandle.get(handle.toLowerCase()) || { media: [], caption: null })
+          : { media: fallbackMedia, caption: null };
+        const perPageMedia   = perPageBundle.media;
+        const perPageCaption = perPageBundle.caption;
 
-        if (attributed.length === 0 && (useCollab || useFilenames || useLabels)) {
-          // We HAVE per-page attribution data but this specific handle isn't
-          // in it. Means the operator typo'd the label / host line, OR the
-          // page was added to the brief but the creative wasn't included.
-          // Don't forward random media — log and continue with brief only.
-          console.warn(`[adHandler] ⚠️ No attributed creative found for @${handle} — forwarding brief only`);
+        // 1️⃣ Forward per-page attributed media (cover = slide 1)
+        if (perPageMedia.length === 0 && activeBundle) {
+          // We HAVE attribution data but this specific handle isn't in
+          // byHandle. Operator typo'd the label / host line, OR the page
+          // was added to the brief but its creative wasn't included.
+          // Don't forward random media — log and continue. Shared media
+          // and brief below still go out so the page isn't totally silent.
+          console.warn(`[adHandler] ⚠️ No per-page creative found for @${handle} — sending shared + brief only`);
         } else {
-          for (const mediaMsg of attributed) {
+          for (const mediaMsg of perPageMedia) {
             try {
               await ctx.telegram.forwardMessage(String(destChatId), sourceChatId, mediaMsg.message_id);
             } catch (err) {
-              console.error(`[adHandler] ❌ Forward creative msg ${mediaMsg.message_id} → @${handle}: ${err.message}`);
+              console.error(`[adHandler] ❌ Forward per-page msg ${mediaMsg.message_id} → @${handle}: ${err.message}`);
             }
           }
-          if (attributed.length > 0) {
-            console.log(`[adHandler] ✅ Forwarded ${attributed.length} creative msg(s) → @${handle}`);
+          if (perPageMedia.length > 0) {
+            console.log(`[adHandler] ✅ Forwarded ${perPageMedia.length} per-page msg(s) → @${handle}`);
           }
         }
 
-        // ── Per-page caption (label format) ──────────────────────────────
-        // If the label was "@thefuck.tv NEO just dropped! Read bio ^" OR
-        // the file's Telegram caption had per-page text, send that as a
-        // separate message after the media so the VA can copy/paste it
-        // into the IG post. Brief still gets sent below (separate flow).
-        if (perPageCaption) {
+        // 2️⃣ Forward shared media (slides 2-4 for ALL pages, etc.)
+        // Same set to every destination, in original chronological order.
+        if (sharedBundle.media.length > 0) {
+          for (const mediaMsg of sharedBundle.media) {
+            try {
+              await ctx.telegram.forwardMessage(String(destChatId), sourceChatId, mediaMsg.message_id);
+            } catch (err) {
+              console.error(`[adHandler] ❌ Forward shared msg ${mediaMsg.message_id} → @${handle}: ${err.message}`);
+            }
+          }
+          console.log(`[adHandler] ✅ Forwarded ${sharedBundle.media.length} shared msg(s) → @${handle}`);
+        }
+
+        // 3️⃣ Caption — per-page wins over shared. Either way, sent as a
+        // separate text message after media so VA can copy/paste into IG.
+        const captionToSend = perPageCaption || sharedBundle.caption;
+        if (captionToSend) {
           try {
-            await ctx.telegram.sendMessage(String(destChatId), perPageCaption);
-            console.log(`[adHandler] 💬 Per-page caption sent → @${handle} (${perPageCaption.length} chars)`);
+            await ctx.telegram.sendMessage(String(destChatId), captionToSend);
+            const source = perPageCaption ? "per-page" : "shared";
+            console.log(`[adHandler] 💬 ${source} caption sent → @${handle} (${captionToSend.length} chars)`);
           } catch (err) {
-            console.error(`[adHandler] ❌ Per-page caption → @${handle}: ${err.message}`);
+            console.error(`[adHandler] ❌ Caption → @${handle}: ${err.message}`);
           }
         }
 

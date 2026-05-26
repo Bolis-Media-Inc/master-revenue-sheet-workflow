@@ -72,6 +72,32 @@ function getPrecedingMessages(chatId, beforeMessageId, count = 2) {
 }
 
 /**
+ * Pull the SHARED caption candidate from the message immediately before
+ * the brief (preceding[preceding.length - 1]). Returns the trimmed text
+ * iff it qualifies as IG caption copy, else null. Rules:
+ *   - non-empty
+ *   - not a label (doesn't end with "^")
+ *   - not a previous-ad brief (no "PAGE INFO"/"INSTRUCTIONS:" markers)
+ *
+ * Used by all three bundle scanners — the convention is the same
+ * regardless of attribution format: Danielson types the IG caption
+ * once, right above the brief, and every page's IG Ads chat should
+ * receive it.
+ */
+function _extractSharedCaption(preceding) {
+  if (preceding.length === 0) return null;
+  const last = preceding[preceding.length - 1];
+  const text = (last.text || "").trim();
+  const hasMedia = !!(last.photo || last.video || last.document ||
+                      last.animation || last.audio || last.sticker);
+  if (hasMedia) return null;
+  if (!text) return null;
+  if (text.endsWith("^")) return null;
+  if (_looksLikePreviousBrief(text)) return null;
+  return text;
+}
+
+/**
  * Scan backwards from the ad message and group preceding content into
  * per-page bundles based on text label messages ending with "^".
  *
@@ -79,18 +105,20 @@ function getPrecedingMessages(chatId, beforeMessageId, count = 2) {
  *
  * The scan walks back through the buffer and collects media messages,
  * assigning them to the most recent label seen while going backwards.
- * It stops when it hits a plain text message that is NOT a label
- * (e.g. an old ad brief, an admin comment) to avoid over-reaching.
+ * Media that isn't followed by any label going backwards = unattributed,
+ * gets collected into the SHARED bundle so every page receives it
+ * (matches the team's "shared slides for ALL pages" convention).
  *
- * Returns a Map<string, Array<message>> where the key is the normalized
- * label (lowercased, "^" stripped) and the value is the content messages
- * for that page in chronological order (oldest first).
+ * Returns `{ byHandle, shared }` where:
+ *   - byHandle: Map<handle, { media, caption }> — per-page attributed
+ *   - shared:   { media, caption } — content every page should get
  *
- * Returns an empty Map if no labeled bundles are found (simple/shared ad).
+ * Returns `{ byHandle: new Map(), shared: { media: [], caption: null } }`
+ * if no labels found — caller decides whether to use standard fallback.
  *
  * @param {string} chatId
  * @param {number} adMessageId
- * @returns {Map<string, Array>}
+ * @returns {{ byHandle: Map<string, {media:Array, caption:string|null}>, shared: {media:Array, caption:string|null} }}
  */
 function getContentBundlesByPage(chatId, adMessageId) {
   const buf = _buffers.get(String(chatId)) || [];
@@ -98,11 +126,12 @@ function getContentBundlesByPage(chatId, adMessageId) {
 
   // Messages before the ad (oldest … newest, not including the ad itself)
   // If the ad wasn't found in the buffer, return empty — never scan random buffer contents.
-  if (adIdx <= 0) return new Map();
+  if (adIdx <= 0) return { byHandle: new Map(), shared: { media: [], caption: null } };
   const preceding = buf.slice(0, adIdx);
 
-  const result = new Map();
-  let pendingContent = []; // media messages collected since the last label (going backwards)
+  const byHandle = new Map();
+  const sharedMedia = []; // media not claimed by any label going backwards
+  let pendingContent = []; // media collected since the last label (going backwards)
 
   for (let i = preceding.length - 1; i >= 0; i--) {
     const msg  = preceding[i];
@@ -130,7 +159,7 @@ function getContentBundlesByPage(chatId, adMessageId) {
       const handlePart = (firstSpace === -1 ? labelText : labelText.slice(0, firstSpace))
         .toLowerCase().replace(/^@/, "");
       const captionPart = firstSpace === -1 ? null : labelText.slice(firstSpace + 1).trim() || null;
-      result.set(handlePart, { media: [...pendingContent], caption: captionPart });
+      byHandle.set(handlePart, { media: [...pendingContent], caption: captionPart });
       pendingContent = [];
 
     } else if (hasMedia) {
@@ -143,16 +172,30 @@ function getContentBundlesByPage(chatId, adMessageId) {
 
     } else if (_looksLikePreviousBrief(text)) {
       // Strong signal we've crossed into a previous ad — stop.
+      // Anything still in pendingContent is from BEFORE the previous
+      // brief; safer to drop than to attribute to the current ad.
+      pendingContent = [];
       break;
 
     } else {
-      // Random text (Instagram caption, admin chatter, "13 Covers ^" annotation
-      // that wasn't a label, etc). Skip — keep scanning for media + labels.
+      // Random text (Instagram caption, admin chatter, "13 Covers ^"
+      // annotation that wasn't a label, etc). Skip — keep scanning.
       continue;
     }
   }
 
-  return result;
+  // Anything left in pendingContent at the end = media that appeared
+  // before any label going backwards. These are unattributed — they
+  // belong to the shared bundle so every page receives them.
+  for (const m of pendingContent) sharedMedia.push(m);
+
+  return {
+    byHandle,
+    shared: {
+      media: sharedMedia,
+      caption: _extractSharedCaption(preceding),
+    },
+  };
 }
 
 /**
@@ -238,7 +281,7 @@ function getCollabBundlesByPage(chatId, adMessageId) {
   // sibling messages, not as text the VA copies into IG) — so caption is
   // always null. Could revisit if Bolis ever needs unique IG copy per
   // collab member.
-  const result = new Map();
+  const byHandle = new Map();
   for (const group of groups) {
     for (const { msg: hostMsg, handles } of group.hostMsgs) {
       // Order: video → caption text messages → host/invite message
@@ -248,12 +291,16 @@ function getCollabBundlesByPage(chatId, adMessageId) {
         hostMsg,
       ];
       for (const handle of handles) {
-        result.set(handle, { media: toForward, caption: null });
+        byHandle.set(handle, { media: toForward, caption: null });
       }
     }
   }
 
-  return result;
+  // Collab doesn't use the team's "shared slides for ALL" pattern —
+  // everything is routed through Host/invite blocks. Return empty
+  // shared bundle so the caller can read collab results with the same
+  // shape as the other scanners.
+  return { byHandle, shared: { media: [], caption: null } };
 }
 
 /**
@@ -273,16 +320,18 @@ function getCollabBundlesByPage(chatId, adMessageId) {
  * tolerated since Telegram clients sometimes append them when files
  * collide on the user's device.
  *
- * Returns Map<handle, Array<message>> where each entry is just [coverMsg]
- * (one message per page). Returns null when no filename-attributed media
- * is found, so the caller can fall through to text-label detection.
+ * Media WITHOUT an @-filename in the same scan window (e.g. shared
+ * "slides 2-4" videos) is collected into the SHARED bundle so every
+ * page receives it.
  *
- * Stops scanning at the first non-media, non-empty message (typically
- * the previous ad's brief) so we don't pull covers from earlier ads.
+ * Returns `{ byHandle, shared }` or null when nothing filename-
+ * attributed was found (signals the caller to try the next scanner).
+ *
+ * Stops scanning at any text that looks like a previous ad brief.
  *
  * @param {string} chatId
  * @param {number} adMessageId
- * @returns {Map<string, Array>|null}
+ * @returns {{ byHandle: Map<string, {media:Array, caption:string|null}>, shared: {media:Array, caption:string|null} }|null}
  */
 function getFilenameBundlesByPage(chatId, adMessageId) {
   const buf = _buffers.get(String(chatId)) || [];
@@ -290,7 +339,8 @@ function getFilenameBundlesByPage(chatId, adMessageId) {
   if (adIdx <= 0) return null;
   const preceding = buf.slice(0, adIdx);
 
-  const result = new Map();
+  const byHandle = new Map();
+  const sharedMedia = []; // chronological — collected newest-first then reversed below
   let foundAny = false;
 
   for (let i = preceding.length - 1; i >= 0; i--) {
@@ -314,26 +364,30 @@ function getFilenameBundlesByPage(chatId, adMessageId) {
         // under the file in his client, it surfaces here. Becomes the
         // per-page caption forwarded as a separate text after the cover.
         const mediaCaption = (msg.caption || "").trim() || null;
-        if (!result.has(handle)) {
-          result.set(handle, { media: [msg], caption: mediaCaption });
+        if (!byHandle.has(handle)) {
+          byHandle.set(handle, { media: [msg], caption: mediaCaption });
         } else {
           // Multiple files for the same page — keep chronological order
           // and prefer the most recent non-null caption (first iteration =
           // newest since we're walking backwards).
-          const entry = result.get(handle);
+          const entry = byHandle.get(handle);
           entry.media.unshift(msg);
           if (!entry.caption && mediaCaption) entry.caption = mediaCaption;
         }
         foundAny = true;
+      } else {
+        // Media without an @-filename → shared bundle (e.g. slides 2-4
+        // for all pages). Collect newest-first; we'll reverse at the end
+        // to restore chronological order.
+        sharedMedia.unshift(msg);
       }
-      // Media without an @-filename is fine — could be a shared "slides
-      // 2-4" attachment that doesn't get per-page-routed by filename.
-      // We just don't attribute it.
 
     } else if (!text) {
       continue; // empty / service
     } else if (_looksLikePreviousBrief(text)) {
-      // Strong "previous ad" signal — stop here, don't pull from earlier ad
+      // Strong "previous ad" signal — stop here. Drop sharedMedia
+      // collected up to now, those came from before the previous brief.
+      sharedMedia.length = 0;
       break;
     } else {
       // Caption text, "13 Covers ^" annotation, admin chatter — skip and
@@ -342,7 +396,15 @@ function getFilenameBundlesByPage(chatId, adMessageId) {
     }
   }
 
-  return foundAny ? result : null;
+  if (!foundAny) return null;
+
+  return {
+    byHandle,
+    shared: {
+      media: sharedMedia,
+      caption: _extractSharedCaption(preceding),
+    },
+  };
 }
 
 function clearBufferUpTo(chatId, upToMessageId) {
