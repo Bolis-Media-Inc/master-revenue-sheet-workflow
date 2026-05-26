@@ -46,6 +46,30 @@ const PLACEHOLDER_PATTERN = /^(SHEET_ID_|TELEGRAM_CHAT_ID_)/;
 const _recentlyProcessed = new Set();
 const DEDUP_MAX_SIZE = 200;
 
+// Levenshtein distance — used to fuzzy-correct typo'd handles in
+// "Posted on" replies against the original brief's page list. Iterative
+// matrix; O(m*n) is fine for the handle lengths we deal with (<25 chars).
+function _editDistance(a, b) {
+  if (a === b) return 0;
+  if (!a) return b.length;
+  if (!b) return a.length;
+  const m = a.length, n = b.length;
+  const dp = new Array(n + 1);
+  for (let j = 0; j <= n; j++) dp[j] = j;
+  for (let i = 1; i <= m; i++) {
+    let prev = dp[0];
+    dp[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const tmp = dp[j];
+      dp[j] = a[i - 1] === b[j - 1]
+        ? prev
+        : 1 + Math.min(prev, dp[j], dp[j - 1]);
+      prev = tmp;
+    }
+  }
+  return dp[n];
+}
+
 /**
 /**
  * Parse a date written naturally inside a "Posted on" reply.
@@ -272,7 +296,7 @@ async function handleAdMessage(ctx) {
         console.log("[adHandler] ⏭️  Skipping greg-mirrored Posted-on (already handled by Greg)");
         return;
       }
-      const handles = text.split("\n")
+      const rawHandles = text.split("\n")
         .map((l) => l.trim())
         .filter((l) => l.startsWith("@"))
         .map((l) => l.match(/^@([\w.]+)/)?.[1])
@@ -292,6 +316,33 @@ async function handleAdMessage(ctx) {
           console.log(`[adHandler] "Posted on" linked to campaign: "${clientName}"`);
         }
       }
+
+      // Fuzzy-correct typos in Posted-on handles against the brief's actual
+      // page list. Bounded to the brief's pages only (not the whole registry)
+      // so we can't accidentally flip an unrelated handle. Edit distance ≤ 1
+      // catches single-character typos (e.g. "oddlyhorrifyinh" → "oddlyhorrifying").
+      // Ambiguous corrections (2+ candidates within distance 1) are rejected
+      // and the typo is passed through unchanged — better an obvious miss than
+      // a silent wrong flip.
+      const briefHandles = originalList
+        .map((p) => p.pageHandle)
+        .filter(Boolean)
+        .map((h) => h.toLowerCase());
+      const handles = briefHandles.length === 0
+        ? rawHandles
+        : rawHandles.map((h) => {
+            const lower = h.toLowerCase();
+            if (briefHandles.includes(lower)) return h; // exact match already
+            const candidates = briefHandles.filter((b) => _editDistance(lower, b) <= 1);
+            if (candidates.length === 1) {
+              console.log(`[adHandler] 🔤 Fuzzy-matched "@${h}" → "@${candidates[0]}" (typo correction)`);
+              return candidates[0];
+            }
+            if (candidates.length > 1) {
+              console.warn(`[adHandler] ⚠️ Ambiguous Posted-on handle "@${h}" — matches ${candidates.join(", ")} — leaving as-is`);
+            }
+            return h;
+          });
 
       // ── Optional date override ─────────────────────────────────────────────
       // VAs sometimes confirm a post days late ("Posted on @goal April 14th").
