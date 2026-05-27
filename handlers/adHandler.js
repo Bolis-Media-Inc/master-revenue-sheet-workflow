@@ -556,6 +556,40 @@ async function handleAdMessage(ctx) {
         `fallback media: ${fallbackMedia.length})`,
       );
 
+      // ── Coverage check ─────────────────────────────────────────────────
+      // Cross-reference the brief's page list against what attribution
+      // produced. Surfaces three useful signals BEFORE forwarding:
+      //   • covered:    pages in brief AND attributed — will get per-page media
+      //   • uncovered:  pages in brief BUT not attributed — will get only
+      //                 shared media + brief (no cover). Operator should know
+      //                 since this often means a missing @-filename or typo.
+      //   • orphan:     pages attributed but NOT in the brief — usually a
+      //                 typo in a handle-list or filename. The forwarder
+      //                 will skip these (only brief-listed pages get sent
+      //                 to), so they're surfaced for human review.
+      if (activeBundle) {
+        const listed     = new Set(parsedList.map((p) => p.pageHandle?.toLowerCase()).filter(Boolean));
+        const attributed = new Set([...activeBundle.byHandle.keys()]);
+        const covered    = [...listed].filter((h) => attributed.has(h));
+        const uncovered  = [...listed].filter((h) => !attributed.has(h));
+        const orphan     = [...attributed].filter((h) => !listed.has(h));
+        console.log(
+          `[adHandler] 📋 Coverage: ${listed.size} in brief · ` +
+          `${covered.length} with per-page media · ${uncovered.length} brief-only · ` +
+          `${orphan.length} orphan attribution`,
+        );
+        if (uncovered.length > 0) {
+          console.log(`[adHandler]    🟡 Brief-only (no per-page cover): ${uncovered.map((h) => "@" + h).join(", ")}`);
+        }
+        if (orphan.length > 0) {
+          // Orphans are suspicious — likely typo'd handles in a label or
+          // handle-list, OR an @-named file for a page not actually in this
+          // brief. Either way, that media won't get forwarded (we only loop
+          // over brief-listed pages). Flagging so it's visible.
+          console.log(`[adHandler]    🔴 Orphan attribution (won't forward): ${orphan.map((h) => "@" + h).join(", ")}`);
+        }
+      }
+
       // Only forward for pages that are enabled AND have a configured destination
       const uniqueHandles = [...new Set(
         parsedList.map((p) => p.pageHandle).filter((h) => h && isPageEnabled(h))
