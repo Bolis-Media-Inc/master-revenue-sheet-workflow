@@ -343,6 +343,31 @@ function getFilenameBundlesByPage(chatId, adMessageId) {
   const sharedMedia = []; // chronological — collected newest-first then reversed below
   let foundAny = false;
 
+  // A "handle list" message is a standalone text containing ONLY @-handles
+  // (whitespace-separated, nothing else). Danielson uses this to attach a
+  // single un-named cover to multiple pages, e.g.:
+  //
+  //    IMG_3190.JPG
+  //    @memedwyd @greatestmediamoments @popdownload
+  //
+  // The list applies to the immediately-preceding (chronologically) media
+  // when that media has no @-filename of its own. Walking backwards, we
+  // see the list first, set pendingHandleList, and apply it to the next
+  // unfilenamed media we encounter.
+  //
+  // Cleared when: (a) consumed by a media, (b) interrupted by any other
+  // text, (c) we hit a previous-brief boundary.
+  const HANDLE_LIST_RE = /^(@[\w.]+(?:\s+|$))+$/;
+  let pendingHandleList = null;
+
+  function _addHandleEntry(handle, msg) {
+    if (!byHandle.has(handle)) {
+      byHandle.set(handle, { media: [msg], caption: null });
+    } else {
+      byHandle.get(handle).media.unshift(msg);
+    }
+  }
+
   for (let i = preceding.length - 1; i >= 0; i--) {
     const msg = preceding[i];
     const fileName =
@@ -375,10 +400,17 @@ function getFilenameBundlesByPage(chatId, adMessageId) {
           if (!entry.caption && mediaCaption) entry.caption = mediaCaption;
         }
         foundAny = true;
+        pendingHandleList = null; // filename attribution wins; list discarded
+      } else if (pendingHandleList) {
+        // Unnamed media with a handle-list waiting for it → attribute to
+        // every handle in the list. Same cover sent to N pages.
+        for (const h of pendingHandleList) _addHandleEntry(h, msg);
+        foundAny = true;
+        pendingHandleList = null;
       } else {
-        // Media without an @-filename → shared bundle (e.g. slides 2-4
-        // for all pages). Collect newest-first; we'll reverse at the end
-        // to restore chronological order.
+        // Media without an @-filename and no handle-list → shared bundle
+        // (e.g. slides 2-4 for all pages). Collect newest-first; we'll
+        // reverse at the end to restore chronological order.
         sharedMedia.unshift(msg);
       }
 
@@ -388,10 +420,20 @@ function getFilenameBundlesByPage(chatId, adMessageId) {
       // Strong "previous ad" signal — stop here. Drop sharedMedia
       // collected up to now, those came from before the previous brief.
       sharedMedia.length = 0;
+      pendingHandleList = null;
       break;
+    } else if (HANDLE_LIST_RE.test(text)) {
+      // Set pending; will attribute the next media we encounter (going
+      // backwards = chronologically before this text). Replace any
+      // previous pending — only the closest list applies to a cover.
+      pendingHandleList = (text.match(/@([\w.]+)/g) || [])
+        .map((h) => h.slice(1).toLowerCase());
     } else {
       // Caption text, "13 Covers ^" annotation, admin chatter — skip and
-      // keep scanning. The strong-marker check above is the real boundary.
+      // keep scanning. An intervening non-handle-list text invalidates
+      // any pending list so we don't attribute a cover to handles that
+      // weren't actually adjacent.
+      pendingHandleList = null;
       continue;
     }
   }
