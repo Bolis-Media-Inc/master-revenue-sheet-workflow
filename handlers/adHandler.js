@@ -362,6 +362,191 @@ async function forwardToPage(telegram, sourceChatId, adMessageId, originalText, 
 /**
  * Main handler — called by the Telegraf bot for every incoming message.
  */
+/**
+ * /replay — re-run brief forwarding for a previously-processed brief.
+ *
+ * Triggered when an admin replies to a brief with "/replay" (optionally
+ * followed by specific @handles). Useful when forwarding failed for one
+ * or more pages (e.g., bot wasn't a member of the destination chat at
+ * the time of the original processing) and is now fixed.
+ *
+ * Skips master sheet write, per-page sheet write, mark-forwarded, and
+ * NIF reminder scheduling — those side effects were already done by the
+ * original processing run. Replay is PURE Telegram re-forwarding.
+ *
+ * Constraint: the brief + its preceding media must still be in the
+ * messageBuffer (capped at MAX_BUFFER_PER_CHAT = 30 messages per chat).
+ * If the buffer has aged out, surface a clear error.
+ */
+async function handleReplayCommand(ctx) {
+  const replyTo = ctx.message?.reply_to_message;
+  if (!replyTo) {
+    await ctx.reply("❌ `/replay` must be sent as a reply to the original brief.", { parse_mode: "Markdown" }).catch(() => {});
+    return;
+  }
+
+  // Parse requested handles from "/replay @x @y" — empty means "all pages"
+  const cmdText = (ctx.message?.text || "").trim();
+  const handleMatches = cmdText.match(/@([\w.]+)/g) || [];
+  const requestedHandles = handleMatches.map((h) => h.slice(1).toLowerCase());
+
+  const briefText = replyTo.text || replyTo.caption || "";
+  if (!briefText) {
+    await ctx.reply("❌ Replied message has no text — can't replay.").catch(() => {});
+    return;
+  }
+  const briefMessageId = replyTo.message_id;
+  const sourceChatId   = String(ctx.chat.id);
+
+  // Re-parse the brief
+  const briefDate = new Date((replyTo.date || Math.floor(Date.now() / 1000)) * 1000);
+  const parsed    = parseAdMessage(briefText, briefDate);
+  if (!parsed) {
+    await ctx.reply("❌ Couldn't parse replied message as an ad brief.").catch(() => {});
+    return;
+  }
+  const parsedList = Array.isArray(parsed) ? parsed : [parsed];
+
+  // Figure out which handles to target
+  const briefHandles = new Set(parsedList.map((p) => p.pageHandle?.toLowerCase()).filter(Boolean));
+  let targetHandles;
+  if (requestedHandles.length === 0) {
+    targetHandles = [...briefHandles];
+  } else {
+    const valid   = requestedHandles.filter((h) => briefHandles.has(h));
+    const invalid = requestedHandles.filter((h) => !briefHandles.has(h));
+    if (valid.length === 0) {
+      await ctx.reply(
+        `❌ None of those handles are in this brief.\n\n` +
+        `Brief lists: ${[...briefHandles].map((h) => "@" + h).join(", ") || "(none)"}`
+      ).catch(() => {});
+      return;
+    }
+    targetHandles = valid;
+    if (invalid.length > 0) {
+      console.warn(`[adHandler] /replay: ignoring handles not in brief: ${invalid.join(", ")}`);
+    }
+  }
+
+  // Filter to pages that are auto_forward + have a chat_id
+  const ready  = targetHandles.filter((h) => isPageEnabled(h) && pagesRegistry.getChatId(h));
+  const noFwd  = targetHandles.filter((h) => !isPageEnabled(h));
+  const noChat = targetHandles.filter((h) => isPageEnabled(h) && !pagesRegistry.getChatId(h));
+  if (ready.length === 0) {
+    let msg = "❌ No targetable handles.\n\n";
+    if (noFwd.length > 0)  msg += `auto_forward=false: ${noFwd.map((h) => "@" + h).join(", ")}\n`;
+    if (noChat.length > 0) msg += `No chat_id configured: ${noChat.map((h) => "@" + h).join(", ")}\n`;
+    await ctx.reply(msg.trim()).catch(() => {});
+    return;
+  }
+
+  // Re-build bundles from the messageBuffer (same logic as initial processing)
+  const collabBundles    = getCollabBundlesByPage(sourceChatId, briefMessageId);
+  const filenameBundles  = collabBundles ? null : getFilenameBundlesByPage(sourceChatId, briefMessageId);
+  const labelBundles     = (collabBundles || filenameBundles) ? null : getContentBundlesByPage(sourceChatId, briefMessageId);
+  const useCollab        = !!collabBundles    && collabBundles.byHandle.size    > 0;
+  const useFilenames     = !useCollab && !!filenameBundles && filenameBundles.byHandle.size > 0;
+  const useLabels        = !useCollab && !useFilenames && !!labelBundles && labelBundles.byHandle.size > 0;
+  const activeBundle     = useCollab ? collabBundles : useFilenames ? filenameBundles : useLabels ? labelBundles : null;
+  const sharedBundle     = activeBundle?.shared || { media: [], caption: null };
+  const fallbackMedia    = (!useCollab && !useFilenames && !useLabels)
+    ? getPrecedingMessages(sourceChatId, briefMessageId, 4)
+        .filter((m) => m.photo || m.video || m.document || m.animation)
+    : [];
+
+  const format = useCollab ? "collab" : useFilenames ? "filename" : useLabels ? "label" : "standard";
+  const hasMediaInBuffer =
+    (activeBundle && activeBundle.byHandle.size > 0) ||
+    sharedBundle.media.length > 0 ||
+    fallbackMedia.length > 0;
+
+  console.log(
+    `[adHandler] 🔁 /replay triggered — brief msg ${briefMessageId}, ${ready.length} target handle(s), format: ${format}, ` +
+    `attributed: ${activeBundle?.byHandle.size || 0}, shared media: ${sharedBundle.media.length}, fallback: ${fallbackMedia.length}`,
+  );
+
+  if (!hasMediaInBuffer && !sharedBundle.caption) {
+    await ctx.reply(
+      `⚠️ Brief is no longer in the bot's in-memory buffer (max 30 msgs).\n\n` +
+      `Will forward only the per-page brief text — no media will be re-attached.`
+    ).catch(() => {});
+  }
+
+  // Run forwarding loop
+  let ok = 0;
+  const errors = [];
+  const forwardedDestinations = new Set();
+
+  for (const handle of ready) {
+    const destChatId = String(pagesRegistry.getChatId(handle));
+    if (forwardedDestinations.has(destChatId)) {
+      console.log(`[adHandler]    ⏭️ /replay: skipping @${handle} — dest ${destChatId} already covered`);
+      continue;
+    }
+    forwardedDestinations.add(destChatId);
+
+    const perPageBundle = activeBundle
+      ? (activeBundle.byHandle.get(handle.toLowerCase()) || { media: [], caption: null })
+      : { media: fallbackMedia, caption: null };
+
+    try {
+      // 1. Per-page media
+      for (const m of perPageBundle.media) {
+        try {
+          await ctx.telegram.forwardMessage(destChatId, sourceChatId, m.message_id);
+        } catch (err) {
+          console.error(`[adHandler] ❌ /replay per-page msg ${m.message_id} → @${handle}: ${err.message}`);
+        }
+      }
+      if (perPageBundle.media.length > 0) {
+        console.log(`[adHandler] ✅ /replay forwarded ${perPageBundle.media.length} per-page msg(s) → @${handle}`);
+      }
+
+      // 2. Shared media
+      for (const m of sharedBundle.media) {
+        try {
+          await ctx.telegram.forwardMessage(destChatId, sourceChatId, m.message_id);
+        } catch (err) {
+          console.error(`[adHandler] ❌ /replay shared msg ${m.message_id} → @${handle}: ${err.message}`);
+        }
+      }
+      if (sharedBundle.media.length > 0) {
+        console.log(`[adHandler] ✅ /replay forwarded ${sharedBundle.media.length} shared msg(s) → @${handle}`);
+      }
+
+      // 3. Caption (per-page wins over shared)
+      const captionToSend = perPageBundle.caption || sharedBundle.caption;
+      if (captionToSend) {
+        await ctx.telegram.sendMessage(destChatId, captionToSend);
+        console.log(`[adHandler] 💬 /replay caption sent → @${handle}`);
+      }
+
+      // 4. Per-page brief (rewritten to just this page's row)
+      const parsedItem = parsedList.find((p) => p.pageHandle?.toLowerCase() === handle);
+      await forwardToPage(
+        ctx.telegram, sourceChatId, briefMessageId, briefText, destChatId, handle, parsedItem,
+      );
+
+      ok++;
+      console.log(`[adHandler] ✅ /replay complete for @${handle}`);
+    } catch (err) {
+      errors.push({ handle, msg: err.message });
+      console.error(`[adHandler] ❌ /replay @${handle}: ${err.message}`);
+    }
+  }
+
+  // Reply with summary
+  let reply = `🔁 *Replay summary*: ${ok}/${ready.length} sent`;
+  if (errors.length > 0) {
+    reply += `\n\n*Failures*:\n` + errors.map((e) => `• @${e.handle}: \`${e.msg.slice(0, 100)}\``).join("\n");
+  }
+  if (ready.length < targetHandles.length) {
+    const skipped = targetHandles.filter((h) => !ready.includes(h));
+    reply += `\n\n*Skipped* (not enabled or no chat): ${skipped.map((h) => "@" + h).join(", ")}`;
+  }
+  await ctx.reply(reply, { parse_mode: "Markdown" }).catch(() => {});
+}
+
 async function handleAdMessage(ctx) {
   try {
     const chatId = String(ctx.chat?.id);
@@ -376,6 +561,19 @@ async function handleAdMessage(ctx) {
     // Greg's API intake adds <!-- greg-handled --> as the first line of the brief
     // so bm_tracking_bot writes to sheets but doesn't re-forward content.
     const isGregHandled = /<!--\s*greg-handled\s*-->/i.test(text);
+
+    // ── /replay — re-run forwarding for a previously-processed brief ───────────
+    // Usage (as a reply to a brief in a TARGET chat):
+    //   /replay                       → retry every page in the brief
+    //   /replay @howeverythingworks   → retry one page
+    //   /replay @a @b @c              → retry multiple
+    //
+    // Re-uses the buffer's bundles + forwarder. Skips sheet writes + NIF
+    // reminders (those were done on the original processing). Bails clearly
+    // if the brief is no longer in the in-memory buffer (max 30 msgs).
+    if (/^\/replay\b/i.test(text.trim())) {
+      return await handleReplayCommand(ctx);
+    }
 
     // ── "Posted on" reply → flip matching rows from Scheduled → Live ───────────
     if (/^posted on\b/i.test(text.trim())) {
