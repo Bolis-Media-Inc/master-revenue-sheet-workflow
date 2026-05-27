@@ -149,18 +149,38 @@ function getContentBundlesByPage(chatId, adMessageId) {
       //   "@thefuck.tv ^"                              → handle only
       //   "@thefuck.tv ^"  (no @)                      → handle only
       //   "@thefuck.tv NEO just dropped! Read bio ^"   → handle + per-page caption
+      //   "@story ^" / "@stories ^"                    → SHARED bundle (special)
       //
       // First token (sans @, lowercased) is the handle. Anything between
       // handle and trailing ^ becomes the per-page caption text that will
       // be forwarded as a separate message after the media in that
       // page's IG Ads chat — useful when each page gets unique copy.
+      //
+      // Special tokens (@story / @stories) are NOT page handles — they're
+      // markers that the preceding media is meant to be posted to every
+      // page's Instagram Story alongside the main feed creative. We route
+      // the media to shared.media so it forwards to every attributed page.
       const labelText = text.slice(0, -1).trim();
       const firstSpace = labelText.search(/\s/);
       const handlePart = (firstSpace === -1 ? labelText : labelText.slice(0, firstSpace))
         .toLowerCase().replace(/^@/, "");
       const captionPart = firstSpace === -1 ? null : labelText.slice(firstSpace + 1).trim() || null;
-      byHandle.set(handlePart, { media: [...pendingContent], caption: captionPart });
-      pendingContent = [];
+
+      if (handlePart === "story" || handlePart === "stories") {
+        // Special marker — preceding media is Story content for every
+        // page. Route to shared.media so the forwarder sends it to all
+        // attributed pages alongside their per-page feed creative.
+        //
+        // pendingContent is already in chronological order (oldest first
+        // due to unshift collection). push preserves that order. Story
+        // labels encountered EARLIER in the backwards walk = chronologically
+        // NEWER media, so they come last in sharedMedia.
+        for (const m of pendingContent) sharedMedia.push(m);
+        pendingContent = [];
+      } else {
+        byHandle.set(handlePart, { media: [...pendingContent], caption: captionPart });
+        pendingContent = [];
+      }
 
     } else if (hasMedia) {
       // Content message — prepend so the final array stays chronological
@@ -185,9 +205,10 @@ function getContentBundlesByPage(chatId, adMessageId) {
   }
 
   // Anything left in pendingContent at the end = media that appeared
-  // before any label going backwards. These are unattributed — they
-  // belong to the shared bundle so every page receives them.
-  for (const m of pendingContent) sharedMedia.push(m);
+  // before any label going backwards = chronologically OLDER than any
+  // @story-flushed media already in sharedMedia. Prepend to preserve
+  // chronological order in sharedMedia.
+  sharedMedia.unshift(...pendingContent);
 
   return {
     byHandle,
