@@ -247,21 +247,113 @@ function buildRow(parsed) {
 }
 
 /**
- * Forward the ad brief to a page's Telegram destination channel.
+ * Build a per-page version of the brief — strips other pages from the
+ * PAGE INFO list and rewrites the header dollar amount to just this
+ * page's price. Matches the convention VAs follow when copy-pasting:
  *
- * Content (media/video) is now forwarded directly by Greg (wizard.js) at
- * submission time — bm_tracking_bot only forwards the brief message itself.
+ *   Phil Heave JerkMate - Sexual - $4,350         →   Phil Heave JerkMate - Sexual - $600
+ *
+ *   PAGE INFO:                                         PAGE INFO:
+ *   11:30am AZ / 2:30pm EST                            11:30am AZ / 2:30pm EST
+ *   @moist - $750                                      @thefuck.tv - $600
+ *   @dailyhumor_4u - $700
+ *   @i_have_no_memes96_v2 - $600
+ *   @thefuck.tv - $600
+ *   …
+ *
+ * Strategy: extract the original line for this handle verbatim (so any
+ * bulk numbers, parentheticals, or other annotations Danielson adds
+ * survive intact), and keep the INSTRUCTIONS section unchanged.
+ *
+ * Returns null when the brief can't be parsed cleanly (no PAGE INFO
+ * section, no matching handle line) so the caller can fall back to
+ * forwardMessage of the original.
+ */
+function buildPerPageBriefText(originalText, pageHandle, pagePriceFromParser) {
+  if (!originalText) return null;
+  const pageInfoIdx = originalText.search(/PAGE INFO:/i);
+  if (pageInfoIdx === -1) return null;
+
+  const headerPart = originalText.slice(0, pageInfoIdx);
+  const infoPart   = originalText.slice(pageInfoIdx);
+
+  // Find the original line for THIS handle inside PAGE INFO (verbatim).
+  // Escape dots for regex (handles like "thefuck.tv", "secrets.jp").
+  const handleEsc = pageHandle.replace(/[.\\]/g, "\\$&");
+  const pageLineRe = new RegExp(`^[ \\t]*\\(?[^@\\n]*@${handleEsc}\\b.*$`, "mi");
+  const pageLineMatch = infoPart.match(pageLineRe);
+  if (!pageLineMatch) return null; // handle not present in PAGE INFO list
+  const pageLine = pageLineMatch[0].trim();
+
+  // Extract the time / date header line (first non-empty, non-@ line after
+  // "PAGE INFO:"). Preserves whatever format Danielson used.
+  const infoLines = infoPart.split("\n");
+  let timeLine = "";
+  for (let i = 1; i < infoLines.length; i++) {
+    const t = infoLines[i].trim();
+    if (!t) continue;
+    if (t.startsWith("@") || /^\(/.test(t)) break; // hit the page list
+    timeLine = t;
+    break;
+  }
+
+  // Rewrite header price to this page's. Matches "$<number>" at end of
+  // the FIRST line (the header). Leaves rest of headerPart (INSTRUCTIONS,
+  // senior tags, bullets) untouched.
+  //
+  // Use function replacer (not string with $N backrefs) because the
+  // pricePart contains "$<number>" and "$100" / "$200" etc. would otherwise
+  // be parsed as group-N backreferences by String.replace.
+  const pricePart = pagePriceFromParser != null ? `$${pagePriceFromParser}` : "$0";
+  const newHeader = headerPart.replace(
+    /^([^\n]+?)\s*-\s*\$[\d,]+(?:\.\d+)?(\s*\n)/,
+    (_match, g1, g2) => `${g1} - ${pricePart}${g2}`,
+  );
+
+  // Reassemble. Preserve any whitespace style by re-using a typical layout.
+  const trimmedHeader = newHeader.trimEnd();
+  return `${trimmedHeader}\n\nPAGE INFO:\n\n${timeLine ? timeLine + "\n\n" : ""}${pageLine}`;
+}
+
+/**
+ * Send a per-page version of the ad brief to a page's Telegram destination.
+ *
+ * Previously this was a `forwardMessage` that re-sent the full brief (every
+ * page + every price). Now we rebuild a brief that contains only THIS page's
+ * row + THIS page's price in the header — matches how VAs manually format
+ * briefs in IG Ads chats. If the rewrite fails (parser couldn't isolate the
+ * handle), falls back to forwardMessage of the original brief so the chat
+ * still gets something.
+ *
+ * Content (media/video) is forwarded separately upstream — bm_tracking_bot
+ * only handles the brief text here.
  *
  * @param {object} telegram        ctx.telegram (Telegraf Telegram instance)
  * @param {string} sourceChatId    The group the ad came from
- * @param {number} adMessageId     The ad brief's message_id
+ * @param {number} adMessageId     The ad brief's message_id (for fallback forward)
+ * @param {string} originalText    The original brief's text (for rewriting)
  * @param {string} destChatId      Destination Telegram chat ID (page's group/DM)
- * @param {string} pageHandle      For logging
+ * @param {string} pageHandle      Page handle (e.g. "thefuck.tv")
+ * @param {object} parsedItem      Parsed item for this page (gives adPrice, etc.)
  */
-async function forwardToPage(telegram, sourceChatId, adMessageId, destChatId, pageHandle) {
+async function forwardToPage(telegram, sourceChatId, adMessageId, originalText, destChatId, pageHandle, parsedItem) {
+  const perPageText = buildPerPageBriefText(originalText, pageHandle, parsedItem?.adPrice);
+  if (perPageText) {
+    try {
+      await telegram.sendMessage(destChatId, perPageText);
+      console.log(`[adHandler] ✅ Per-page brief @${pageHandle} → ${destChatId} ($${parsedItem?.adPrice ?? "?"})`);
+      return;
+    } catch (err) {
+      console.error(`[adHandler] ❌ Per-page brief @${pageHandle} → ${destChatId}: ${err.message} — falling back to original forward`);
+    }
+  } else {
+    console.warn(`[adHandler] ⚠️ Couldn't build per-page brief for @${pageHandle} — using original forward`);
+  }
+
+  // Fallback: forward the original brief verbatim
   try {
     await telegram.forwardMessage(destChatId, sourceChatId, adMessageId);
-    console.log(`[adHandler] ✅ Forward brief @${pageHandle} → ${destChatId}`);
+    console.log(`[adHandler] ✅ Forward brief @${pageHandle} → ${destChatId} (full brief, rewrite skipped)`);
   } catch (err) {
     console.error(`[adHandler] ❌ Forward brief @${pageHandle} → ${destChatId}: ${err.message}`);
   }
@@ -678,12 +770,17 @@ async function handleAdMessage(ctx) {
         }
 
         try {
+          // Find the parsed item for THIS handle so the per-page brief
+          // rewrite can use the right price + bulkNum + nif.
+          const parsedItem = parsedList.find((p) => p.pageHandle === handle);
           await forwardToPage(
             ctx.telegram,
             sourceChatId,
             adMessageId,
+            ctx.message?.text || ctx.message?.caption || "",
             String(destChatId),
-            handle
+            handle,
+            parsedItem
           );
           forwardOk++;
 
