@@ -13,7 +13,7 @@
 
 const { parseAdMessage }       = require("../parser");
 const { appendRow, markForwarded, updateStatusToLive, updateAdDate, appendReminder } = require("../sheets");
-const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getPrecedingMessages } = require("../messageBuffer");
+const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
 const pagesRegistry            = require("../lib/pages");
@@ -379,30 +379,107 @@ async function forwardToPage(telegram, sourceChatId, adMessageId, originalText, 
  * If the buffer has aged out, surface a clear error.
  */
 async function handleReplayCommand(ctx) {
-  const replyTo = ctx.message?.reply_to_message;
-  if (!replyTo) {
-    await ctx.reply("❌ `/replay` must be sent as a reply to the original brief.", { parse_mode: "Markdown" }).catch(() => {});
+  // Admin gate — /replay re-triggers forwards, so restrict to the bot's
+  // configured admin. WIZARD_ADMIN_USER_ID is the numeric Telegram user
+  // ID set in env (5849045894 = Connor on master-revenue-sheet-workflow).
+  const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+  if (adminId && ctx.from?.id !== adminId) {
+    console.log(`[adHandler] /replay denied — user ${ctx.from?.id} is not admin (${adminId})`);
     return;
   }
 
-  // Parse requested handles from "/replay @x @y" — empty means "all pages"
   const cmdText = (ctx.message?.text || "").trim();
   const handleMatches = cmdText.match(/@([\w.]+)/g) || [];
   const requestedHandles = handleMatches.map((h) => h.slice(1).toLowerCase());
 
-  const briefText = replyTo.text || replyTo.caption || "";
-  if (!briefText) {
-    await ctx.reply("❌ Replied message has no text — can't replay.").catch(() => {});
-    return;
-  }
-  const briefMessageId = replyTo.message_id;
-  const sourceChatId   = String(ctx.chat.id);
+  // Two paths to find the brief:
+  //   1. Reply mode — reply to the brief, use reply_to_message
+  //   2. Search mode — campaign name follows /replay (before any @handles)
+  let briefText, briefMessageId, sourceChatId, briefDate;
+  const replyTo = ctx.message?.reply_to_message;
 
-  // Re-parse the brief
-  const briefDate = new Date((replyTo.date || Math.floor(Date.now() / 1000)) * 1000);
-  const parsed    = parseAdMessage(briefText, briefDate);
+  if (replyTo) {
+    // Reply mode
+    briefText      = replyTo.text || replyTo.caption || "";
+    briefMessageId = replyTo.message_id;
+    sourceChatId   = String(ctx.chat.id);
+    briefDate      = new Date((replyTo.date || Math.floor(Date.now() / 1000)) * 1000);
+    if (!briefText) {
+      await ctx.reply("❌ Replied message has no text — can't replay.").catch(() => {});
+      return;
+    }
+  } else {
+    // Search mode — strip "/replay" + handle mentions to get the campaign name
+    const campaignName = cmdText
+      .replace(/^\/replay\s*/i, "")
+      .replace(/@[\w.]+/g, "")
+      .trim();
+    if (!campaignName) {
+      await ctx.reply(
+        "❌ Usage:\n" +
+        "• Reply to a brief with `/replay [@handle …]`\n" +
+        "• Or type `/replay <campaign name> @handle [@handle …]`\n\n" +
+        "Example: `/replay stake bet slip day 5 @howeverythingworks`",
+        { parse_mode: "Markdown" }
+      ).catch(() => {});
+      return;
+    }
+    if (requestedHandles.length === 0) {
+      await ctx.reply(
+        `❌ Search mode requires at least one @handle. ` +
+        `Example: \`/replay ${campaignName} @howeverythingworks\``,
+        { parse_mode: "Markdown" }
+      ).catch(() => {});
+      return;
+    }
+
+    // Search each TARGET chat's buffer for a brief matching this campaign name.
+    // Match = every word in the query appears in the brief's client field
+    // (case-insensitive). Walks newest → oldest so we hit the most recent
+    // matching brief if multiple exist.
+    const queryWords = campaignName.toLowerCase().split(/\s+/).filter(Boolean);
+    let match = null;
+    outer: for (const tc of TARGET_CHAT_IDS) {
+      const msgs = getMessages(tc);
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const msg = msgs[i];
+        const t = msg.text || msg.caption || "";
+        if (!t) continue;
+        const parsed = parseAdMessage(t, new Date((msg.date || 0) * 1000));
+        if (!parsed) continue;
+        const items = Array.isArray(parsed) ? parsed : [parsed];
+        const briefClient = (items[0]?.client || "").toLowerCase();
+        if (!briefClient) continue;
+        if (queryWords.every((w) => briefClient.includes(w))) {
+          match = { msg, chatId: tc, items, parsedClient: items[0]?.client };
+          break outer;
+        }
+      }
+    }
+
+    if (!match) {
+      await ctx.reply(
+        `❌ Couldn't find a brief matching "${campaignName}" in the bot's recent buffers ` +
+        `(last 30 msgs of Internal Network Ads + AI TEST).\n\n` +
+        `Either the brief aged out or the name doesn't match. ` +
+        `Try replying to the brief directly with \`/replay @${requestedHandles.join(" @")}\` instead.`,
+        { parse_mode: "Markdown" }
+      ).catch(() => {});
+      return;
+    }
+
+    briefText      = match.msg.text || match.msg.caption || "";
+    briefMessageId = match.msg.message_id;
+    sourceChatId   = match.chatId;
+    briefDate      = new Date((match.msg.date || 0) * 1000);
+    console.log(`[adHandler] 🔁 /replay search found "${match.parsedClient}" in chat ${sourceChatId} (msg ${briefMessageId})`);
+  }
+
+  // Re-parse the brief (search mode parsed once already, but re-parse for
+  // consistency — cheap and ensures parsedList is always available below)
+  const parsed = parseAdMessage(briefText, briefDate);
   if (!parsed) {
-    await ctx.reply("❌ Couldn't parse replied message as an ad brief.").catch(() => {});
+    await ctx.reply("❌ Couldn't parse the brief.").catch(() => {});
     return;
   }
   const parsedList = Array.isArray(parsed) ? parsed : [parsed];
@@ -549,31 +626,33 @@ async function handleReplayCommand(ctx) {
 
 async function handleAdMessage(ctx) {
   try {
+    const text = ctx.message?.text || ctx.message?.caption;
+
+    // ── /replay — re-run forwarding for a previously-processed brief ───────────
+    // Runs BEFORE the TARGET_CHAT_IDS gate so it can be invoked from any
+    // chat the bot is in (e.g. Monetization Team + AI). Admin-only via
+    // WIZARD_ADMIN_USER_ID check inside the handler.
+    //
+    // Two usage modes:
+    //   • Reply mode — reply to a brief in any chat; "/replay [@handles…]"
+    //   • Search mode — type "/replay <campaign name> @handle [@handle…]"
+    //                   from anywhere. The bot searches its in-memory
+    //                   buffers (TARGET_CHAT_IDS) for the brief by name.
+    if (text && /^\/replay\b/i.test(text.trim())) {
+      return await handleReplayCommand(ctx);
+    }
+
     const chatId = String(ctx.chat?.id);
 
     // Only process messages from allowed groups (production + any test groups)
     if (TARGET_CHAT_IDS.size > 0 && !TARGET_CHAT_IDS.has(chatId)) return;
 
-    const text = ctx.message?.text || ctx.message?.caption;
     if (!text) return;
 
     // ── Greg-handled brief → skip forwarding (Greg already forwarded per-page) ─
     // Greg's API intake adds <!-- greg-handled --> as the first line of the brief
     // so bm_tracking_bot writes to sheets but doesn't re-forward content.
     const isGregHandled = /<!--\s*greg-handled\s*-->/i.test(text);
-
-    // ── /replay — re-run forwarding for a previously-processed brief ───────────
-    // Usage (as a reply to a brief in a TARGET chat):
-    //   /replay                       → retry every page in the brief
-    //   /replay @howeverythingworks   → retry one page
-    //   /replay @a @b @c              → retry multiple
-    //
-    // Re-uses the buffer's bundles + forwarder. Skips sheet writes + NIF
-    // reminders (those were done on the original processing). Bails clearly
-    // if the brief is no longer in the in-memory buffer (max 30 msgs).
-    if (/^\/replay\b/i.test(text.trim())) {
-      return await handleReplayCommand(ctx);
-    }
 
     // ── "Posted on" reply → flip matching rows from Scheduled → Live ───────────
     if (/^posted on\b/i.test(text.trim())) {

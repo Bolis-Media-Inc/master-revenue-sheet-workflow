@@ -513,4 +513,13 @@ function clearBufferUpTo(chatId, upToMessageId) {
   }
 }
 
-module.exports = { addMessage, getPrecedingMessages, getContentBundlesByPage, getCollabBundlesByPage, getFilenameBundlesByPage, clearBufferUpTo, MAX_BUFFER_PER_CHAT };
+/**
+ * Return the raw buffer for a chat — used by /replay to scan past
+ * messages for a brief matching a campaign name. Caller-side is
+ * responsible for parsing each candidate.
+ */
+function getMessages(chatId) {
+  return _buffers.get(String(chatId)) || [];
+}
+
+module.exports = { addMessage, getPrecedingMessages, getContentBundlesByPage, getCollabBundlesByPage, getFilenameBundlesByPage, getMessages, clearBufferUpTo, MAX_BUFFER_PER_CHAT };
