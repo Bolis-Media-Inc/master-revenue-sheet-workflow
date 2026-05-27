@@ -132,6 +132,10 @@ function getContentBundlesByPage(chatId, adMessageId) {
   const byHandle = new Map();
   const sharedMedia = []; // media not claimed by any label going backwards
   let pendingContent = []; // media collected since the last label (going backwards)
+  // Set true when we encounter a Story label with no pending media (i.e.
+  // label-AFTER-media convention). The very next media we see going
+  // backwards is the story creative and routes to sharedMedia.
+  let nextMediaIsStory = false;
 
   for (let i = preceding.length - 1; i >= 0; i--) {
     const msg  = preceding[i];
@@ -167,24 +171,51 @@ function getContentBundlesByPage(chatId, adMessageId) {
       const captionPart = firstSpace === -1 ? null : labelText.slice(firstSpace + 1).trim() || null;
 
       if (handlePart === "story" || handlePart === "stories") {
-        // Special marker — preceding media is Story content for every
-        // page. Route to shared.media so the forwarder sends it to all
-        // attributed pages alongside their per-page feed creative.
+        // Story label has TWO valid conventions:
+        //   (1) label-BEFORE-media (legacy):
+        //         "@story ^"
+        //         story_creative
+        //         brief
+        //       Walking backwards, story_creative lands in pendingContent
+        //       before we hit "@story ^". On flush, pendingContent moves
+        //       into sharedMedia.
         //
-        // pendingContent is already in chronological order (oldest first
-        // due to unshift collection). push preserves that order. Story
-        // labels encountered EARLIER in the backwards walk = chronologically
-        // NEWER media, so they come last in sharedMedia.
-        for (const m of pendingContent) sharedMedia.push(m);
-        pendingContent = [];
+        //   (2) label-AFTER-media (Danielson's preferred form):
+        //         story_creative
+        //         "Story ^"
+        //         brief
+        //       Walking backwards, we see "Story ^" first when
+        //       pendingContent is empty. We can't flush anything yet —
+        //       set nextMediaIsStory so the next media we walk into gets
+        //       routed to sharedMedia instead of pendingContent.
+        //
+        // Picking the convention by inspecting pendingContent at the
+        // moment of label encounter lets BOTH forms work without the
+        // operator declaring which they used.
+        if (pendingContent.length > 0) {
+          for (const m of pendingContent) sharedMedia.push(m);
+          pendingContent = [];
+        } else {
+          nextMediaIsStory = true;
+        }
       } else {
         byHandle.set(handlePart, { media: [...pendingContent], caption: captionPart });
         pendingContent = [];
       }
 
     } else if (hasMedia) {
-      // Content message — prepend so the final array stays chronological
-      pendingContent.unshift(msg);
+      if (nextMediaIsStory) {
+        // The Story ^ label we just walked past claims THIS media as
+        // story content. Route directly to sharedMedia, NOT pendingContent
+        // (so it doesn't get re-attributed to whatever per-page label
+        // comes next going backwards). Unshift = prepend to keep chrono
+        // order in sharedMedia.
+        sharedMedia.unshift(msg);
+        nextMediaIsStory = false;
+      } else {
+        // Content message — prepend so the final array stays chronological
+        pendingContent.unshift(msg);
+      }
 
     } else if (!text) {
       // Empty / service message — skip
@@ -195,6 +226,7 @@ function getContentBundlesByPage(chatId, adMessageId) {
       // Anything still in pendingContent is from BEFORE the previous
       // brief; safer to drop than to attribute to the current ad.
       pendingContent = [];
+      nextMediaIsStory = false;
       break;
 
     } else {
