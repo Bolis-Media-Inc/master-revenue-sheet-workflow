@@ -208,8 +208,8 @@ function buildPageRow(parsed) {
     parsed.category      || "",  // B: Ad Type
     parsed.bulkNum       || "",  // C: Bulk #
     parsed.datePosted    || "",  // D: Date Posted
-    parsed.postType      || "",  // E: Post Type (Reels, Carousel, etc.)
-    parsed.nif           || "",  // F: Post Duration (Permanent, 24hr, etc.)
+    parsed.postType      || "",  // E: Post Type (Reels, Carousel, Story, Feed)
+    parsed.postDuration  || "",  // F: Post Duration (Permanent, 24hr, 30 Days, etc.)
     parsed.adPrice != null ? `$${parsed.adPrice}` : "", // G: Ad Price
     "",                          // H: Notes
   ];

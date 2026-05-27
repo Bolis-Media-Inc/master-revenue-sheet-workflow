@@ -114,8 +114,23 @@ function parseAdMessage(text, date) {
   }
 
   // ── INSTRUCTIONS section ─────────────────────────────────────────────────────
-  let postType = "";
-  let nif      = "";   // NIF / Perm / duration — maps to column K
+  // Three distinct fields extracted from the INSTRUCTIONS block:
+  //
+  //   postType     — Feed / Reels / Carousel / Story
+  //                  (normalized to one canonical token, NOT the whole line)
+  //   postDuration — Permanent / 24hr / 30 Days etc.
+  //                  (how long the post stays up — column F on per-page sheet)
+  //   nif          — 30 MIN NIF / 1hr NIF etc.
+  //                  (no-impression-feed window — column K on master sheet)
+  //
+  // Previously postDuration and nif were conflated into a single `nif` field
+  // that landed in both columns, producing rows like:
+  //    Post Type: "FEED POST"     ← whole line captured, not normalized
+  //    Post Duration: "30 MIN NIF" ← actually the NIF, not the duration
+  // Fixed: separate them, normalize postType to canonical token.
+  let postType     = "";
+  let postDuration = "";
+  let nif          = "";
 
   const instrIdx = lines.findIndex((l) =>
     l.replace(/\*/g, "").toLowerCase().includes("instructions")
@@ -127,36 +142,64 @@ function parseAdMessage(text, date) {
       l.replace(/^[-*•]\s*/, "").replace(/\*/g, "").trim()
     );
 
-    // Post type (feed / reels / carousel / story)
-    const typeKeywords = ["feed", "reel", "reels", "carousel", "story", "stories"];
+    // ── Post type — normalize to canonical token ───────────────────────────
+    // Match order matters: check "reels" before "reel" (substring),
+    // "stories" before "story", "carousel" first since it's unique.
+    const POST_TYPE_MAP = [
+      { pat: /\bcarousel\b/i,  out: "Carousel" },
+      { pat: /\breels?\b/i,    out: "Reels"    },
+      { pat: /\bstor(?:y|ies)\b/i, out: "Story" },
+      { pat: /\bfeed\b/i,      out: "Feed"     }, // checked last so "feed post" doesn't override more specific types
+    ];
     for (const instr of instrLines) {
-      if (typeKeywords.some((k) => instr.toLowerCase().includes(k))) {
-        postType = instr.charAt(0).toUpperCase() + instr.slice(1);
-        break;
+      let matched = false;
+      for (const t of POST_TYPE_MAP) {
+        if (t.pat.test(instr)) { postType = t.out; matched = true; break; }
       }
+      if (matched) break;
     }
 
-    // NIF / duration — prefer lines with "NIF" explicitly, then fall back to perm/duration keywords
-    // Priority 1: explicit NIF mention (e.g. "1hr NIF", "30min NIF")
+    // ── NIF — explicit "<duration> NIF" only ───────────────────────────────
     for (const instr of instrLines) {
       if (/\bnif\b/i.test(instr)) {
-        nif = instr.charAt(0).toUpperCase() + instr.slice(1);
+        // Capture e.g. "30 MIN NIF" / "1hr NIF" verbatim (master sheet K)
+        nif = instr.trim();
         break;
       }
     }
-    // Priority 2: perm / duration keywords
-    if (!nif) {
-      const nifKeywords = ["perm", "do not delete", "24h", "48h", "hour", "week", "month", "permanent"];
-      for (const instr of instrLines) {
-        if (nifKeywords.some((k) => instr.toLowerCase().includes(k))) {
-          nif = instr.charAt(0).toUpperCase() + instr.slice(1);
-          break;
-        }
+
+    // ── Post duration — how long the post lives ────────────────────────────
+    // Separate from NIF: NIF is the testing window, duration is post lifetime.
+    // "Permanent" / "Do not delete" / "Leave as permanent" → "Permanent"
+    // "24h" / "24 hr" / "24 hours" → "24hr"
+    // "30 days" → "30 Days"
+    const DURATION_MAP = [
+      { pat: /\b(?:permanent|do not delete|leave as perm|never delete)\b/i,
+        fn: () => "Permanent" },
+      { pat: /\b(\d+)\s*h(?:r|our)?s?\b/i,
+        fn: (m) => `${m[1]}hr` },
+      { pat: /\b(\d+)\s*day/i,
+        fn: (m) => `${m[1]} Days` },
+      { pat: /\b(\d+)\s*week/i,
+        fn: (m) => `${m[1]} Week${m[1] === "1" ? "" : "s"}` },
+      { pat: /\b(\d+)\s*month/i,
+        fn: (m) => `${m[1]} Month${m[1] === "1" ? "" : "s"}` },
+    ];
+    for (const instr of instrLines) {
+      // Skip the NIF line so we don't accidentally pull its duration
+      if (/\bnif\b/i.test(instr)) continue;
+      for (const d of DURATION_MAP) {
+        const m = instr.match(d.pat);
+        if (m) { postDuration = d.fn(m); break; }
       }
+      if (postDuration) break;
     }
 
+    // Fallback: if no postType match in any line, use first instruction line's
+    // first word (preserves old behavior for bare "Reel" / "Carousel" briefs).
     if (!postType && instrLines.length > 0) {
-      postType = instrLines[0].charAt(0).toUpperCase() + instrLines[0].slice(1);
+      const firstWord = instrLines[0].split(/\s+/)[0];
+      postType = firstWord.charAt(0).toUpperCase() + firstWord.slice(1).toLowerCase();
     }
   }
 
@@ -170,7 +213,7 @@ function parseAdMessage(text, date) {
     year:    "2-digit",
   });
 
-  const base = { client, category, postType, nif, datePosted, timeMST };
+  const base = { client, category, postType, postDuration, nif, datePosted, timeMST };
 
   if (pageEntries.length === 0) {
     return { ...base, adPrice, pageHandle: null, bulkNum: "" };
