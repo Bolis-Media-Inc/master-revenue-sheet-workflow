@@ -7,7 +7,13 @@
  * that precedes an ad brief, we store the last N messages as they come in.
  */
 
-const MAX_BUFFER_PER_CHAT = 30; // keep last 30 messages per group
+// Buffer cap per chat. Used to be 30, which was fine when /replay
+// didn't exist. Now /replay walks the buffer to find prior briefs by
+// name — for an active chat like Internal Network Ads (~5-10 briefs/hr
+// × ~5-15 msgs per brief) 30 = ~15min window before briefs age out.
+// 100 ≈ 1 hour of headroom on a heavy day. Still RAM-cheap (~250KB
+// per chat with full Telegram message objects).
+const MAX_BUFFER_PER_CHAT = 100;
 
 // Map<chatId (string), Array<TelegramMessage>>
 const _buffers = new Map();
