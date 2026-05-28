@@ -65,41 +65,32 @@ async function _throttled(fn) {
 }
 
 /**
- * Return a Proxy-wrapped Sheets client where every leaf method call
- * (.get, .update, .batchUpdate, .append, .values.batchUpdate, etc.) is
- * automatically routed through the rate limiter. Replaces the raw
- * `google.sheets({version: "v4", auth})` so we don't have to wrap each
- * of the ~35 call sites manually.
- *
- * The proxy recurses through property access — accessing
- * `sheets.spreadsheets.values.get` walks 3 levels deep, each property
- * returning another proxy until we hit the function. The function
- * itself is wrapped to `await _throttle()` before invocation.
- */
-function _wrapThrottle(target) {
-  return new Proxy(target, {
-    get(obj, prop) {
-      const val = obj[prop];
-      if (typeof val === "function") {
-        return async (...args) => {
-          await _throttle();
-          return val.apply(obj, args);
-        };
-      }
-      if (val !== null && typeof val === "object") {
-        return _wrapThrottle(val);
-      }
-      return val;
-    },
-  });
-}
-
-/**
  * Drop-in replacement for `google.sheets({version, auth})` that returns
- * a rate-limited client. Use this instead of the raw factory throughout.
+ * a rate-limited client. Hand-rolled wrapper (not Proxy-based) because
+ * googleapis defines `spreadsheets` as non-configurable+non-writable
+ * on the Resource object, and the ES Proxy spec forbids returning a
+ * different value (like a wrapped sub-proxy) for such properties —
+ * tripping a "proxy did not return its actual value" TypeError.
+ *
+ * Instead, we manually wrap the 6 methods we actually call so each one
+ * awaits the rate limiter before invoking. Adding a new method later
+ * just means adding one more line here.
  */
 function getThrottledSheets(authClient) {
-  return _wrapThrottle(google.sheets({ version: "v4", auth: authClient }));
+  const sheets = google.sheets({ version: "v4", auth: authClient });
+  const t = (fn) => (...args) => _throttle().then(() => fn(...args));
+  return {
+    spreadsheets: {
+      get:         t(sheets.spreadsheets.get.bind(sheets.spreadsheets)),
+      batchUpdate: t(sheets.spreadsheets.batchUpdate.bind(sheets.spreadsheets)),
+      values: {
+        get:         t(sheets.spreadsheets.values.get.bind(sheets.spreadsheets.values)),
+        update:      t(sheets.spreadsheets.values.update.bind(sheets.spreadsheets.values)),
+        append:      t(sheets.spreadsheets.values.append.bind(sheets.spreadsheets.values)),
+        batchUpdate: t(sheets.spreadsheets.values.batchUpdate.bind(sheets.spreadsheets.values)),
+      },
+    },
+  };
 }
 
 /**
