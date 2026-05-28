@@ -899,6 +899,10 @@ async function handleSyncSheetsCommand(ctx) {
   let masterWritten = 0, masterAlreadyOk = 0, masterFailed = 0;
   let pageWritten   = 0, pageAlreadyOk   = 0, pageFailed   = 0, pageSkippedNoSheet = 0;
   const errors = [];
+  // Collect master rows that need Forwarded ✅ — pages that DB shows as
+  // forwarded but whose master row was just written by us (so the
+  // original markForwarded batched never saw the row number).
+  const masterRowsToTickForwarded = [];
 
   for (const row of incomplete) {
     const brief = row.brief;
@@ -927,6 +931,10 @@ async function handleSyncSheetsCommand(ctx) {
           applyCenterAlignmentBatch(MASTER_SHEET_ID, TAB_NAME, [rowNum], "K").catch(() => {});
           masterWritten++;
           console.log(`[adHandler] 🩹 /syncsheets: master row ${rowNum} → ${brief.client} / @${row.page_handle}`);
+          // If the page was already forwarded (per DB), the original
+          // markForwardedBatch never saw this row number (sheet write
+          // had failed at that point). Queue for batched tick at end.
+          if (row.forwarded_at) masterRowsToTickForwarded.push(rowNum);
         }
       } catch (err) {
         masterFailed++;
@@ -967,6 +975,21 @@ async function handleSyncSheetsCommand(ctx) {
     }
   }
 
+  // Tick Forwarded ✅ on master rows that were already forwarded per DB
+  // but whose row number wasn't known when the original markForwardedBatch
+  // ran. Batched into one API call to stay efficient.
+  let forwardedTicked = 0;
+  if (masterRowsToTickForwarded.length > 0 && MASTER_SHEET_ID) {
+    try {
+      await markForwardedBatch(MASTER_SHEET_ID, TAB_NAME, masterRowsToTickForwarded);
+      forwardedTicked = masterRowsToTickForwarded.length;
+      console.log(`[adHandler] 🩹 /syncsheets: ticked ${forwardedTicked} Forwarded checkbox(es)`);
+    } catch (err) {
+      console.error(`[adHandler] ❌ /syncsheets markForwarded: ${err.message}`);
+      errors.push(`markForwarded: ${err.message}`);
+    }
+  }
+
   // Build a human summary
   const lines = [
     `🩹 *SyncSheets done*${clientFilter ? ` (filter: \`${clientFilter}\`)` : ""}`,
@@ -975,6 +998,7 @@ async function handleSyncSheetsCommand(ctx) {
     `  ✅ wrote ${masterWritten}`,
     `  ⏭️  already ok ${masterAlreadyOk}`,
     masterFailed > 0 ? `  ❌ failed ${masterFailed}` : null,
+    forwardedTicked > 0 ? `  ✅ ticked Forwarded ${forwardedTicked}` : null,
     "",
     `*Per-page sheets*:`,
     `  ✅ wrote ${pageWritten}`,
