@@ -543,9 +543,13 @@ async function handleReplayCommand(ctx) {
   );
 
   if (!hasMediaInBuffer && !sharedBundle.caption) {
+    // Brief itself was found (otherwise we'd have errored out earlier) — what's
+    // missing is the *media bundle* (covers / slides / caption). For text-only
+    // briefs (e.g. Stake bet slips, where pages create their own clips) this
+    // is the expected case, not an error. Phrase it accordingly.
     await ctx.reply(
-      `⚠️ Brief is no longer in the bot's in-memory buffer (max 30 msgs).\n\n` +
-      `Will forward only the per-page brief text — no media will be re-attached.`
+      `ℹ️ No media bundle attached to this brief — forwarding the per-page brief text only.\n\n` +
+      `(Normal for text-only campaigns like Stake bet slips. If media *was* expected, the brief is older than the bot's in-memory buffer.)`
     ).catch(() => {});
   }
 
