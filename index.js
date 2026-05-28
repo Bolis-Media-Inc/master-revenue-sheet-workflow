@@ -12,7 +12,7 @@ const cron = require("node-cron");
 const { Telegraf } = require("telegraf");
 const { handleAdMessage }    = require("./handlers/adHandler");
 const { handleAuditCommand } = require("./handlers/auditHandler");
-const { addMessage }         = require("./messageBuffer");
+const { addMessage, hydrateFromDb } = require("./messageBuffer");
 const { checkAndFireReminders } = require("./reminders");
 
 // ── Validate required env vars ─────────────────────────────────────────────────
@@ -156,6 +156,15 @@ if (WEBHOOK_URL) {
 
   server.listen(PORT, async () => {
     console.log(`✅ HTTP server listening on port ${PORT}`);
+    // Restore in-memory buffer from Supabase BEFORE registering the
+    // webhook so the first brief post-redeploy can resolve its preceding
+    // media. Without this, mid-flow redeploys wipe the buffer and the
+    // brief lands with no media to attribute.
+    try {
+      await hydrateFromDb();
+    } catch (err) {
+      console.error("❌ messageBuffer hydration failed:", err.message);
+    }
     try {
       await bot.telegram.setWebhook(webhookFullUrl, { drop_pending_updates: true });
       const info = await bot.telegram.getWebhookInfo();
@@ -168,10 +177,14 @@ if (WEBHOOK_URL) {
     }
   });
 } else {
-  // Local dev
-  bot.launch().then(() =>
-    console.log("✅ Revenue Sheet Workflow running via polling (local dev)")
-  );
+  // Local dev — hydrate before polling starts so /replay etc. work
+  hydrateFromDb()
+    .catch((err) => console.error("❌ messageBuffer hydration failed:", err.message))
+    .finally(() => {
+      bot.launch().then(() =>
+        console.log("✅ Revenue Sheet Workflow running via polling (local dev)")
+      );
+    });
 }
 
 // In webhook mode bot.stop() throws "Bot is not running!" — just close the HTTP server gracefully

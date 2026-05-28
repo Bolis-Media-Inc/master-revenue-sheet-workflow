@@ -18,6 +18,65 @@ const MAX_BUFFER_PER_CHAT = 100;
 // Map<chatId (string), Array<TelegramMessage>>
 const _buffers = new Map();
 
+// ── Persistence layer ─────────────────────────────────────────────────────
+// In-memory buffer dies on every Railway redeploy / crash. To prevent
+// in-flight collab/multi-msg briefs from breaking when we deploy fixes,
+// mirror every message to Supabase message_buffer table. On startup,
+// hydrate the in-memory buffer from the last MAX_BUFFER_PER_CHAT rows
+// per chat. Bundle scanners are unchanged — they still read the
+// in-memory _buffers Map.
+//
+// Schema: migrations/013_message_buffer.sql
+// Fail-soft: if Supabase isn't configured, everything still works in-
+// memory only (same behavior as before this layer was added).
+const { createClient } = require("@supabase/supabase-js");
+const _supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
+  : null;
+
+if (!_supabase) {
+  console.warn("[messageBuffer] SUPABASE_URL not set — persistence disabled, buffer is RAM-only");
+}
+
+/**
+ * Hydrate the in-memory buffer from Supabase on startup. Must be awaited
+ * before the webhook starts processing messages.
+ */
+async function hydrateFromDb() {
+  if (!_supabase) return;
+  try {
+    // Pull the last MAX_BUFFER_PER_CHAT rows per chat — Postgres doesn't
+    // do per-group LIMIT easily, so just grab the most recent N=10000
+    // rows total (safe over-fetch for ~100 chats × 100 msgs) and group
+    // in code. Cheap; runs once at boot.
+    const { data, error } = await _supabase
+      .from("message_buffer")
+      .select("chat_id, message_json, received_at")
+      .order("received_at", { ascending: false })
+      .limit(10000);
+    if (error) { console.error("[messageBuffer] hydrateFromDb error:", error.message); return; }
+
+    // Group by chat_id, take newest MAX_BUFFER_PER_CHAT, reverse for chrono order
+    const byChat = new Map();
+    for (const row of (data || [])) {
+      const cid = String(row.chat_id);
+      if (!byChat.has(cid)) byChat.set(cid, []);
+      const arr = byChat.get(cid);
+      if (arr.length < MAX_BUFFER_PER_CHAT) arr.push(row.message_json);
+    }
+    let total = 0;
+    for (const [cid, msgs] of byChat) {
+      // Reverse to chronological order (we fetched DESC, in-memory expects oldest→newest)
+      msgs.reverse();
+      _buffers.set(cid, msgs);
+      total += msgs.length;
+    }
+    console.log(`[messageBuffer] 🔄 Hydrated ${total} message(s) across ${byChat.size} chat(s) from DB`);
+  } catch (err) {
+    console.error("[messageBuffer] hydrateFromDb threw:", err.message);
+  }
+}
+
 // Strong markers that a text message is a brief (not a caption / admin
 // chatter). Used by the bundle scanners as a STOP signal — if we hit one
 // of these while scanning backwards from the current ad, we've crossed
@@ -50,6 +109,19 @@ function addMessage(message) {
 
   // Trim to max — drop oldest
   if (buf.length > MAX_BUFFER_PER_CHAT) buf.shift();
+
+  // Fire-and-forget DB persistence — never blocks message processing.
+  // Idempotent via UNIQUE(chat_id, message_id), so dupes from retry are
+  // silently swallowed.
+  if (_supabase) {
+    _supabase.from("message_buffer").upsert({
+      chat_id:      Number(chatId),
+      message_id:   message.message_id,
+      message_json: message,
+    }, { onConflict: "chat_id,message_id" }).then(({ error }) => {
+      if (error) console.error("[messageBuffer] persist error:", error.message);
+    });
+  }
 }
 
 /**
@@ -514,12 +586,24 @@ function getFilenameBundlesByPage(chatId, adMessageId) {
 
 function clearBufferUpTo(chatId, upToMessageId) {
   const buf = _buffers.get(String(chatId));
-  if (!buf) return;
+  if (buf) {
+    const idx = buf.findIndex((m) => m.message_id === upToMessageId);
+    if (idx >= 0) {
+      // Remove everything up to and including the ad message
+      buf.splice(0, idx + 1);
+    }
+  }
 
-  const idx = buf.findIndex((m) => m.message_id === upToMessageId);
-  if (idx >= 0) {
-    // Remove everything up to and including the ad message
-    buf.splice(0, idx + 1);
+  // Mirror the prune to DB so a restart doesn't re-hydrate stale content.
+  // Fire-and-forget; in-memory state is the source of truth at runtime.
+  if (_supabase) {
+    _supabase.from("message_buffer")
+      .delete()
+      .eq("chat_id", Number(chatId))
+      .lte("message_id", upToMessageId)
+      .then(({ error }) => {
+        if (error) console.error("[messageBuffer] prune error:", error.message);
+      });
   }
 }
 
@@ -597,5 +681,6 @@ module.exports = {
   getStandardBundle,
   getMessages,
   clearBufferUpTo,
+  hydrateFromDb,
   MAX_BUFFER_PER_CHAT,
 };
