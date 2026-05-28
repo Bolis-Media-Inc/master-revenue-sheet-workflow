@@ -138,10 +138,22 @@ function getContentBundlesByPage(chatId, adMessageId) {
   const byHandle = new Map();
   const sharedMedia = []; // media not claimed by any label going backwards
   let pendingContent = []; // media collected since the last label (going backwards)
-  // Set true when we encounter a Story label with no pending media (i.e.
-  // label-AFTER-media convention). The very next media we see going
-  // backwards is the story creative and routes to sharedMedia.
-  let nextMediaIsStory = false;
+  // Pending label info for label-AFTER-media convention. When we encounter
+  // a label with no preceding media, the next media we see (going backwards)
+  // belongs to that label. Generalized from the old @story-only flag to
+  // support any handle — Danny's FashionNova format puts every per-page
+  // label AFTER its video.
+  //
+  //   { kind: "story"   } → next media routes to sharedMedia
+  //   { kind: "handle", handle: "thefuck.tv", caption: null|"..." } → next media goes to byHandle
+  let pendingLabel = null;
+  // First non-label non-media text encountered going backwards. This is
+  // the shared IG caption — captured inline rather than via a separate
+  // _extractSharedCaption call so it works even when intervening labels
+  // / media sit between the caption and the brief (Danny's layout:
+  // caption → IMG_3286 → Story ^ → brief). Only the FIRST match wins —
+  // anything older is treated as ad chatter and ignored.
+  let sharedCaption = null;
 
   for (let i = preceding.length - 1; i >= 0; i--) {
     const msg  = preceding[i];
@@ -157,67 +169,52 @@ function getContentBundlesByPage(chatId, adMessageId) {
     if (isLabel) {
       // Label format options:
       //   "@thefuck.tv ^"                              → handle only
-      //   "@thefuck.tv ^"  (no @)                      → handle only
       //   "@thefuck.tv NEO just dropped! Read bio ^"   → handle + per-page caption
       //   "@story ^" / "@stories ^"                    → SHARED bundle (special)
       //
       // First token (sans @, lowercased) is the handle. Anything between
-      // handle and trailing ^ becomes the per-page caption text that will
-      // be forwarded as a separate message after the media in that
-      // page's IG Ads chat — useful when each page gets unique copy.
-      //
-      // Special tokens (@story / @stories) are NOT page handles — they're
-      // markers that the preceding media is meant to be posted to every
-      // page's Instagram Story alongside the main feed creative. We route
-      // the media to shared.media so it forwards to every attributed page.
+      // handle and trailing ^ becomes the per-page caption text.
       const labelText = text.slice(0, -1).trim();
       const firstSpace = labelText.search(/\s/);
       const handlePart = (firstSpace === -1 ? labelText : labelText.slice(0, firstSpace))
         .toLowerCase().replace(/^@/, "");
       const captionPart = firstSpace === -1 ? null : labelText.slice(firstSpace + 1).trim() || null;
+      const isStory = handlePart === "story" || handlePart === "stories";
 
-      if (handlePart === "story" || handlePart === "stories") {
-        // Story label has TWO valid conventions:
-        //   (1) label-BEFORE-media (legacy):
-        //         "@story ^"
-        //         story_creative
-        //         brief
-        //       Walking backwards, story_creative lands in pendingContent
-        //       before we hit "@story ^". On flush, pendingContent moves
-        //       into sharedMedia.
-        //
-        //   (2) label-AFTER-media (Danielson's preferred form):
-        //         story_creative
-        //         "Story ^"
-        //         brief
-        //       Walking backwards, we see "Story ^" first when
-        //       pendingContent is empty. We can't flush anything yet —
-        //       set nextMediaIsStory so the next media we walk into gets
-        //       routed to sharedMedia instead of pendingContent.
-        //
-        // Picking the convention by inspecting pendingContent at the
-        // moment of label encounter lets BOTH forms work without the
-        // operator declaring which they used.
-        if (pendingContent.length > 0) {
+      // Pick label-before vs label-after by inspecting pendingContent at
+      // moment of encounter:
+      //   - pendingContent has stuff → label-BEFORE-media. Flush pending
+      //     into this label.
+      //   - pendingContent is empty → label-AFTER-media. Remember this
+      //     label as pending; the next media we walk into belongs to it.
+      if (pendingContent.length > 0) {
+        if (isStory) {
           for (const m of pendingContent) sharedMedia.push(m);
-          pendingContent = [];
         } else {
-          nextMediaIsStory = true;
+          byHandle.set(handlePart, { media: [...pendingContent], caption: captionPart });
         }
-      } else {
-        byHandle.set(handlePart, { media: [...pendingContent], caption: captionPart });
         pendingContent = [];
+      } else {
+        pendingLabel = isStory
+          ? { kind: "story" }
+          : { kind: "handle", handle: handlePart, caption: captionPart };
       }
 
     } else if (hasMedia) {
-      if (nextMediaIsStory) {
-        // The Story ^ label we just walked past claims THIS media as
-        // story content. Route directly to sharedMedia, NOT pendingContent
-        // (so it doesn't get re-attributed to whatever per-page label
-        // comes next going backwards). Unshift = prepend to keep chrono
-        // order in sharedMedia.
-        sharedMedia.unshift(msg);
-        nextMediaIsStory = false;
+      if (pendingLabel) {
+        // The label we just walked past claims THIS media. Route directly
+        // (per kind) instead of via pendingContent so a subsequent label
+        // doesn't re-claim it.
+        if (pendingLabel.kind === "story") {
+          sharedMedia.unshift(msg);
+        } else {
+          const existing = byHandle.get(pendingLabel.handle) || { media: [], caption: null };
+          existing.media.unshift(msg);
+          // First label wins for the caption — don't overwrite if already set
+          if (existing.caption == null) existing.caption = pendingLabel.caption;
+          byHandle.set(pendingLabel.handle, existing);
+        }
+        pendingLabel = null;
       } else {
         // Content message — prepend so the final array stays chronological
         pendingContent.unshift(msg);
@@ -232,12 +229,15 @@ function getContentBundlesByPage(chatId, adMessageId) {
       // Anything still in pendingContent is from BEFORE the previous
       // brief; safer to drop than to attribute to the current ad.
       pendingContent = [];
-      nextMediaIsStory = false;
+      pendingLabel = null;
       break;
 
     } else {
-      // Random text (Instagram caption, admin chatter, "13 Covers ^"
-      // annotation that wasn't a label, etc). Skip — keep scanning.
+      // Random text — could be the shared IG caption or just chatter.
+      // Capture the FIRST one we see going backwards (closest to brief)
+      // since that's the caption-slot by team convention. Older plain-text
+      // messages are treated as chatter and ignored.
+      if (sharedCaption == null) sharedCaption = text;
       continue;
     }
   }
@@ -251,8 +251,12 @@ function getContentBundlesByPage(chatId, adMessageId) {
   return {
     byHandle,
     shared: {
-      media: sharedMedia,
-      caption: _extractSharedCaption(preceding),
+      media:   sharedMedia,
+      // Inline-captured caption wins over the legacy _extractSharedCaption
+      // (which only looks at preceding[last]). When no inline caption was
+      // found AND the immediately-preceding message qualifies, fall back to
+      // _extractSharedCaption so simpler layouts still work.
+      caption: sharedCaption || _extractSharedCaption(preceding),
     },
   };
 }

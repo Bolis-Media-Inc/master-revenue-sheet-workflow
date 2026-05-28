@@ -102,14 +102,51 @@ function parseAdMessage(text, date) {
     }
   }
 
-  // Fallback: scan whole message for "@handle - $price" if PAGE INFO had none.
-  // Only looks at lines AFTER the PAGE INFO section (or whole message if no PAGE INFO found)
-  // to avoid accidentally picking up admin handles listed near the top.
+  // Fallback: scan for page entries when PAGE INFO section didn't yield any.
+  // Two recognized formats:
+  //
+  //   "@handle - $price"   — standard sponsorship brief
+  //   "@handle - <URL>"    — affiliate brief (FashionNova-style, where the
+  //                          per-page link IS the per-page deal). Header
+  //                          $price is used as the per-page price.
+  //
+  // We scan from AFTER the INSTRUCTIONS heading (when present) so admin
+  // handles listed near the top (@davogabriel, @sales_bolismedia) don't
+  // accidentally become pages. If no INSTRUCTIONS marker exists either,
+  // scan from the top — risk is acceptable since handles followed by a
+  // dash + something are very unlikely to be admin handles.
+  //
+  // Collects ALL matches (multi-page support) — the old single-match
+  // behavior silently dropped pages 2-N of any multi-page affiliate brief.
   if (pageEntries.length === 0) {
-    const scanStart = pageInfoIdx !== -1 ? pageInfoIdx + 1 : 0;
+    // Hoisted INSTRUCTIONS lookup — the section parser below computes its own
+    // instrIdx but we need ours earlier to bound the fallback scan.
+    const instrIdxForFallback = lines.findIndex((l) =>
+      l.replace(/\*/g, "").toLowerCase().includes("instructions")
+    );
+    const scanStart = pageInfoIdx !== -1
+      ? pageInfoIdx + 1
+      : (instrIdxForFallback !== -1 ? instrIdxForFallback + 1 : 0);
     for (let i = scanStart; i < lines.length; i++) {
-      const m = lines[i].match(/^@([\w.]+)\s*-\s*\$?([\d,]+)/);
-      if (m) { pageEntries.push({ handle: m[1].toLowerCase(), price: parseFloat(m[2].replace(/,/g, "")) }); break; }
+      const line = lines[i];
+      // @handle - $price
+      const priceMatch = line.match(/^@([\w.]+)\s*-\s*\$?([\d,]+(?:\.\d{1,2})?)/);
+      if (priceMatch) {
+        pageEntries.push({
+          handle: priceMatch[1].toLowerCase(),
+          price:  parseFloat(priceMatch[2].replace(/,/g, "")),
+        });
+        continue;
+      }
+      // @handle - <URL>   (affiliate brief — per-page price = header price)
+      const urlMatch = line.match(/^@([\w.]+)\s*-\s*(https?:\/\/\S+)/i);
+      if (urlMatch) {
+        pageEntries.push({
+          handle: urlMatch[1].toLowerCase(),
+          price:  adPrice,
+        });
+        continue;
+      }
     }
   }
 
