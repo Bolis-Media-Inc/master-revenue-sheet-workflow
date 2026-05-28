@@ -93,45 +93,61 @@ async function appendRow(spreadsheetId, tabName, rowValues) {
  */
 async function markForwarded(spreadsheetId, tabName, rowNumber) {
   if (!rowNumber) return;
+  return markForwardedBatch(spreadsheetId, tabName, [rowNumber]);
+}
+
+/**
+ * Batched variant — tick multiple "Forwarded" checkboxes in column A in
+ * a single batchUpdate call. Avoids the Google Sheets API write-per-minute
+ * quota that gets blown when a 25-page brief fires 25 individual
+ * markForwarded calls in a tight loop.
+ *
+ * Cost: 1 spreadsheets.get + 1 spreadsheets.batchUpdate (vs N+N before).
+ * Silent no-op for empty arrays.
+ */
+async function markForwardedBatch(spreadsheetId, tabName, rowNumbers) {
+  const rows = (rowNumbers || []).filter((n) => Number.isFinite(n) && n > 0);
+  if (rows.length === 0) return;
+
   const auth   = getAuth();
   const client = await auth.getClient();
   const sheets = google.sheets({ version: "v4", auth: client });
 
-  // Resolve the numeric sheetId for the named tab
+  // One metadata fetch covers all rows
   const meta  = await sheets.spreadsheets.get({ spreadsheetId });
   const sheet = meta.data.sheets?.find((s) => s.properties.title === tabName);
   if (!sheet) {
-    console.warn(`[sheets] markForwarded: tab "${tabName}" not found`);
+    console.warn(`[sheets] markForwardedBatch: tab "${tabName}" not found`);
     return;
   }
   const sheetId = sheet.properties.sheetId;
-  const rowIdx  = rowNumber - 1; // 0-indexed
+
+  // Build N updateCells requests in one batchUpdate
+  const requests = rows.map((rowNumber) => ({
+    updateCells: {
+      range: {
+        sheetId,
+        startRowIndex:    rowNumber - 1,
+        endRowIndex:      rowNumber,
+        startColumnIndex: 0,
+        endColumnIndex:   1,
+      },
+      rows: [{
+        values: [{
+          userEnteredValue: { boolValue: true },
+          dataValidation: {
+            condition: { type: "BOOLEAN" },
+            showCustomUi: true,
+          },
+        }],
+      }],
+      fields: "userEnteredValue,dataValidation",
+    },
+  }));
 
   await sheets.spreadsheets.batchUpdate({
     spreadsheetId,
-    requestBody: {
-      requests: [{
-        updateCells: {
-          range: {
-            sheetId,
-            startRowIndex:    rowIdx,
-            endRowIndex:      rowIdx + 1,
-            startColumnIndex: 0,
-            endColumnIndex:   1,
-          },
-          rows: [{
-            values: [{
-              userEnteredValue: { boolValue: true },
-              dataValidation: {
-                condition: { type: "BOOLEAN" },
-                showCustomUi: true, // renders as a real checkbox
-              },
-            }],
-          }],
-          fields: "userEnteredValue,dataValidation",
-        },
-      }],
-    },
+    requestBody: { requests },
   });
 }
 
@@ -531,6 +547,20 @@ async function ensureRemindersTab(spreadsheetId) {
  * @param {{ handle, client, destChatId, type, dueAt }} reminder
  */
 async function appendReminder(spreadsheetId, reminder) {
+  return appendRemindersBatch(spreadsheetId, [reminder]);
+}
+
+/**
+ * Batched variant — append N reminders in a single API call instead of N.
+ * One ensureRemindersTab + one spreadsheets.values.append.
+ * Cuts 25 reminders from 50 calls (25 ensure + 25 append) to 2.
+ *
+ * Silent no-op for empty arrays.
+ */
+async function appendRemindersBatch(spreadsheetId, reminders) {
+  const items = (reminders || []).filter(Boolean);
+  if (items.length === 0) return;
+
   await ensureRemindersTab(spreadsheetId);
 
   const auth   = getAuth();
@@ -543,14 +573,14 @@ async function appendReminder(spreadsheetId, reminder) {
     valueInputOption: "USER_ENTERED",
     insertDataOption: "OVERWRITE",
     requestBody: {
-      values: [[
-        reminder.handle,
-        reminder.client,
-        reminder.destChatId,
-        reminder.type,
-        reminder.dueAt,
+      values: items.map((r) => [
+        r.handle,
+        r.client,
+        r.destChatId,
+        r.type,
+        r.dueAt,
         "FALSE",
-      ]],
+      ]),
     },
   });
 }
@@ -604,8 +634,8 @@ async function markReminderSent(spreadsheetId, rowNumber) {
 }
 
 module.exports = {
-  appendRow, markForwarded,
+  appendRow, markForwarded, markForwardedBatch,
   getLastDate, appendSeparatorRow,
   updateStatusToLive, updateAdPrice, updateAdDate, deleteAdRows,
-  appendReminder, getPendingReminders, markReminderSent,
+  appendReminder, appendRemindersBatch, getPendingReminders, markReminderSent,
 };

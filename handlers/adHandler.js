@@ -12,7 +12,7 @@
  */
 
 const { parseAdMessage }       = require("../parser");
-const { appendRow, markForwarded, updateStatusToLive, updateAdDate, appendReminder } = require("../sheets");
+const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch } = require("../sheets");
 const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
@@ -971,6 +971,15 @@ async function handleAdMessage(ctx) {
       // to prevent sending the same brief 3-4x when multiple handles share a channel
       const forwardedDestinations = new Set();
 
+      // Collect side-effect work to flush in a single batched call AFTER
+      // the per-page forward loop completes. Before: each successful
+      // forward triggered 2 sheet writes (markForwarded + appendReminder),
+      // so a 25-page brief = 50+ writes/min and Google Sheets API quota
+      // (60 writes/min/user) would kick in and silently drop half of them.
+      // After: collect during the loop, flush once = 2 calls total.
+      const masterRowsToMark = [];
+      const remindersToQueue = [];
+
       for (const handle of uniqueHandles) {
         const destChatId = pagesRegistry.getChatId(handle);
 
@@ -1061,15 +1070,13 @@ async function handleAdMessage(ctx) {
           );
           forwardOk++;
 
-          // ── Tick "Forwarded" checkbox in master sheet (column A) ────────────
+          // ── Queue "Forwarded" checkbox tick (batched after loop) ────────────
           const masterRow = masterRowByHandle.get(handle);
           if (MASTER_SHEET_ID && masterRow) {
-            markForwarded(MASTER_SHEET_ID, TAB_NAME, masterRow).catch((err) =>
-              console.error(`[adHandler] ❌ markForwarded error for @${handle}: ${err.message}`)
-            );
+            masterRowsToMark.push(masterRow);
           }
 
-          // ── Post expiry / analytics reminder (persisted to Reminders sheet) ──
+          // ── Queue post-expiry / analytics reminder (batched after loop) ──
           // NIF reminder is scheduled separately from the "Posted on" handler
           // so it starts when the post actually goes live, not at brief-forwarding time.
           const item = parsedList.find((p) => p.pageHandle === handle);
@@ -1077,15 +1084,13 @@ async function handleAdMessage(ctx) {
             const postDur = parsePostDuration(item.nif);
             if (postDur) {
               const dueAt = new Date(Date.now() + postDur.ms).toISOString();
-              appendReminder(MASTER_SHEET_ID, {
+              remindersToQueue.push({
                 handle,
                 client:     item.client,
                 destChatId: String(destChatId),
                 type:       postDur.type,
                 dueAt,
-              }).catch((err) =>
-                console.error(`[adHandler] ❌ appendReminder error for @${handle}: ${err.message}`)
-              );
+              });
             }
           }
 
@@ -1097,6 +1102,18 @@ async function handleAdMessage(ctx) {
       console.log(
         `[adHandler] 📤 Forward summary: ${forwardOk} sent, ${forwardSkipped} skipped`
       );
+
+      // ── Flush batched side effects (1 sheet call each, not N) ──────────
+      if (masterRowsToMark.length > 0) {
+        markForwardedBatch(MASTER_SHEET_ID, TAB_NAME, masterRowsToMark)
+          .then(() => console.log(`[adHandler] ✅ markForwarded batched: ${masterRowsToMark.length} row(s)`))
+          .catch((err) => console.error(`[adHandler] ❌ markForwardedBatch error: ${err.message}`));
+      }
+      if (remindersToQueue.length > 0) {
+        appendRemindersBatch(MASTER_SHEET_ID, remindersToQueue)
+          .then(() => console.log(`[adHandler] ✅ appendReminders batched: ${remindersToQueue.length} reminder(s)`))
+          .catch((err) => console.error(`[adHandler] ❌ appendRemindersBatch error: ${err.message}`));
+      }
 
       // Clear the buffer up to and including this ad message so stale
       // content from this batch doesn't leak into the next ad's scan.
