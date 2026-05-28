@@ -17,6 +17,7 @@ const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFil
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
 const pagesRegistry            = require("../lib/pages");
+const adBriefs                 = require("../lib/adBriefs");
 
 // Supports comma-separated chat IDs so a test group can run alongside production.
 // e.g. TARGET_CHAT_ID=-1001111111111,-1002222222222
@@ -187,6 +188,29 @@ function formatSheetDate(date) {
     day:     "numeric",
     year:    "2-digit",
   });
+}
+
+/**
+ * Pull the highest-resolution file_id out of a Telegram message regardless
+ * of media type. Used when persisting bundle file_ids to ad_briefs so a
+ * future /replay can re-attach the exact creatives without scanning the
+ * in-memory buffer.
+ *
+ * Returns null if the message carries no media (e.g. text-only).
+ */
+function extractFileId(msg) {
+  if (!msg) return null;
+  if (msg.photo && msg.photo.length > 0) {
+    // photo is an array of size variants — last is highest resolution
+    return msg.photo[msg.photo.length - 1].file_id;
+  }
+  if (msg.video)     return msg.video.file_id;
+  if (msg.document)  return msg.document.file_id;
+  if (msg.animation) return msg.animation.file_id;
+  if (msg.audio)     return msg.audio.file_id;
+  if (msg.voice)     return msg.voice.file_id;
+  if (msg.video_note) return msg.video_note.file_id;
+  return null;
 }
 
 /**
@@ -808,6 +832,59 @@ async function handleAdMessage(ctx) {
         : ` / $${parsedList[0].adPrice}` + (parsedList[0].pageHandle ? ` → @${parsedList[0].pageHandle}` : " (no page handle)"))
     );
 
+    // ── Persist brief skeleton to Supabase ─────────────────────────────────────
+    // Insert the brief + one row per targeted page BEFORE any side effects so
+    // we have stable DB IDs to attach sheet-row numbers + forward outcomes to
+    // throughout the rest of this handler. Shared media / per-page media /
+    // bundle format get filled in later (after bundle detection runs around
+    // line ~902). Forward outcomes get attached in the forwarding loop.
+    //
+    // Fail-soft: if Supabase is unconfigured or insert fails, briefRowId is
+    // null and pageRowIdByHandle is empty — downstream updates silently no-op
+    // and the rest of the handler runs unchanged. The DB layer is a
+    // tracking/audit add-on, never a hard dependency.
+    let briefRowId = null;
+    const pageRowIdByHandle = new Map(); // page_handle → ad_brief_pages.id
+    try {
+      const first = parsedList[0] || {};
+      // Total price = sum of per-page prices (handles bulk briefs)
+      const totalPrice = parsedList.reduce(
+        (sum, p) => sum + (Number.isFinite(p.adPrice) ? p.adPrice : 0),
+        0,
+      );
+      briefRowId = await adBriefs.insertBrief({
+        telegramChatId:    Number(chatId),
+        telegramMessageId: ctx.message.message_id,
+        senderUserId:      ctx.message.from?.id ?? null,
+        senderHandle:      ctx.message.from?.username ?? null,
+        rawText:           text,
+        client:            first.client ?? null,
+        category:          first.category ?? null,
+        totalPrice,
+        postType:          first.postType ?? null,
+        postDuration:      first.postDuration ?? null,
+        nif:               first.nif ?? null,
+        datePosted:        first.datePosted ?? null,
+        timeMst:           first.timeMST ?? null,
+        // shared_media_file_ids / shared_caption / bundle_format filled later
+      });
+      if (briefRowId) {
+        const pageRows = parsedList
+          .filter((p) => p.pageHandle)
+          .map((p) => ({
+            pageHandle: p.pageHandle.toLowerCase(),
+            bulkNum:    p.bulkNum || null,
+            pagePrice:  Number.isFinite(p.adPrice) ? p.adPrice : null,
+          }));
+        const inserted = await adBriefs.insertBriefPages(briefRowId, pageRows);
+        for (const [handle, id] of inserted) pageRowIdByHandle.set(handle, id);
+        console.log(`[adBriefs] 📥 Persisted brief ${briefRowId.slice(0, 8)}… (${pageRowIdByHandle.size}/${parsedList.length} pages)`);
+      }
+    } catch (err) {
+      console.error(`[adBriefs] ❌ Failed to persist brief: ${err.message}`);
+      // Continue — DB persistence is best-effort, doesn't block forwarding
+    }
+
     // ── Write to Master Revenue Sheet ──────────────────────────────────────────
     // masterRowByHandle: handle → 1-indexed row number (used later to tick checkbox)
     const masterRowByHandle = new Map();
@@ -820,7 +897,15 @@ async function handleAdMessage(ctx) {
         try {
           const rowNumber = await appendRow(MASTER_SHEET_ID, TAB_NAME, row);
           successCount++;
-          if (item.pageHandle && rowNumber) masterRowByHandle.set(item.pageHandle, rowNumber);
+          if (item.pageHandle && rowNumber) {
+            masterRowByHandle.set(item.pageHandle, rowNumber);
+            // Persist master row number to DB so we can audit + retry missing writes
+            const pageRowId = pageRowIdByHandle.get(item.pageHandle.toLowerCase());
+            if (pageRowId) {
+              adBriefs.updatePageSheetRows(pageRowId, { masterSheetRow: rowNumber })
+                .catch(() => {}); // fire-and-forget; logged inside the helper
+            }
+          }
         } catch (err) {
           console.error(`[adHandler] ❌ Master sheet write error for @${item.pageHandle}: ${err.message}`);
           console.error(err.stack);
@@ -850,8 +935,14 @@ async function handleAdMessage(ctx) {
       const row = buildPageRow(item);
       try {
         // Per-page sheets: col A = Client Name (always filled), cols go A→H
-        await appendRow(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "A", endColumn: "H" });
+        const pageSheetRowNum = await appendRow(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "A", endColumn: "H" });
         pageSheetCount++;
+        // Persist per-page sheet row to DB for audit + retry visibility
+        const pageRowId = pageRowIdByHandle.get(item.pageHandle.toLowerCase());
+        if (pageRowId && pageSheetRowNum) {
+          adBriefs.updatePageSheetRows(pageRowId, { pageSheetRow: pageSheetRowNum })
+            .catch(() => {});
+        }
         console.log(`[adHandler] ✅ Page sheet write: @${item.pageHandle} → "${PAGE_TAB_NAME}"`);
       } catch (err) {
         console.error(`[adHandler] ❌ Page sheet error for @${item.pageHandle}: ${err.message}`);
@@ -929,6 +1020,49 @@ async function handleAdMessage(ctx) {
         `shared caption: ${sharedBundle.caption ? "yes" : "no"}, ` +
         `fallback media: ${fallbackMedia.length})`,
       );
+
+      // ── Persist bundle info to DB ────────────────────────────────────────
+      // Now that bundle detection has run, attach shared media/caption + format
+      // to the brief row, and per-page media/caption to each page row. This
+      // lets a future /replay reconstruct the exact bundle without scanning
+      // the in-memory buffer (which has a 100-msg window).
+      if (briefRowId) {
+        try {
+          const sharedFileIds = sharedBundle.media.map(extractFileId).filter(Boolean);
+          if (sharedFileIds.length > 0 || sharedBundle.caption || detectedFormat) {
+            // Bypass insertBrief wrapper and update directly via supabase client
+            const sb = adBriefs._supabase;
+            if (sb) {
+              sb.from("ad_briefs").update({
+                shared_media_file_ids: sharedFileIds,
+                shared_caption:        sharedBundle.caption ?? null,
+                bundle_format:         detectedFormat,
+              }).eq("id", briefRowId).then(({ error }) => {
+                if (error) console.error("[adBriefs] update brief bundle:", error.message);
+              });
+            }
+          }
+          if (activeBundle) {
+            for (const [handle, bundle] of activeBundle.byHandle) {
+              const pageRowId = pageRowIdByHandle.get(handle);
+              if (!pageRowId) continue;
+              const fileIds = (bundle.media || []).map(extractFileId).filter(Boolean);
+              if (fileIds.length === 0 && !bundle.caption) continue;
+              const sb = adBriefs._supabase;
+              if (sb) {
+                sb.from("ad_brief_pages").update({
+                  page_media_file_ids: fileIds,
+                  page_caption:        bundle.caption ?? null,
+                }).eq("id", pageRowId).then(({ error }) => {
+                  if (error) console.error(`[adBriefs] update page @${handle}:`, error.message);
+                });
+              }
+            }
+          }
+        } catch (err) {
+          console.error(`[adBriefs] ❌ Failed to update bundle info: ${err.message}`);
+        }
+      }
 
       // ── Coverage check ─────────────────────────────────────────────────
       // Cross-reference the brief's page list against what attribution
@@ -1075,6 +1209,18 @@ async function handleAdMessage(ctx) {
           );
           forwardOk++;
 
+          // ── Mark this page forwarded in the DB ──────────────────────────────
+          // forwardToPage doesn't surface the destination message_ids, so we
+          // can't store forwarded_message_ids precisely here without a bigger
+          // refactor. The forwarded_at timestamp + master_sheet_row + page_sheet_row
+          // are enough for /replay backfill purposes.
+          const pageRowId = pageRowIdByHandle.get(handle.toLowerCase());
+          if (pageRowId) {
+            adBriefs.markPageForwarded(pageRowId, {
+              masterSheetRow: masterRowByHandle.get(handle) ?? null,
+            }).catch(() => {});
+          }
+
           // ── Queue "Forwarded" checkbox tick (batched after loop) ────────────
           const masterRow = masterRowByHandle.get(handle);
           if (MASTER_SHEET_ID && masterRow) {
@@ -1101,6 +1247,12 @@ async function handleAdMessage(ctx) {
 
         } catch (err) {
           console.error(`[adHandler] ❌ Forward error for @${handle}: ${err.message}`);
+          // Record the failure on the page row so /replay can target it later
+          const pageRowId = pageRowIdByHandle.get(handle.toLowerCase());
+          if (pageRowId) {
+            adBriefs.markPageForwardError(pageRowId, err.message || String(err))
+              .catch(() => {});
+          }
         }
       }
 
