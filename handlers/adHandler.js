@@ -191,25 +191,57 @@ function formatSheetDate(date) {
 }
 
 /**
- * Pull the highest-resolution file_id out of a Telegram message regardless
- * of media type. Used when persisting bundle file_ids to ad_briefs so a
- * future /replay can re-attach the exact creatives without scanning the
- * in-memory buffer.
+ * Send a stored media reference ({file_id, kind}) to a chat via the right
+ * Telegram method. Used by DB-backed /replay to re-attach media when the
+ * original messages are no longer in the in-memory buffer.
+ *
+ * Telegram file_ids stay valid as long as the bot's seen the file before,
+ * regardless of how much time has passed — so this works even for briefs
+ * weeks old.
+ *
+ * Falls back to sendDocument if kind is unknown, which works for most
+ * file types as a last resort.
+ *
+ * @param {import("telegraf").Telegram} telegram
+ * @param {string} chatId
+ * @param {{file_id: string, kind: string}} ref
+ */
+async function sendByKind(telegram, chatId, ref) {
+  if (!ref || !ref.file_id) return;
+  switch (ref.kind) {
+    case "photo":     return telegram.sendPhoto    (chatId, ref.file_id);
+    case "video":     return telegram.sendVideo    (chatId, ref.file_id);
+    case "document":  return telegram.sendDocument (chatId, ref.file_id);
+    case "animation": return telegram.sendAnimation(chatId, ref.file_id);
+    case "audio":     return telegram.sendAudio    (chatId, ref.file_id);
+    case "voice":     return telegram.sendVoice    (chatId, ref.file_id);
+    case "video_note": return telegram.sendVideoNote(chatId, ref.file_id);
+    default:          return telegram.sendDocument(chatId, ref.file_id); // best-effort fallback
+  }
+}
+
+/**
+ * Pull the highest-resolution file_id + media kind out of a Telegram message.
+ * The kind tells a future /replay which Telegram API to use to re-send the
+ * file (sendPhoto vs sendVideo vs sendDocument vs sendAnimation etc.) —
+ * file_id alone doesn't reveal type, so we record both.
  *
  * Returns null if the message carries no media (e.g. text-only).
+ *
+ * @returns {{file_id: string, kind: string} | null}
  */
-function extractFileId(msg) {
+function extractMediaRef(msg) {
   if (!msg) return null;
   if (msg.photo && msg.photo.length > 0) {
     // photo is an array of size variants — last is highest resolution
-    return msg.photo[msg.photo.length - 1].file_id;
+    return { file_id: msg.photo[msg.photo.length - 1].file_id, kind: "photo" };
   }
-  if (msg.video)     return msg.video.file_id;
-  if (msg.document)  return msg.document.file_id;
-  if (msg.animation) return msg.animation.file_id;
-  if (msg.audio)     return msg.audio.file_id;
-  if (msg.voice)     return msg.voice.file_id;
-  if (msg.video_note) return msg.video_note.file_id;
+  if (msg.video)      return { file_id: msg.video.file_id,      kind: "video" };
+  if (msg.document)   return { file_id: msg.document.file_id,   kind: "document" };
+  if (msg.animation)  return { file_id: msg.animation.file_id,  kind: "animation" };
+  if (msg.audio)      return { file_id: msg.audio.file_id,      kind: "audio" };
+  if (msg.voice)      return { file_id: msg.voice.file_id,      kind: "voice" };
+  if (msg.video_note) return { file_id: msg.video_note.file_id, kind: "video_note" };
   return null;
 }
 
@@ -642,19 +674,27 @@ async function handleReplayCommand(ctx) {
     sharedBundle.media.length > 0 ||
     fallbackMedia.length > 0;
 
+  // DB-backed media: if buffer is empty but we have JSONB page_media or
+  // shared_media populated from a prior brief capture, we can still
+  // re-attach media via sendPhoto/sendVideo using the stored file_ids.
+  const hasMediaInDb =
+    (dbBriefForBackfill?.shared_media?.length > 0) ||
+    [...dbPagesByHandle.values()].some((p) => p.page_media?.length > 0);
+
   console.log(
     `[adHandler] 🔁 /replay triggered — brief msg ${briefMessageId}, ${ready.length} target handle(s), format: ${format}, ` +
-    `attributed: ${activeBundle?.byHandle.size || 0}, shared media: ${sharedBundle.media.length}, fallback: ${fallbackMedia.length}`,
+    `attributed: ${activeBundle?.byHandle.size || 0}, shared media: ${sharedBundle.media.length}, fallback: ${fallbackMedia.length}, ` +
+    `db media: ${hasMediaInDb ? "yes" : "no"}`,
   );
 
-  if (!hasMediaInBuffer && !sharedBundle.caption) {
+  if (!hasMediaInBuffer && !hasMediaInDb && !sharedBundle.caption && !dbBriefForBackfill?.shared_caption) {
     // Brief itself was found (otherwise we'd have errored out earlier) — what's
     // missing is the *media bundle* (covers / slides / caption). For text-only
     // briefs (e.g. Stake bet slips, where pages create their own clips) this
     // is the expected case, not an error. Phrase it accordingly.
     await ctx.reply(
       `ℹ️ No media bundle attached to this brief — forwarding the per-page brief text only.\n\n` +
-      `(Normal for text-only campaigns like Stake bet slips. If media *was* expected, the brief is older than the bot's in-memory buffer.)`
+      `(Normal for text-only campaigns like Stake bet slips. If media *was* expected, the brief is older than the bot's in-memory buffer and wasn't captured to DB.)`
     ).catch(() => {});
   }
 
@@ -675,8 +715,18 @@ async function handleReplayCommand(ctx) {
       ? (activeBundle.byHandle.get(handle.toLowerCase()) || { media: [], caption: null })
       : { media: fallbackMedia, caption: null };
 
+    // DB media fallback: when the buffer doesn't have the bundle (because
+    // the brief aged out / was processed pre-deploy), fall back to
+    // ad_brief_pages.page_media + ad_briefs.shared_media JSONB columns.
+    // Each entry is { file_id, kind } → routes to sendPhoto/sendVideo/etc.
+    const dbPageForMedia = dbPagesByHandle.get(handle.toLowerCase());
+    const dbPerPageMedia = (!perPageBundle.media.length && dbPageForMedia?.page_media) || [];
+    const dbSharedMedia  = (!sharedBundle.media.length && dbBriefForBackfill?.shared_media) || [];
+    const dbPerPageCaption = !perPageBundle.caption && dbPageForMedia?.page_caption || null;
+    const dbSharedCaption  = !sharedBundle.caption && dbBriefForBackfill?.shared_caption || null;
+
     try {
-      // 1. Per-page media
+      // 1. Per-page media — buffer (forwardMessage) OR DB (sendByKind)
       for (const m of perPageBundle.media) {
         try {
           await ctx.telegram.forwardMessage(destChatId, sourceChatId, m.message_id);
@@ -684,11 +734,16 @@ async function handleReplayCommand(ctx) {
           console.error(`[adHandler] ❌ /replay per-page msg ${m.message_id} → @${handle}: ${err.message}`);
         }
       }
-      if (perPageBundle.media.length > 0) {
-        console.log(`[adHandler] ✅ /replay forwarded ${perPageBundle.media.length} per-page msg(s) → @${handle}`);
+      for (const ref of dbPerPageMedia) {
+        try { await sendByKind(ctx.telegram, destChatId, ref); }
+        catch (err) { console.error(`[adHandler] ❌ /replay per-page (DB) ${ref.kind} → @${handle}: ${err.message}`); }
+      }
+      const perPageTotal = perPageBundle.media.length + dbPerPageMedia.length;
+      if (perPageTotal > 0) {
+        console.log(`[adHandler] ✅ /replay forwarded ${perPageTotal} per-page msg(s) → @${handle} (buffer: ${perPageBundle.media.length}, DB: ${dbPerPageMedia.length})`);
       }
 
-      // 2. Shared media
+      // 2. Shared media — same two paths
       for (const m of sharedBundle.media) {
         try {
           await ctx.telegram.forwardMessage(destChatId, sourceChatId, m.message_id);
@@ -696,12 +751,18 @@ async function handleReplayCommand(ctx) {
           console.error(`[adHandler] ❌ /replay shared msg ${m.message_id} → @${handle}: ${err.message}`);
         }
       }
-      if (sharedBundle.media.length > 0) {
-        console.log(`[adHandler] ✅ /replay forwarded ${sharedBundle.media.length} shared msg(s) → @${handle}`);
+      for (const ref of dbSharedMedia) {
+        try { await sendByKind(ctx.telegram, destChatId, ref); }
+        catch (err) { console.error(`[adHandler] ❌ /replay shared (DB) ${ref.kind} → @${handle}: ${err.message}`); }
+      }
+      const sharedTotal = sharedBundle.media.length + dbSharedMedia.length;
+      if (sharedTotal > 0) {
+        console.log(`[adHandler] ✅ /replay forwarded ${sharedTotal} shared msg(s) → @${handle} (buffer: ${sharedBundle.media.length}, DB: ${dbSharedMedia.length})`);
       }
 
-      // 3. Caption (per-page wins over shared)
-      const captionToSend = perPageBundle.caption || sharedBundle.caption;
+      // 3. Caption (per-page wins over shared) — buffer first, then DB
+      const captionToSend = perPageBundle.caption || sharedBundle.caption
+                          || dbPerPageCaption || dbSharedCaption;
       if (captionToSend) {
         await ctx.telegram.sendMessage(destChatId, captionToSend);
         console.log(`[adHandler] 💬 /replay caption sent → @${handle}`);
@@ -1183,20 +1244,20 @@ async function handleAdMessage(ctx) {
 
       // ── Persist bundle info to DB ────────────────────────────────────────
       // Now that bundle detection has run, attach shared media/caption + format
-      // to the brief row, and per-page media/caption to each page row. This
-      // lets a future /replay reconstruct the exact bundle without scanning
-      // the in-memory buffer (which has a 100-msg window).
+      // to the brief row, and per-page media/caption to each page row. Media
+      // is stored as JSONB [{file_id, kind}, …] so /replay can re-send via
+      // the right Telegram method (sendPhoto / sendVideo / etc.) without
+      // having to scan the in-memory buffer.
       if (briefRowId) {
         try {
-          const sharedFileIds = sharedBundle.media.map(extractFileId).filter(Boolean);
-          if (sharedFileIds.length > 0 || sharedBundle.caption || detectedFormat) {
-            // Bypass insertBrief wrapper and update directly via supabase client
+          const sharedMedia = sharedBundle.media.map(extractMediaRef).filter(Boolean);
+          if (sharedMedia.length > 0 || sharedBundle.caption || detectedFormat) {
             const sb = adBriefs._supabase;
             if (sb) {
               sb.from("ad_briefs").update({
-                shared_media_file_ids: sharedFileIds,
-                shared_caption:        sharedBundle.caption ?? null,
-                bundle_format:         detectedFormat,
+                shared_media:   sharedMedia,
+                shared_caption: sharedBundle.caption ?? null,
+                bundle_format:  detectedFormat,
               }).eq("id", briefRowId).then(({ error }) => {
                 if (error) console.error("[adBriefs] update brief bundle:", error.message);
               });
@@ -1206,13 +1267,13 @@ async function handleAdMessage(ctx) {
             for (const [handle, bundle] of activeBundle.byHandle) {
               const pageRowId = pageRowIdByHandle.get(handle);
               if (!pageRowId) continue;
-              const fileIds = (bundle.media || []).map(extractFileId).filter(Boolean);
-              if (fileIds.length === 0 && !bundle.caption) continue;
+              const media = (bundle.media || []).map(extractMediaRef).filter(Boolean);
+              if (media.length === 0 && !bundle.caption) continue;
               const sb = adBriefs._supabase;
               if (sb) {
                 sb.from("ad_brief_pages").update({
-                  page_media_file_ids: fileIds,
-                  page_caption:        bundle.caption ?? null,
+                  page_media:   media,
+                  page_caption: bundle.caption ?? null,
                 }).eq("id", pageRowId).then(({ error }) => {
                   if (error) console.error(`[adBriefs] update page @${handle}:`, error.message);
                 });
