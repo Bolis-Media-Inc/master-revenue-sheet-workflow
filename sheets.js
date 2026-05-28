@@ -759,9 +759,57 @@ async function markReminderSent(spreadsheetId, rowNumber) {
   });
 }
 
+/**
+ * Apply center horizontal alignment to entire columns (A..endColumn) of a
+ * sheet. One-time setup per sheet — once columns are formatted, every new
+ * row inherits center alignment automatically, with ZERO per-write API cost.
+ *
+ * Replaces the per-row applyCenterAlignmentBatch that was blowing the
+ * Sheets API quota (60/min) by firing one batchUpdate per row per page
+ * sheet per brief.
+ *
+ * Cost: 1 spreadsheets.get + 1 spreadsheets.batchUpdate per sheet.
+ * Idempotent — re-running just re-asserts CENTER alignment, no-op effect.
+ */
+async function applyColumnCenterAlignment(spreadsheetId, tabName, endColumn = "K") {
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: "v4", auth: client });
+
+  const meta  = await sheets.spreadsheets.get({ spreadsheetId });
+  const sheet = meta.data.sheets?.find((s) => s.properties.title === tabName);
+  if (!sheet) {
+    throw new Error(`Tab "${tabName}" not found in ${spreadsheetId}`);
+  }
+  const sheetId   = sheet.properties.sheetId;
+  const rowCount  = sheet.properties.gridProperties?.rowCount  || 1000;
+  const endColumnIndex = endColumn.toUpperCase().charCodeAt(0) - "A".charCodeAt(0) + 1;
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: [{
+        repeatCell: {
+          range: {
+            sheetId,
+            startRowIndex:    1,           // skip header row
+            endRowIndex:      rowCount,
+            startColumnIndex: 0,
+            endColumnIndex:   endColumnIndex,
+          },
+          cell: {
+            userEnteredFormat: { horizontalAlignment: "CENTER" },
+          },
+          fields: "userEnteredFormat.horizontalAlignment",
+        },
+      }],
+    },
+  });
+}
+
 module.exports = {
   appendRow, markForwarded, markForwardedBatch,
-  applyCenterAlignmentBatch,
+  applyCenterAlignmentBatch, applyColumnCenterAlignment,
   getLastDate, appendSeparatorRow,
   updateStatusToLive, updateAdPrice, updateAdDate, deleteAdRows,
   appendReminder, appendRemindersBatch, getPendingReminders, markReminderSent,

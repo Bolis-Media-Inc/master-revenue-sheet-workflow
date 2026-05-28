@@ -12,7 +12,7 @@
  */
 
 const { parseAdMessage }       = require("../parser");
-const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch } = require("../sheets");
+const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment } = require("../sheets");
 const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages, getStandardBundle } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
@@ -817,8 +817,8 @@ async function handleReplayCommand(ctx) {
               );
               if (rowNum) {
                 adBriefs.updatePageSheetRows(dbPage.id, { pageSheetRow: rowNum }).catch(() => {});
-                applyCenterAlignmentBatch(sheetId, PAGE_TAB_NAME, [rowNum], "H")
-                  .catch(() => {});
+                // Per-page sheet center-align removed — column-wide formatting
+                // via /centersheets handles this once per sheet at zero per-row cost
                 console.log(`[adHandler] 🩹 /replay backfilled per-page row ${rowNum} for @${handle}`);
               }
             } catch (err) {
@@ -953,7 +953,7 @@ async function handleSyncSheetsCommand(ctx) {
         });
         if (rowNum) {
           await adBriefs.updatePageSheetRows(row.id, { pageSheetRow: rowNum });
-          applyCenterAlignmentBatch(sheetId, PAGE_TAB_NAME, [rowNum], "H").catch(() => {});
+          // Per-page center-align removed — /centersheets handles column-wide
           pageWritten++;
           console.log(`[adHandler] 🩹 /syncsheets: page row ${rowNum} → @${row.page_handle} (${brief.client})`);
         }
@@ -991,6 +991,82 @@ async function handleSyncSheetsCommand(ctx) {
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
 }
 
+/**
+ * /centersheets — one-time column-wide center alignment on master sheet
+ * + every configured per-page sheet. New rows inherit center alignment
+ * from the column going forward, so the bot never has to apply per-row
+ * formatting again (which was blowing the Sheets API quota).
+ *
+ * Throttled to 1 sheet per second to stay safely under 60/min read +
+ * write quota — a 60-sheet pass takes ~60s, runs in the background.
+ *
+ * Usage:
+ *   /centersheets         — format master + all per-page sheets
+ *   /centersheets master  — master sheet only (fast)
+ */
+async function handleCenterSheetsCommand(ctx) {
+  const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+  if (adminId && ctx.from?.id !== adminId) return;
+
+  const cmdText = (ctx.message?.text || "").trim();
+  const masterOnly = /master/i.test(cmdText);
+
+  await ctx.reply(
+    `⏳ Applying column-wide center alignment${masterOnly ? " to master sheet" : " (master + all per-page sheets)"}…\n` +
+    `Throttled to ~1 sheet/sec to stay under quota.`
+  ).catch(() => {});
+
+  let ok = 0, failed = 0;
+  const errors = [];
+
+  // Master sheet
+  if (MASTER_SHEET_ID && !PLACEHOLDER_PATTERN.test(MASTER_SHEET_ID)) {
+    try {
+      await applyColumnCenterAlignment(MASTER_SHEET_ID, TAB_NAME, "K");
+      ok++;
+      console.log(`[adHandler] 🎨 /centersheets: master sheet done`);
+    } catch (err) {
+      failed++;
+      errors.push(`master: ${err.message}`);
+      console.error(`[adHandler] ❌ /centersheets master: ${err.message}`);
+    }
+  }
+
+  if (!masterOnly) {
+    // Per-page sheets — one at a time, throttled
+    const allPages = pagesRegistry.listAllSync ? pagesRegistry.listAllSync() : [];
+    const targets = allPages.filter((p) => p.sheet_id && !PLACEHOLDER_PATTERN.test(p.sheet_id));
+    console.log(`[adHandler] 🎨 /centersheets: ${targets.length} per-page sheets to format`);
+
+    for (const page of targets) {
+      try {
+        await applyColumnCenterAlignment(page.sheet_id, PAGE_TAB_NAME, "H");
+        ok++;
+        console.log(`[adHandler] 🎨 /centersheets: @${page.handle} done`);
+      } catch (err) {
+        failed++;
+        errors.push(`@${page.handle}: ${err.message}`);
+        console.error(`[adHandler] ❌ /centersheets @${page.handle}: ${err.message}`);
+      }
+      // Throttle — stay under 60/min quota
+      await new Promise((r) => setTimeout(r, 1100));
+    }
+  }
+
+  const lines = [
+    `🎨 *CenterSheets done*${masterOnly ? " (master only)" : ""}`,
+    "",
+    `✅ formatted: ${ok}`,
+    failed > 0 ? `❌ failed: ${failed}` : null,
+  ].filter(Boolean);
+  if (errors.length > 0) {
+    lines.push("", "*Errors*:");
+    errors.slice(0, 10).forEach((e) => lines.push(`• \`${e.slice(0, 150)}\``));
+    if (errors.length > 10) lines.push(`…and ${errors.length - 10} more (see logs)`);
+  }
+  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
+}
+
 async function handleAdMessage(ctx) {
   try {
     const text = ctx.message?.text || ctx.message?.caption;
@@ -1013,6 +1089,13 @@ async function handleAdMessage(ctx) {
     // fills nulls. No Telegram re-forwarding — sheets only.
     if (text && /^\/syncsheets\b/i.test(text.trim())) {
       return await handleSyncSheetsCommand(ctx);
+    }
+
+    // /centersheets — one-time column-wide center formatting on every
+    // configured sheet. Future rows then inherit center alignment from
+    // column formatting, so no per-write API cost.
+    if (text && /^\/centersheets\b/i.test(text.trim())) {
+      return await handleCenterSheetsCommand(ctx);
     }
 
     const chatId = String(ctx.chat?.id);
@@ -1316,13 +1399,16 @@ async function handleAdMessage(ctx) {
       console.log(`[adHandler] ✅ Individual page sheets: wrote ${pageSheetCount} row(s)`);
     }
 
-    // Batched center-align across all per-page sheets touched by this brief.
-    // One batchUpdate per unique sheet (so a 25-page brief = 25 format calls
-    // but each is independent — different spreadsheets, no quota cross-contamination).
-    for (const [sheetId, rows] of perPageRowsToFormat) {
-      applyCenterAlignmentBatch(sheetId, PAGE_TAB_NAME, rows, "H")
-        .catch((err) => console.error(`[adHandler] ❌ Center-align page sheet ${sheetId.slice(0, 8)}…: ${err.message}`));
-    }
+    // Per-page sheet center-align was removed — fire-and-forget calls one
+    // batchUpdate per page sheet per brief, which blew the 60/min Sheets
+    // API quota (24-page brief = 48+ extra calls) and caused REAL sheet
+    // writes to drop with "quota exceeded" errors.
+    //
+    // Instead: column-wide center alignment via /centersheets is set ONCE
+    // per sheet — new rows then inherit center formatting from the column
+    // automatically with zero per-brief API cost. Master sheet center-align
+    // (a single call per brief) is kept since it doesn't risk the quota.
+    void perPageRowsToFormat; // keep var for the per-page write loop above
 
     // ── Forward content + ad brief to each page's Telegram destination ─────────
     // Skip entirely if this brief was sent by Greg's /api/ad/intake — Greg already
