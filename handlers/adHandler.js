@@ -604,14 +604,29 @@ async function handleReplayCommand(ctx) {
   }
   const parsedList = Array.isArray(parsed) ? parsed : [parsed];
 
+  // Canonicalize brief-listed handles via the registry — same fuzzy-resolution
+  // applied during initial brief processing. This way the brief's "dankquilius"
+  // (one-L typo) gets matched to the registered "dankquillius", and the user
+  // can pass either spelling in their /replay command.
+  for (const item of parsedList) {
+    if (!item.pageHandle) continue;
+    const canonical = pagesRegistry.resolveHandle(item.pageHandle);
+    if (canonical && canonical !== item.pageHandle.toLowerCase()) {
+      item.pageHandle = canonical;
+    }
+  }
+  // Also canonicalize user-requested handles so /replay accepts either
+  // spelling when the registry has a canonical form for it.
+  const canonicalRequested = requestedHandles.map((h) => pagesRegistry.resolveHandle(h) || h);
+
   // Figure out which handles to target
   const briefHandles = new Set(parsedList.map((p) => p.pageHandle?.toLowerCase()).filter(Boolean));
   let targetHandles;
-  if (requestedHandles.length === 0) {
+  if (canonicalRequested.length === 0) {
     targetHandles = [...briefHandles];
   } else {
-    const valid   = requestedHandles.filter((h) => briefHandles.has(h));
-    const invalid = requestedHandles.filter((h) => !briefHandles.has(h));
+    const valid   = canonicalRequested.filter((h) => briefHandles.has(h));
+    const invalid = canonicalRequested.filter((h) => !briefHandles.has(h));
     if (valid.length === 0) {
       await ctx.reply(
         `❌ None of those handles are in this brief.\n\n` +
