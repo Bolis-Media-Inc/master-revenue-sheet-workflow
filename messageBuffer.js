@@ -528,4 +528,70 @@ function getMessages(chatId) {
   return _buffers.get(String(chatId)) || [];
 }
 
-module.exports = { addMessage, getPrecedingMessages, getContentBundlesByPage, getCollabBundlesByPage, getFilenameBundlesByPage, getMessages, clearBufferUpTo, MAX_BUFFER_PER_CHAT };
+/**
+ * Last-resort scanner for ads with NO attribution (no @<handle>.jpg
+ * filenames, no @page ^ labels, no Host: collab markers — just plain
+ * IMG_XXXX.PNG files like Danny posts).
+ *
+ * Was previously handled inline in adHandler.js by grabbing the last
+ * 4 preceding messages, which silently dropped slides 1-5 of any 6+
+ * slide carousel. Now walks backwards collecting ALL preceding media
+ * until it hits a previous brief — handles carousels of any length.
+ *
+ * Returns the same `{ byHandle, shared }` shape as the other scanners
+ * for forwarder symmetry. byHandle is always empty (no attribution by
+ * definition) — everything goes to shared, where every page receives
+ * the same set of media + caption.
+ *
+ * @param {string} chatId
+ * @param {number} adMessageId
+ * @returns {{ byHandle: Map<string, {media:Array, caption:string|null}>, shared: {media:Array, caption:string|null} }}
+ */
+function getStandardBundle(chatId, adMessageId) {
+  const buf = _buffers.get(String(chatId)) || [];
+  const adIdx = buf.findIndex((m) => m.message_id === adMessageId);
+  if (adIdx <= 0) return { byHandle: new Map(), shared: { media: [], caption: null } };
+  const preceding = buf.slice(0, adIdx);
+
+  const sharedMedia = [];
+
+  // Walk backwards from the message just before the brief. Collect media,
+  // skip non-brief text (admin chatter, captions, annotations like
+  // "8 covers ^"), stop hard if we encounter a previous ad brief.
+  for (let i = preceding.length - 1; i >= 0; i--) {
+    const msg  = preceding[i];
+    const text = (msg.text || "").trim();
+    const hasMedia = !!(
+      msg.photo || msg.video || msg.document ||
+      msg.animation || msg.audio || msg.sticker
+    );
+
+    if (hasMedia) {
+      sharedMedia.unshift(msg); // unshift to preserve chronological order
+      continue;
+    }
+    if (!text) continue;
+    if (_looksLikePreviousBrief(text)) break;
+    // Random non-brief text (caption, annotation, chatter) — skip but keep scanning
+  }
+
+  return {
+    byHandle: new Map(),
+    shared: {
+      media:   sharedMedia,
+      caption: _extractSharedCaption(preceding),
+    },
+  };
+}
+
+module.exports = {
+  addMessage,
+  getPrecedingMessages,
+  getContentBundlesByPage,
+  getCollabBundlesByPage,
+  getFilenameBundlesByPage,
+  getStandardBundle,
+  getMessages,
+  clearBufferUpTo,
+  MAX_BUFFER_PER_CHAT,
+};

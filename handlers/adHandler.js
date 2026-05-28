@@ -13,7 +13,7 @@
 
 const { parseAdMessage }       = require("../parser");
 const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch } = require("../sheets");
-const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages } = require("../messageBuffer");
+const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages, getStandardBundle } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
 const pagesRegistry            = require("../lib/pages");
@@ -654,16 +654,24 @@ async function handleReplayCommand(ctx) {
     console.log(`[adHandler] 🔁 /replay: backfill enabled — ${dbPages.length} DB page rows linked to brief`);
   }
 
-  // Re-build bundles from the messageBuffer (same logic as initial processing)
+  // Re-build bundles from the messageBuffer (same logic as initial processing).
+  // Same getStandardBundle fallback as the main handler so /replay handles
+  // 6+ slide carousels without dropping early slides.
   const collabBundles    = getCollabBundlesByPage(sourceChatId, briefMessageId);
   const filenameBundles  = collabBundles ? null : getFilenameBundlesByPage(sourceChatId, briefMessageId);
   const labelBundles     = (collabBundles || filenameBundles) ? null : getContentBundlesByPage(sourceChatId, briefMessageId);
   const useCollab        = !!collabBundles    && collabBundles.byHandle.size    > 0;
   const useFilenames     = !useCollab && !!filenameBundles && filenameBundles.byHandle.size > 0;
   const useLabels        = !useCollab && !useFilenames && !!labelBundles && labelBundles.byHandle.size > 0;
-  const activeBundle     = useCollab ? collabBundles : useFilenames ? filenameBundles : useLabels ? labelBundles : null;
+  const standardBundle   = (!useCollab && !useFilenames && !useLabels)
+                         ? getStandardBundle(sourceChatId, briefMessageId)
+                         : null;
+  const activeBundle     = useCollab    ? collabBundles
+                         : useFilenames ? filenameBundles
+                         : useLabels    ? labelBundles
+                         : standardBundle;
   const sharedBundle     = activeBundle?.shared || { media: [], caption: null };
-  const fallbackMedia    = (!useCollab && !useFilenames && !useLabels)
+  const fallbackMedia    = (sharedBundle.media.length === 0 && !useCollab && !useFilenames && !useLabels)
     ? getPrecedingMessages(sourceChatId, briefMessageId, 4)
         .filter((m) => m.photo || m.video || m.document || m.animation)
     : [];
@@ -1216,15 +1224,24 @@ async function handleAdMessage(ctx) {
       const useCollab        = !!collabBundles    && collabBundles.byHandle.size    > 0;
       const useFilenames     = !useCollab && !!filenameBundles && filenameBundles.byHandle.size > 0;
       const useLabels        = !useCollab && !useFilenames && !!labelBundles && labelBundles.byHandle.size > 0;
-      // Pick the active bundle source so we read byHandle + shared from
-      // one place below. When no attribution detected, sharedBundle is
-      // empty and we fall through to the legacy 4-preceding-media path.
+      // Pick the active bundle source. When no attribution is detected by
+      // any of the three structured scanners, fall back to getStandardBundle:
+      // walks backwards collecting ALL preceding media until hitting a
+      // previous brief, and captures the IG caption text. Replaces the old
+      // "last 4 preceding messages" heuristic which silently dropped slides
+      // 1-5 of any 6+ slide carousel.
+      const standardBundle   = (!useCollab && !useFilenames && !useLabels)
+                             ? getStandardBundle(sourceChatId, adMessageId)
+                             : null;
       const activeBundle     = useCollab    ? collabBundles
                              : useFilenames ? filenameBundles
                              : useLabels    ? labelBundles
-                             : null;
+                             : standardBundle;
       const sharedBundle     = activeBundle?.shared || { media: [], caption: null };
-      const fallbackMedia  = (!useCollab && !useFilenames && !useLabels)
+      // fallbackMedia kept as a final escape hatch — used only when the
+      // ad message itself isn't in the buffer (so getStandardBundle returns
+      // empty). Otherwise sharedBundle has everything.
+      const fallbackMedia  = (sharedBundle.media.length === 0 && !useCollab && !useFilenames && !useLabels)
         ? getPrecedingMessages(sourceChatId, adMessageId, 4)
             .filter((m) => m.photo || m.video || m.document || m.animation)
         : [];
@@ -1233,6 +1250,10 @@ async function handleAdMessage(ctx) {
                            : useFilenames ? "filename-attributed"
                            : useLabels ? "per-page-label"
                            : "standard";
+      // True iff we have actual per-handle attribution. Standard fallback
+      // has activeBundle set but byHandle is empty by design — every page
+      // gets the same shared bundle, no per-page differentiation.
+      const isAttributed = useCollab || useFilenames || useLabels;
       const attributedCount = activeBundle?.byHandle.size || 0;
       console.log(
         `[adHandler] 📤 Manual ad — forwarding ` +
@@ -1296,7 +1317,9 @@ async function handleAdMessage(ctx) {
       //                 typo in a handle-list or filename. The forwarder
       //                 will skip these (only brief-listed pages get sent
       //                 to), so they're surfaced for human review.
-      if (activeBundle) {
+      // Skip entirely in standard fallback — there's no per-handle
+      // attribution by definition, every page gets the same shared bundle.
+      if (isAttributed) {
         const listed     = new Set(parsedList.map((p) => p.pageHandle?.toLowerCase()).filter(Boolean));
         const attributed = new Set([...activeBundle.byHandle.keys()]);
         const covered    = [...listed].filter((h) => attributed.has(h));
@@ -1369,7 +1392,11 @@ async function handleAdMessage(ctx) {
         const perPageCaption = perPageBundle.caption;
 
         // 1️⃣ Forward per-page attributed media (cover = slide 1)
-        if (perPageMedia.length === 0 && activeBundle) {
+        // Only warn about missing per-page creative when an ATTRIBUTED
+        // bundle is in effect (collab / filename / label). In standard
+        // fallback every page receives the same shared bundle by design,
+        // so "no per-page creative" isn't a missing-creative bug.
+        if (perPageMedia.length === 0 && isAttributed) {
           // We HAVE attribution data but this specific handle isn't in
           // byHandle. Operator typo'd the label / host line, OR the page
           // was added to the brief but its creative wasn't included.
