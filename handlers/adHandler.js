@@ -854,6 +854,143 @@ async function handleReplayCommand(ctx) {
   await ctx.reply(reply, { parse_mode: "Markdown" }).catch(() => {});
 }
 
+/**
+ * /syncsheets — write any missing sheet rows for briefs captured in DB.
+ *
+ * Walks ad_brief_pages for entries with NULL master_sheet_row or
+ * NULL page_sheet_row, rebuilds the rows from the joined brief data,
+ * appends to the correct sheets via the (now grid-extending) appendRow,
+ * and writes the resulting row numbers back to DB.
+ *
+ * Idempotent — only writes when the corresponding sheet_row column is
+ * still NULL. Re-runs are safe.
+ *
+ * No Telegram re-forwarding (unlike /replay) — sheets only. Use when
+ * the chat-side outcome is already fine and you just need the books
+ * caught up.
+ *
+ * Usage:
+ *   /syncsheets                       — fix everything that's missing
+ *   /syncsheets FashionNova           — fix only briefs matching client name
+ *   /syncsheets Stake BET SLIP Day 5  — multi-word filter works
+ */
+async function handleSyncSheetsCommand(ctx) {
+  // Same admin gate as /replay
+  const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+  if (adminId && ctx.from?.id !== adminId) {
+    console.log(`[adHandler] /syncsheets denied — user ${ctx.from?.id} is not admin (${adminId})`);
+    return;
+  }
+
+  const cmdText = (ctx.message?.text || "").trim();
+  const clientFilter = cmdText.replace(/^\/syncsheets\s*/i, "").trim() || null;
+
+  await ctx.reply(
+    `⏳ Scanning DB for incomplete sheet writes${clientFilter ? ` matching "${clientFilter}"` : ""}…`
+  ).catch(() => {});
+
+  const incomplete = await adBriefs.findIncompletePages({ clientFilter });
+  if (incomplete.length === 0) {
+    await ctx.reply("✅ Nothing to sync — every captured brief has both sheet rows populated.").catch(() => {});
+    return;
+  }
+
+  console.log(`[adHandler] 🩹 /syncsheets — ${incomplete.length} incomplete page row(s) to backfill`);
+
+  let masterWritten = 0, masterAlreadyOk = 0, masterFailed = 0;
+  let pageWritten   = 0, pageAlreadyOk   = 0, pageFailed   = 0, pageSkippedNoSheet = 0;
+  const errors = [];
+
+  for (const row of incomplete) {
+    const brief = row.brief;
+    if (!brief) { errors.push(`@${row.page_handle}: missing brief join`); continue; }
+
+    // Build a parsed-item shape that matches what buildRow/buildPageRow expect
+    const parsedItem = {
+      client:       brief.client,
+      category:     brief.category,
+      adPrice:      row.page_price,
+      pageHandle:   row.page_handle,
+      bulkNum:      row.bulk_num,
+      postType:     brief.post_type,
+      postDuration: brief.post_duration,
+      nif:          brief.nif,
+      datePosted:   brief.date_posted,
+      timeMST:      brief.time_mst,
+    };
+
+    // ── Master sheet backfill ───────────────────────────────────────────
+    if (!row.master_sheet_row && MASTER_SHEET_ID && !PLACEHOLDER_PATTERN.test(MASTER_SHEET_ID)) {
+      try {
+        const rowNum = await appendRow(MASTER_SHEET_ID, TAB_NAME, buildRow(parsedItem));
+        if (rowNum) {
+          await adBriefs.updatePageSheetRows(row.id, { masterSheetRow: rowNum });
+          applyCenterAlignmentBatch(MASTER_SHEET_ID, TAB_NAME, [rowNum], "K").catch(() => {});
+          masterWritten++;
+          console.log(`[adHandler] 🩹 /syncsheets: master row ${rowNum} → ${brief.client} / @${row.page_handle}`);
+        }
+      } catch (err) {
+        masterFailed++;
+        const msg = `master @${row.page_handle} (${brief.client}): ${err.message}`;
+        errors.push(msg);
+        console.error(`[adHandler] ❌ /syncsheets ${msg}`);
+      }
+    } else if (row.master_sheet_row) {
+      masterAlreadyOk++;
+    }
+
+    // ── Per-page sheet backfill ─────────────────────────────────────────
+    if (!row.page_sheet_row) {
+      const sheetId = pagesRegistry.getSheetId(row.page_handle);
+      if (!sheetId || PLACEHOLDER_PATTERN.test(sheetId)) {
+        pageSkippedNoSheet++;
+        console.warn(`[adHandler] ⚠️ /syncsheets: no sheet_id for @${row.page_handle} — skipping per-page`);
+        continue;
+      }
+      try {
+        const rowNum = await appendRow(sheetId, PAGE_TAB_NAME, buildPageRow(parsedItem), {
+          anchorColumn: "A", endColumn: "H",
+        });
+        if (rowNum) {
+          await adBriefs.updatePageSheetRows(row.id, { pageSheetRow: rowNum });
+          applyCenterAlignmentBatch(sheetId, PAGE_TAB_NAME, [rowNum], "H").catch(() => {});
+          pageWritten++;
+          console.log(`[adHandler] 🩹 /syncsheets: page row ${rowNum} → @${row.page_handle} (${brief.client})`);
+        }
+      } catch (err) {
+        pageFailed++;
+        const msg = `page @${row.page_handle} (${brief.client}): ${err.message}`;
+        errors.push(msg);
+        console.error(`[adHandler] ❌ /syncsheets ${msg}`);
+      }
+    } else {
+      pageAlreadyOk++;
+    }
+  }
+
+  // Build a human summary
+  const lines = [
+    `🩹 *SyncSheets done*${clientFilter ? ` (filter: \`${clientFilter}\`)` : ""}`,
+    "",
+    `*Master sheet*:`,
+    `  ✅ wrote ${masterWritten}`,
+    `  ⏭️  already ok ${masterAlreadyOk}`,
+    masterFailed > 0 ? `  ❌ failed ${masterFailed}` : null,
+    "",
+    `*Per-page sheets*:`,
+    `  ✅ wrote ${pageWritten}`,
+    `  ⏭️  already ok ${pageAlreadyOk}`,
+    pageSkippedNoSheet > 0 ? `  ⚠️  no sheet_id ${pageSkippedNoSheet}` : null,
+    pageFailed > 0 ? `  ❌ failed ${pageFailed}` : null,
+  ].filter(Boolean);
+  if (errors.length > 0) {
+    lines.push("", "*First few errors*:");
+    errors.slice(0, 5).forEach((e) => lines.push(`• \`${e.slice(0, 150)}\``));
+    if (errors.length > 5) lines.push(`…and ${errors.length - 5} more (see logs)`);
+  }
+  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
+}
+
 async function handleAdMessage(ctx) {
   try {
     const text = ctx.message?.text || ctx.message?.caption;
@@ -870,6 +1007,12 @@ async function handleAdMessage(ctx) {
     //                   buffers (TARGET_CHAT_IDS) for the brief by name.
     if (text && /^\/replay\b/i.test(text.trim())) {
       return await handleReplayCommand(ctx);
+    }
+
+    // /syncsheets — backfill missing sheet rows from DB. Idempotent, only
+    // fills nulls. No Telegram re-forwarding — sheets only.
+    if (text && /^\/syncsheets\b/i.test(text.trim())) {
+      return await handleSyncSheetsCommand(ctx);
     }
 
     const chatId = String(ctx.chat?.id);
