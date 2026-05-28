@@ -423,14 +423,27 @@ async function handleReplayCommand(ctx) {
   const replyTo = ctx.message?.reply_to_message;
 
   if (replyTo) {
-    // Reply mode
+    // Reply mode — first try the replied message itself
     briefText      = replyTo.text || replyTo.caption || "";
     briefMessageId = replyTo.message_id;
     sourceChatId   = String(ctx.chat.id);
     briefDate      = new Date((replyTo.date || Math.floor(Date.now() / 1000)) * 1000);
     if (!briefText) {
-      await ctx.reply("❌ Replied message has no text — can't replay.").catch(() => {});
-      return;
+      // DB fallback — replied msg has no text but we may have captured it earlier.
+      // Happens when the brief is a media-only message and the captured raw_text
+      // is on a different originating message_id.
+      const dbBrief = await adBriefs.findBriefByTelegramMessage(
+        Number(ctx.chat.id),
+        replyTo.message_id,
+      );
+      if (dbBrief) {
+        briefText = dbBrief.raw_text;
+        briefDate = new Date(dbBrief.received_at);
+        console.log(`[adHandler] 🔁 /replay reply-mode found brief in DB — brief_id=${dbBrief.id.slice(0, 8)}…`);
+      } else {
+        await ctx.reply("❌ Replied message has no text — can't replay.").catch(() => {});
+        return;
+      }
     }
   } else {
     // Search mode — strip "/replay" + handle mentions to get the campaign name
@@ -481,22 +494,73 @@ async function handleReplayCommand(ctx) {
       }
     }
 
+    // ── DB fallback ─────────────────────────────────────────────────────────
+    // Buffer miss → check the ad_briefs table (persisted since 8fc4cda).
+    // This lets /replay reach briefs older than the in-memory buffer's window.
+    // Limitation: DB has raw_text + shared media file_ids but no Message
+    // objects, so media re-attachment via DB requires schema extension to
+    // store media types (out of scope this commit). For now the DB path
+    // forwards the per-page brief text only — same UX as a text-only
+    // campaign like Stake. Full media replay from DB lands in a follow-up.
+    let dbBrief = null;
     if (!match) {
+      const candidates = await adBriefs.findBriefsByClient(campaignName, 5);
+      if (candidates.length > 0) {
+        // Default: most recent match (already sorted DESC). If multiple,
+        // surface the date list so user can re-issue with a more specific name.
+        dbBrief = candidates[0];
+        if (candidates.length > 1) {
+          // Heads-up listing: monthly-recurring briefs (Stake bet slip etc.)
+          // will have multiple matches. Show date_posted so user can confirm.
+          const lines = candidates.map((b, i) => {
+            const dt = new Date(b.received_at).toLocaleString("en-US", {
+              timeZone: "America/Phoenix",
+              weekday: "short",
+              month:   "numeric",
+              day:     "numeric",
+              year:    "2-digit",
+              hour:    "numeric",
+              minute:  "2-digit",
+            });
+            return `${i === 0 ? "▶" : " "} [${i + 1}] ${dt} — ${b.client}`;
+          });
+          await ctx.reply(
+            `🔍 Found ${candidates.length} briefs matching "${campaignName}".\n` +
+            `Replaying the most recent (▶):\n\n${lines.join("\n")}\n\n` +
+            `If you wanted a different one, re-run /replay with a more specific name ` +
+            `(e.g. add the month: "${campaignName} ${new Date(candidates[0].received_at).toLocaleString("en-US", { month: "short", timeZone: "America/Phoenix" })}").`,
+            { parse_mode: "Markdown" }
+          ).catch(() => {});
+        }
+      }
+    }
+
+    if (!match && !dbBrief) {
       await ctx.reply(
         `❌ Couldn't find a brief matching "${campaignName}" in the bot's recent buffers ` +
-        `(last 30 msgs of Internal Network Ads + AI TEST).\n\n` +
-        `Either the brief aged out or the name doesn't match. ` +
-        `Try replying to the brief directly with \`/replay @${requestedHandles.join(" @")}\` instead.`,
+        `or DB history.\n\n` +
+        `Either the brief was never seen by this bot (predates DB capture, deployed today) ` +
+        `or the name doesn't match. Try replying to the brief directly with ` +
+        `\`/replay @${requestedHandles.join(" @")}\` instead.`,
         { parse_mode: "Markdown" }
       ).catch(() => {});
       return;
     }
 
-    briefText      = match.msg.text || match.msg.caption || "";
-    briefMessageId = match.msg.message_id;
-    sourceChatId   = match.chatId;
-    briefDate      = new Date((match.msg.date || 0) * 1000);
-    console.log(`[adHandler] 🔁 /replay search found "${match.parsedClient}" in chat ${sourceChatId} (msg ${briefMessageId})`);
+    if (match) {
+      briefText      = match.msg.text || match.msg.caption || "";
+      briefMessageId = match.msg.message_id;
+      sourceChatId   = match.chatId;
+      briefDate      = new Date((match.msg.date || 0) * 1000);
+      console.log(`[adHandler] 🔁 /replay search (buffer) found "${match.parsedClient}" in chat ${sourceChatId} (msg ${briefMessageId})`);
+    } else {
+      // DB path — synthesize what buffer mode would have provided
+      briefText      = dbBrief.raw_text;
+      briefMessageId = dbBrief.telegram_message_id;
+      sourceChatId   = String(dbBrief.telegram_chat_id);
+      briefDate      = new Date(dbBrief.received_at);
+      console.log(`[adHandler] 🔁 /replay search (DB) found "${dbBrief.client}" — brief_id=${dbBrief.id.slice(0, 8)}…`);
+    }
   }
 
   // Re-parse the brief (search mode parsed once already, but re-parse for
