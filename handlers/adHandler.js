@@ -989,10 +989,15 @@ async function handleSyncSheetsCommand(ctx) {
 
     // ── Per-page sheet backfill ─────────────────────────────────────────
     if (!row.page_sheet_row) {
-      const sheetId = pagesRegistry.getSheetId(row.page_handle);
+      // Fuzzy-resolve in case the DB row has a typo'd handle (e.g.
+      // historical @dankquilius vs registered @dankquillius). Avoids
+      // skipping per-page writes for recoverable misspellings.
+      const canonicalHandle = pagesRegistry.resolveHandle(row.page_handle) || row.page_handle;
+      const sheetId = pagesRegistry.getSheetId(canonicalHandle);
       if (!sheetId || PLACEHOLDER_PATTERN.test(sheetId)) {
         pageSkippedNoSheet++;
         console.warn(`[adHandler] ⚠️ /syncsheets: no sheet_id for @${row.page_handle} — skipping per-page`);
+        processed++;
         continue;
       }
       try {
@@ -1365,6 +1370,20 @@ async function handleAdMessage(ctx) {
 
     // Normalise to array so multi-page and single-page use the same code path
     const parsedList = Array.isArray(parsed) ? parsed : [parsed];
+
+    // ── Fuzzy-canonicalize page handles against the registry ────────────────
+    // Briefs sometimes typo handles (e.g. @dankquilius / one L instead of
+    // the registered @dankquillius / two L's). Resolving early means every
+    // downstream lookup (sheet_id, chat_id, auto_forward) hits a canonical
+    // handle. Falls through unchanged for unknown handles — we only "fix"
+    // a handle when there's a unique fuzzy match within distance 1.
+    for (const item of parsedList) {
+      if (!item.pageHandle) continue;
+      const canonical = pagesRegistry.resolveHandle(item.pageHandle);
+      if (canonical && canonical !== item.pageHandle.toLowerCase()) {
+        item.pageHandle = canonical;
+      }
+    }
 
     console.log(
       `[adHandler] Ad detected: "${parsedList[0].client}" / ${parsedList[0].category}` +
