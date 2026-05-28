@@ -605,6 +605,23 @@ async function handleReplayCommand(ctx) {
     return;
   }
 
+  // ── Look up brief + page rows in DB ─────────────────────────────────────
+  // If this brief was processed AFTER the adBriefs wiring landed (8fc4cda),
+  // we can backfill any sheet rows that were missed at original-processing
+  // time (e.g. dropped by Sheets API quota errors). When briefRowId is null
+  // — either DB disabled or brief predates the capture — skip backfill
+  // silently and just do pure Telegram re-forwarding.
+  const dbBriefForBackfill = await adBriefs.findBriefByTelegramMessage(
+    Number(sourceChatId),
+    briefMessageId,
+  );
+  const dbPagesByHandle = new Map();
+  if (dbBriefForBackfill) {
+    const dbPages = await adBriefs.getBriefPages(dbBriefForBackfill.id);
+    for (const p of dbPages) dbPagesByHandle.set(p.page_handle, p);
+    console.log(`[adHandler] 🔁 /replay: backfill enabled — ${dbPages.length} DB page rows linked to brief`);
+  }
+
   // Re-build bundles from the messageBuffer (same logic as initial processing)
   const collabBundles    = getCollabBundlesByPage(sourceChatId, briefMessageId);
   const filenameBundles  = collabBundles ? null : getFilenameBundlesByPage(sourceChatId, briefMessageId);
@@ -695,6 +712,53 @@ async function handleReplayCommand(ctx) {
       await forwardToPage(
         ctx.telegram, sourceChatId, briefMessageId, briefText, destChatId, handle, parsedItem,
       );
+
+      // ── Backfill missing sheet rows ─────────────────────────────────────
+      // If the original processing missed a sheet write (quota error,
+      // network blip, etc.), DB will have null master_sheet_row /
+      // page_sheet_row on the corresponding ad_brief_pages row. Now that
+      // we're successfully forwarding, re-attempt those writes using the
+      // now-deterministic appendRow. Failures here are non-fatal — log,
+      // don't abort the rest of the loop.
+      const dbPage = dbPagesByHandle.get(handle.toLowerCase());
+      if (dbPage && parsedItem) {
+        // Master sheet backfill
+        if (MASTER_SHEET_ID && !dbPage.master_sheet_row && !PLACEHOLDER_PATTERN.test(MASTER_SHEET_ID)) {
+          try {
+            const rowNum = await appendRow(MASTER_SHEET_ID, TAB_NAME, buildRow(parsedItem));
+            if (rowNum) {
+              adBriefs.updatePageSheetRows(dbPage.id, { masterSheetRow: rowNum }).catch(() => {});
+              console.log(`[adHandler] 🩹 /replay backfilled master sheet row ${rowNum} for @${handle}`);
+            }
+          } catch (err) {
+            console.error(`[adHandler] ❌ /replay master backfill @${handle}: ${err.message}`);
+          }
+        }
+        // Per-page sheet backfill
+        if (!dbPage.page_sheet_row) {
+          const sheetId = pagesRegistry.getSheetId(handle);
+          if (sheetId && !PLACEHOLDER_PATTERN.test(sheetId)) {
+            try {
+              const rowNum = await appendRow(
+                sheetId, PAGE_TAB_NAME, buildPageRow(parsedItem),
+                { anchorColumn: "A", endColumn: "H" },
+              );
+              if (rowNum) {
+                adBriefs.updatePageSheetRows(dbPage.id, { pageSheetRow: rowNum }).catch(() => {});
+                console.log(`[adHandler] 🩹 /replay backfilled per-page row ${rowNum} for @${handle}`);
+              }
+            } catch (err) {
+              console.error(`[adHandler] ❌ /replay page backfill @${handle}: ${err.message}`);
+            }
+          }
+        }
+        // Mark forwarded in DB (covers both first-time successful forwards
+        // and re-replays of previously-failed forwards)
+        adBriefs.markPageForwarded(dbPage.id, {
+          masterSheetRow: dbPage.master_sheet_row ?? null,
+          pageSheetRow:   dbPage.page_sheet_row   ?? null,
+        }).catch(() => {});
+      }
 
       ok++;
       console.log(`[adHandler] ✅ /replay complete for @${handle}`);
