@@ -884,17 +884,40 @@ async function handleSyncSheetsCommand(ctx) {
   const cmdText = (ctx.message?.text || "").trim();
   const clientFilter = cmdText.replace(/^\/syncsheets\s*/i, "").trim() || null;
 
-  await ctx.reply(
+  // Single Telegram message that we edit as we go — gives Connor live
+  // progress instead of staring at a stuck "Scanning..." for 30+ seconds.
+  // Telegram editMessageText is cheap (rate-limited at ~30/min per chat,
+  // we update ~5 times max).
+  const statusMsg = await ctx.reply(
     `⏳ Scanning DB for incomplete sheet writes${clientFilter ? ` matching "${clientFilter}"` : ""}…`
-  ).catch(() => {});
+  ).catch(() => null);
+
+  const editStatus = async (text) => {
+    if (!statusMsg) return;
+    try {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, statusMsg.message_id, undefined, text,
+        { parse_mode: "Markdown" }
+      );
+    } catch (err) {
+      // 400 Bad Request: message is not modified → no-op, ignore
+      if (!/not modified/i.test(err.message || "")) {
+        console.error(`[adHandler] /syncsheets editStatus: ${err.message}`);
+      }
+    }
+  };
 
   const incomplete = await adBriefs.findIncompletePages({ clientFilter });
   if (incomplete.length === 0) {
-    await ctx.reply("✅ Nothing to sync — every captured brief has both sheet rows populated.").catch(() => {});
+    await editStatus("✅ *Nothing to sync* — every captured brief has both sheet rows populated.");
     return;
   }
 
   console.log(`[adHandler] 🩹 /syncsheets — ${incomplete.length} incomplete page row(s) to backfill`);
+  await editStatus(
+    `🔍 Found *${incomplete.length}* incomplete row(s)${clientFilter ? ` matching \`${clientFilter}\`` : ""}\n` +
+    `🛠️  Processing… (rate-limited to ~50 API calls/min, est. ${Math.ceil(incomplete.length * 4 / 50)} min)`
+  );
 
   let masterWritten = 0, masterAlreadyOk = 0, masterFailed = 0;
   let pageWritten   = 0, pageAlreadyOk   = 0, pageFailed   = 0, pageSkippedNoSheet = 0;
@@ -904,9 +927,23 @@ async function handleSyncSheetsCommand(ctx) {
   // original markForwarded batched never saw the row number).
   const masterRowsToTickForwarded = [];
 
+  let processed = 0;
+  let lastProgressEdit = Date.now();
   for (const row of incomplete) {
     const brief = row.brief;
-    if (!brief) { errors.push(`@${row.page_handle}: missing brief join`); continue; }
+    if (!brief) { errors.push(`@${row.page_handle}: missing brief join`); processed++; continue; }
+
+    // Edit the status message every ~5 seconds so Connor sees motion.
+    // Telegram allows up to 30 edits/min/message — we're well under that.
+    if (Date.now() - lastProgressEdit > 5000) {
+      const pct = Math.round((processed / incomplete.length) * 100);
+      editStatus(
+        `🛠️  *Backfilling sheets* — ${processed}/${incomplete.length} (${pct}%)\n` +
+        `Master: ${masterWritten} written · Per-page: ${pageWritten} written` +
+        (masterFailed + pageFailed > 0 ? ` · ${masterFailed + pageFailed} failed` : "")
+      ).catch(() => {});
+      lastProgressEdit = Date.now();
+    }
 
     // Build a parsed-item shape that matches what buildRow/buildPageRow expect.
     // If DB shows this page was Posted-on (regardless of whether the master
@@ -977,6 +1014,7 @@ async function handleSyncSheetsCommand(ctx) {
     } else {
       pageAlreadyOk++;
     }
+    processed++;
   }
 
   // Tick Forwarded ✅ on master rows that were already forwarded per DB
@@ -1015,7 +1053,14 @@ async function handleSyncSheetsCommand(ctx) {
     errors.slice(0, 5).forEach((e) => lines.push(`• \`${e.slice(0, 150)}\``));
     if (errors.length > 5) lines.push(`…and ${errors.length - 5} more (see logs)`);
   }
-  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
+  // Edit the status message we've been updating throughout; fall back to a
+  // new reply if the original message couldn't be edited (e.g. it was
+  // deleted manually).
+  if (statusMsg) {
+    await editStatus(lines.join("\n"));
+  } else {
+    await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
+  }
 }
 
 /**
@@ -1038,10 +1083,22 @@ async function handleCenterSheetsCommand(ctx) {
   const cmdText = (ctx.message?.text || "").trim();
   const masterOnly = /master/i.test(cmdText);
 
-  await ctx.reply(
-    `⏳ Applying column-wide center alignment${masterOnly ? " to master sheet" : " (master + all per-page sheets)"}…\n` +
-    `Throttled to ~1 sheet/sec to stay under quota.`
-  ).catch(() => {});
+  // Live-edited status message (same pattern as /syncsheets)
+  const statusMsg = await ctx.reply(
+    `⏳ Applying column-wide center alignment${masterOnly ? " to master sheet" : " (master + all per-page sheets)"}…`
+  ).catch(() => null);
+  const editStatus = async (text) => {
+    if (!statusMsg) return;
+    try {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, statusMsg.message_id, undefined, text, { parse_mode: "Markdown" }
+      );
+    } catch (err) {
+      if (!/not modified/i.test(err.message || "")) {
+        console.error(`[adHandler] /centersheets editStatus: ${err.message}`);
+      }
+    }
+  };
 
   let ok = 0, failed = 0;
   const errors = [];
@@ -1065,6 +1122,14 @@ async function handleCenterSheetsCommand(ctx) {
     const targets = allPages.filter((p) => p.sheet_id && !PLACEHOLDER_PATTERN.test(p.sheet_id));
     console.log(`[adHandler] 🎨 /centersheets: ${targets.length} per-page sheets to format`);
 
+    await editStatus(
+      `🎨 *CenterSheets in progress*\n` +
+      `Master: ✅\n` +
+      `Per-page: 0/${targets.length} (est. ~${Math.ceil(targets.length / 50)} min)`
+    );
+
+    let lastProgressEdit = Date.now();
+    let processed = 0;
     for (const page of targets) {
       try {
         await applyColumnCenterAlignment(page.sheet_id, PAGE_TAB_NAME, "H");
@@ -1075,8 +1140,18 @@ async function handleCenterSheetsCommand(ctx) {
         errors.push(`@${page.handle}: ${err.message}`);
         console.error(`[adHandler] ❌ /centersheets @${page.handle}: ${err.message}`);
       }
-      // Throttle — stay under 60/min quota
-      await new Promise((r) => setTimeout(r, 1100));
+      processed++;
+      // Edit progress every ~5s
+      if (Date.now() - lastProgressEdit > 5000) {
+        editStatus(
+          `🎨 *CenterSheets in progress*\n` +
+          `Master: ✅\n` +
+          `Per-page: ${processed}/${targets.length}${failed > 0 ? ` · ${failed} failed` : ""}`
+        ).catch(() => {});
+        lastProgressEdit = Date.now();
+      }
+      // Throttle is now handled by the API rate limiter (50/min) inside
+      // sheets.js — no extra setTimeout needed here.
     }
   }
 
@@ -1091,7 +1166,11 @@ async function handleCenterSheetsCommand(ctx) {
     errors.slice(0, 10).forEach((e) => lines.push(`• \`${e.slice(0, 150)}\``));
     if (errors.length > 10) lines.push(`…and ${errors.length - 10} more (see logs)`);
   }
-  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
+  if (statusMsg) {
+    await editStatus(lines.join("\n"));
+  } else {
+    await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
+  }
 }
 
 async function handleAdMessage(ctx) {
