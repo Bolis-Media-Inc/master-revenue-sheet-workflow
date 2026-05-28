@@ -191,6 +191,38 @@ function formatSheetDate(date) {
 }
 
 /**
+ * Canonicalize a bundle's byHandle keys against the pages registry.
+ * Bundle scanners (messageBuffer.js) read raw handles from Telegram text
+ * / filenames. When a host line says "@dankquilius" (one-L typo) but the
+ * registry has "@dankquillius", we need byHandle's key to match what the
+ * canonicalized parsedList uses — otherwise the forwarder iterates over
+ * parsedList handles, looks them up in byHandle, misses, and falls back
+ * to "no per-page creative" warnings.
+ *
+ * Merges entries when canonicalization collapses two raw handles into
+ * one canonical handle (e.g. both "dankquilius" and "dankquillius"
+ * appear in a brief somehow → merge their media + take first non-null
+ * caption).
+ *
+ * Returns a new bundle; safe to call with null.
+ */
+function canonicalizeBundleHandles(bundle) {
+  if (!bundle?.byHandle || bundle.byHandle.size === 0) return bundle;
+  const canon = new Map();
+  for (const [handle, b] of bundle.byHandle) {
+    const canonical = pagesRegistry.resolveHandle(handle) || handle;
+    if (canon.has(canonical)) {
+      const existing = canon.get(canonical);
+      existing.media = [...existing.media, ...(b.media || [])];
+      if (!existing.caption && b.caption) existing.caption = b.caption;
+    } else {
+      canon.set(canonical, { media: [...(b.media || [])], caption: b.caption });
+    }
+  }
+  return { ...bundle, byHandle: canon };
+}
+
+/**
  * Send a stored media reference ({file_id, kind}) to a chat via the right
  * Telegram method. Used by DB-backed /replay to re-attach media when the
  * original messages are no longer in the in-memory buffer.
@@ -672,9 +704,12 @@ async function handleReplayCommand(ctx) {
   // Re-build bundles from the messageBuffer (same logic as initial processing).
   // Same getStandardBundle fallback as the main handler so /replay handles
   // 6+ slide carousels without dropping early slides.
-  const collabBundles    = getCollabBundlesByPage(sourceChatId, briefMessageId);
-  const filenameBundles  = collabBundles ? null : getFilenameBundlesByPage(sourceChatId, briefMessageId);
-  const labelBundles     = (collabBundles || filenameBundles) ? null : getContentBundlesByPage(sourceChatId, briefMessageId);
+  // Scanner output is canonicalized against the registry so the
+  // forwarder's parsedList-vs-byHandle lookup never misses on typo'd
+  // raw handles in Host lines / filenames / labels.
+  const collabBundles    = canonicalizeBundleHandles(getCollabBundlesByPage(sourceChatId, briefMessageId));
+  const filenameBundles  = collabBundles ? null : canonicalizeBundleHandles(getFilenameBundlesByPage(sourceChatId, briefMessageId));
+  const labelBundles     = (collabBundles || filenameBundles) ? null : canonicalizeBundleHandles(getContentBundlesByPage(sourceChatId, briefMessageId));
   const useCollab        = !!collabBundles    && collabBundles.byHandle.size    > 0;
   const useFilenames     = !useCollab && !!filenameBundles && filenameBundles.byHandle.size > 0;
   const useLabels        = !useCollab && !useFilenames && !!labelBundles && labelBundles.byHandle.size > 0;
@@ -1594,9 +1629,12 @@ async function handleAdMessage(ctx) {
       // ALL pages" videos) and the IG caption text Danielson types right
       // above the brief — every page receives shared content alongside
       // its per-page attributed cover.
-      const collabBundles    = getCollabBundlesByPage(sourceChatId, adMessageId);
-      const filenameBundles  = collabBundles ? null : getFilenameBundlesByPage(sourceChatId, adMessageId);
-      const labelBundles     = (collabBundles || filenameBundles) ? null : getContentBundlesByPage(sourceChatId, adMessageId);
+      // Canonicalize scanner output against the registry so byHandle keys
+      // match the canonicalized parsedList handles downstream (avoids
+      // "no per-page creative" warnings when a Host line typo'd a handle).
+      const collabBundles    = canonicalizeBundleHandles(getCollabBundlesByPage(sourceChatId, adMessageId));
+      const filenameBundles  = collabBundles ? null : canonicalizeBundleHandles(getFilenameBundlesByPage(sourceChatId, adMessageId));
+      const labelBundles     = (collabBundles || filenameBundles) ? null : canonicalizeBundleHandles(getContentBundlesByPage(sourceChatId, adMessageId));
       const useCollab        = !!collabBundles    && collabBundles.byHandle.size    > 0;
       const useFilenames     = !useCollab && !!filenameBundles && filenameBundles.byHandle.size > 0;
       const useLabels        = !useCollab && !useFilenames && !!labelBundles && labelBundles.byHandle.size > 0;

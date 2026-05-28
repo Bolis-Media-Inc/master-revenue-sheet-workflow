@@ -431,11 +431,16 @@ function getCollabBundlesByPage(chatId, adMessageId) {
     }
   }
 
-  // Collab doesn't use the team's "shared slides for ALL" pattern —
-  // everything is routed through Host/invite blocks. Return empty
-  // shared bundle so the caller can read collab results with the same
-  // shape as the other scanners.
-  return { byHandle, shared: { media: [], caption: null } };
+  // Collab doesn't use the "shared slides for ALL" media pattern (all
+  // collab content routes through Host/invite blocks), but Danielson
+  // DOES still type a shared IG caption right above the brief — same
+  // convention as label / filename / standard formats. Capture it so
+  // every collab destination chat gets the caption alongside the
+  // per-page video + host message.
+  return {
+    byHandle,
+    shared: { media: [], caption: _extractSharedCaption(preceding) },
+  };
 }
 
 /**
