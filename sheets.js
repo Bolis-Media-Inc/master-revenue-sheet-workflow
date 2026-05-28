@@ -100,12 +100,51 @@ async function appendRow(spreadsheetId, tabName, rowValues, opts = {}) {
   }
   const targetRow = lastFilledRow + 1;
 
-  await sheets.spreadsheets.values.update({
-    spreadsheetId,
-    range: `${tabName}!A${targetRow}:${endColumn}${targetRow}`,
-    valueInputOption: "USER_ENTERED",
-    requestBody: { values: [rowValues] },
-  });
+  // values.update fails with "exceeds grid limits" when the target row is
+  // beyond the sheet's currently-allocated grid (default sheets ship with
+  // 1000 rows; once filled, the sheet caps there). values.append would
+  // auto-extend but it has the table-detection issues described above.
+  // Solution: try update, catch grid-exceeded, extend by 1000 rows, retry.
+  try {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `${tabName}!A${targetRow}:${endColumn}${targetRow}`,
+      valueInputOption: "USER_ENTERED",
+      requestBody: { values: [rowValues] },
+    });
+  } catch (err) {
+    const msg = err?.message || String(err);
+    if (!/exceeds grid limits/i.test(msg)) throw err;
+
+    // Find the numeric sheet id (different from spreadsheetId) — needed by
+    // batchUpdate's appendDimension request.
+    const meta  = await sheets.spreadsheets.get({ spreadsheetId });
+    const sheet = meta.data.sheets?.find((s) => s.properties.title === tabName);
+    if (!sheet) throw err; // re-throw original if we can't find the tab
+    const sheetId = sheet.properties.sheetId;
+
+    console.log(`[sheets] 📐 Extending "${tabName}" by 1000 rows (target row ${targetRow} exceeded grid)`);
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests: [{
+          appendDimension: {
+            sheetId,
+            dimension: "ROWS",
+            length: 1000,
+          },
+        }],
+      },
+    });
+
+    // Retry the value write now that the row exists
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `${tabName}!A${targetRow}:${endColumn}${targetRow}`,
+      valueInputOption: "USER_ENTERED",
+      requestBody: { values: [rowValues] },
+    });
+  }
 
   return targetRow;
 }
