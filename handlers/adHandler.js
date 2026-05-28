@@ -296,7 +296,7 @@ function buildRow(parsed) {
     parsed.pageHandle ? `@${parsed.pageHandle}` : "", // F: Page
     parsed.bulkNum || "",                             // G: Bulk # (e.g. "11/15")
     parsed.adPrice != null ? `$${parsed.adPrice}` : "", // H: Page Ad Price ($0 is valid)
-    "Scheduled",                                      // I: Status — default on insert
+    parsed.status || "Scheduled",                     // I: Status — override via parsed.status (e.g. "Live" on /syncsheets recovery)
     "",                                               // J: Views (filled manually later)
     parsed.nif || "",                                 // K: NIF
   ];
@@ -908,7 +908,10 @@ async function handleSyncSheetsCommand(ctx) {
     const brief = row.brief;
     if (!brief) { errors.push(`@${row.page_handle}: missing brief join`); continue; }
 
-    // Build a parsed-item shape that matches what buildRow/buildPageRow expect
+    // Build a parsed-item shape that matches what buildRow/buildPageRow expect.
+    // If DB shows this page was Posted-on (regardless of whether the master
+    // row existed at the time), set status=Live so the backfilled master
+    // row lands correctly instead of Scheduled.
     const parsedItem = {
       client:       brief.client,
       category:     brief.category,
@@ -920,6 +923,7 @@ async function handleSyncSheetsCommand(ctx) {
       nif:          brief.nif,
       datePosted:   brief.date_posted,
       timeMST:      brief.time_mst,
+      status:       row.posted_at ? "Live" : "Scheduled",
     };
 
     // ── Master sheet backfill ───────────────────────────────────────────
@@ -1206,6 +1210,13 @@ async function handleAdMessage(ctx) {
         } catch (err) {
           console.error(`[adHandler] ❌ "Posted on" update error: ${err.message}`);
         }
+        // Persist the Posted-on event to DB regardless of whether the
+        // sheet update found rows. /syncsheets reads this later to set
+        // Status=Live on any rows it backfills (covers the case where
+        // the master row didn't exist when "Posted on" first ran).
+        adBriefs.markPagesPosted(handles, clientName)
+          .then((n) => n > 0 && console.log(`[adHandler] 📥 markPagesPosted: ${n}/${handles.length} page(s) persisted`))
+          .catch((err) => console.error(`[adBriefs] markPagesPosted: ${err.message}`));
 
         if (overrideDate) {
           // Master sheet: update column D for matching client + handle rows
