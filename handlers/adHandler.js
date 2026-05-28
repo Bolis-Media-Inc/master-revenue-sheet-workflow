@@ -817,8 +817,7 @@ async function handleReplayCommand(ctx) {
               );
               if (rowNum) {
                 adBriefs.updatePageSheetRows(dbPage.id, { pageSheetRow: rowNum }).catch(() => {});
-                // Per-page sheet center-align removed — column-wide formatting
-                // via /centersheets handles this once per sheet at zero per-row cost
+                applyCenterAlignmentBatch(sheetId, PAGE_TAB_NAME, [rowNum], "H").catch(() => {});
                 console.log(`[adHandler] 🩹 /replay backfilled per-page row ${rowNum} for @${handle}`);
               }
             } catch (err) {
@@ -953,7 +952,7 @@ async function handleSyncSheetsCommand(ctx) {
         });
         if (rowNum) {
           await adBriefs.updatePageSheetRows(row.id, { pageSheetRow: rowNum });
-          // Per-page center-align removed — /centersheets handles column-wide
+          applyCenterAlignmentBatch(sheetId, PAGE_TAB_NAME, [rowNum], "H").catch(() => {});
           pageWritten++;
           console.log(`[adHandler] 🩹 /syncsheets: page row ${rowNum} → @${row.page_handle} (${brief.client})`);
         }
@@ -1399,16 +1398,16 @@ async function handleAdMessage(ctx) {
       console.log(`[adHandler] ✅ Individual page sheets: wrote ${pageSheetCount} row(s)`);
     }
 
-    // Per-page sheet center-align was removed — fire-and-forget calls one
-    // batchUpdate per page sheet per brief, which blew the 60/min Sheets
-    // API quota (24-page brief = 48+ extra calls) and caused REAL sheet
-    // writes to drop with "quota exceeded" errors.
-    //
-    // Instead: column-wide center alignment via /centersheets is set ONCE
-    // per sheet — new rows then inherit center formatting from the column
-    // automatically with zero per-brief API cost. Master sheet center-align
-    // (a single call per brief) is kept since it doesn't risk the quota.
-    void perPageRowsToFormat; // keep var for the per-page write loop above
+    // Per-page sheet center-align — now safe to fire inline because every
+    // Sheets API call goes through the rate limiter in sheets.js (50/min
+    // ceiling, bursts queue instead of failing). For a heavy brief the
+    // formatting calls will rate-limit themselves and complete after the
+    // critical data writes have already landed. /centersheets remains
+    // available for one-time column-wide setup if preferred.
+    for (const [sheetId, rows] of perPageRowsToFormat) {
+      applyCenterAlignmentBatch(sheetId, PAGE_TAB_NAME, rows, "H")
+        .catch((err) => console.error(`[adHandler] ❌ Center-align page sheet ${sheetId.slice(0, 8)}…: ${err.message}`));
+    }
 
     // ── Forward content + ad brief to each page's Telegram destination ─────────
     // Skip entirely if this brief was sent by Greg's /api/ad/intake — Greg already

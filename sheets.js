@@ -14,6 +14,94 @@ const { google } = require("googleapis");
 
 let _auth = null;
 
+// ── Rate limiter ──────────────────────────────────────────────────────────
+// Google Sheets API enforces 60 read + 60 write requests per minute per user
+// (service account). When a multi-page brief processes, we can burst far
+// above that — a 24-page brief is ~24 per-page writes × 2 calls each + master
+// writes + center-align + markForwarded = ~100 calls in 5-10 seconds.
+//
+// Instead of dropping calls when the burst hits the ceiling, queue them: any
+// caller that would push us over the limit `await`s until the oldest call
+// falls out of the 60-second window. Slows down a heavy brief from ~10s to
+// ~30-60s end-to-end, but every call lands.
+//
+// Cap intentionally set below the 60 quota (50) to leave headroom for the
+// occasional unhandled request and reduce risk of brushing the ceiling.
+// If we increase the underlying quota via Google Cloud Console, bump this
+// number to match.
+const RATE_LIMIT_CALLS_PER_MIN = parseInt(process.env.SHEETS_RATE_LIMIT || "50", 10);
+const RATE_LIMIT_WINDOW_MS     = 60_000;
+const _callTimes = [];
+
+async function _throttle() {
+  const now = Date.now();
+  // Drop call timestamps older than the window — they don't count anymore
+  while (_callTimes.length > 0 && now - _callTimes[0] >= RATE_LIMIT_WINDOW_MS) {
+    _callTimes.shift();
+  }
+  if (_callTimes.length >= RATE_LIMIT_CALLS_PER_MIN) {
+    // Sleep until the oldest in-window call rotates out, then re-check
+    const waitMs = RATE_LIMIT_WINDOW_MS - (now - _callTimes[0]) + 50;
+    if (waitMs > 0) {
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+    return _throttle(); // re-check after sleeping (more calls may have queued)
+  }
+  _callTimes.push(now);
+}
+
+/**
+ * Wrap a Sheets API call with the rate limiter. Use this for EVERY
+ * `sheets.spreadsheets.X.Y(...)` invocation.
+ *
+ * Returns whatever the wrapped promise returns. If the underlying call
+ * still hits a quota error (because the API's actual limit is lower
+ * than RATE_LIMIT_CALLS_PER_MIN), it propagates — caller can decide
+ * to retry or not. Most call sites already have try/catch.
+ */
+async function _throttled(fn) {
+  await _throttle();
+  return fn();
+}
+
+/**
+ * Return a Proxy-wrapped Sheets client where every leaf method call
+ * (.get, .update, .batchUpdate, .append, .values.batchUpdate, etc.) is
+ * automatically routed through the rate limiter. Replaces the raw
+ * `google.sheets({version: "v4", auth})` so we don't have to wrap each
+ * of the ~35 call sites manually.
+ *
+ * The proxy recurses through property access — accessing
+ * `sheets.spreadsheets.values.get` walks 3 levels deep, each property
+ * returning another proxy until we hit the function. The function
+ * itself is wrapped to `await _throttle()` before invocation.
+ */
+function _wrapThrottle(target) {
+  return new Proxy(target, {
+    get(obj, prop) {
+      const val = obj[prop];
+      if (typeof val === "function") {
+        return async (...args) => {
+          await _throttle();
+          return val.apply(obj, args);
+        };
+      }
+      if (val !== null && typeof val === "object") {
+        return _wrapThrottle(val);
+      }
+      return val;
+    },
+  });
+}
+
+/**
+ * Drop-in replacement for `google.sheets({version, auth})` that returns
+ * a rate-limited client. Use this instead of the raw factory throughout.
+ */
+function getThrottledSheets(authClient) {
+  return _wrapThrottle(google.sheets({ version: "v4", auth: authClient }));
+}
+
 /**
  * Initialise and cache the Google Auth client.
  */
@@ -61,7 +149,7 @@ function getAuth() {
 async function appendRow(spreadsheetId, tabName, rowValues, opts = {}) {
   const auth   = getAuth();
   const client = await auth.getClient();
-  const sheets = google.sheets({ version: "v4", auth: client });
+  const sheets = getThrottledSheets(client);
 
   // ── Deterministic append ───────────────────────────────────────────────────
   // Don't use spreadsheets.values.append + table auto-detection — it gets
@@ -178,7 +266,7 @@ async function markForwardedBatch(spreadsheetId, tabName, rowNumbers) {
 
   const auth   = getAuth();
   const client = await auth.getClient();
-  const sheets = google.sheets({ version: "v4", auth: client });
+  const sheets = getThrottledSheets(client);
 
   // One metadata fetch covers all rows
   const meta  = await sheets.spreadsheets.get({ spreadsheetId });
@@ -240,7 +328,7 @@ async function applyCenterAlignmentBatch(spreadsheetId, tabName, rowNumbers, end
 
   const auth   = getAuth();
   const client = await auth.getClient();
-  const sheets = google.sheets({ version: "v4", auth: client });
+  const sheets = getThrottledSheets(client);
 
   const meta  = await sheets.spreadsheets.get({ spreadsheetId });
   const sheet = meta.data.sheets?.find((s) => s.properties.title === tabName);
@@ -284,7 +372,7 @@ async function applyCenterAlignmentBatch(spreadsheetId, tabName, rowNumbers, end
 async function getLastDate(spreadsheetId, tabName) {
   const auth   = getAuth();
   const client = await auth.getClient();
-  const sheets = google.sheets({ version: "v4", auth: client });
+  const sheets = getThrottledSheets(client);
 
   const response = await sheets.spreadsheets.values.get({
     spreadsheetId,
@@ -305,7 +393,7 @@ async function getLastDate(spreadsheetId, tabName) {
 async function appendSeparatorRow(spreadsheetId, tabName) {
   const auth   = getAuth();
   const client = await auth.getClient();
-  const sheets = google.sheets({ version: "v4", auth: client });
+  const sheets = getThrottledSheets(client);
 
   // Append 11 empty cells — enough to anchor the row in the table
   const appendResult = await sheets.spreadsheets.values.append({
@@ -365,7 +453,7 @@ async function appendSeparatorRow(spreadsheetId, tabName) {
 async function updateStatusToLive(spreadsheetId, tabName, pageHandles, clientName = null) {
   const auth   = getAuth();
   const client = await auth.getClient();
-  const sheets = google.sheets({ version: "v4", auth: client });
+  const sheets = getThrottledSheets(client);
 
   // Read B:I — gives us: B=0 (Client), C=1, D=2, E=3, F=4 (Page), G=5, H=6, I=7 (Status)
   const response = await sheets.spreadsheets.values.get({
@@ -424,7 +512,7 @@ async function updateStatusToLive(spreadsheetId, tabName, pageHandles, clientNam
 async function updateAdDate(spreadsheetId, tabName, pageHandles, clientName, newDate, isMasterSheet = true) {
   const auth   = getAuth();
   const client = await auth.getClient();
-  const sheets = google.sheets({ version: "v4", auth: client });
+  const sheets = getThrottledSheets(client);
 
   const normClient = clientName?.toLowerCase().trim() || null;
 
@@ -497,7 +585,7 @@ async function updateAdDate(spreadsheetId, tabName, pageHandles, clientName, new
 async function updateAdPrice(spreadsheetId, tabName, pageHandles, clientName, newPrice, isMasterSheet = true) {
   const auth   = getAuth();
   const client = await auth.getClient();
-  const sheets = google.sheets({ version: "v4", auth: client });
+  const sheets = getThrottledSheets(client);
 
   const normClient = clientName?.toLowerCase().trim() || null;
 
@@ -568,7 +656,7 @@ async function updateAdPrice(spreadsheetId, tabName, pageHandles, clientName, ne
 async function deleteAdRows(spreadsheetId, tabName, pageHandles, clientName, isMasterSheet = true) {
   const auth   = getAuth();
   const client = await auth.getClient();
-  const sheets = google.sheets({ version: "v4", auth: client });
+  const sheets = getThrottledSheets(client);
 
   // Resolve numeric sheetId for the tab (required by deleteDimension)
   const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId });
@@ -652,7 +740,7 @@ const REMINDERS_TAB = "Reminders";
 async function ensureRemindersTab(spreadsheetId) {
   const auth   = getAuth();
   const client = await auth.getClient();
-  const sheets = google.sheets({ version: "v4", auth: client });
+  const sheets = getThrottledSheets(client);
 
   const meta = await sheets.spreadsheets.get({ spreadsheetId });
   const exists = meta.data.sheets?.some((s) => s.properties.title === REMINDERS_TAB);
@@ -691,7 +779,7 @@ async function appendRemindersBatch(spreadsheetId, reminders) {
 
   const auth   = getAuth();
   const client = await auth.getClient();
-  const sheets = google.sheets({ version: "v4", auth: client });
+  const sheets = getThrottledSheets(client);
 
   await sheets.spreadsheets.values.append({
     spreadsheetId,
@@ -720,7 +808,7 @@ async function getPendingReminders(spreadsheetId) {
 
   const auth   = getAuth();
   const client = await auth.getClient();
-  const sheets = google.sheets({ version: "v4", auth: client });
+  const sheets = getThrottledSheets(client);
 
   const response = await sheets.spreadsheets.values.get({
     spreadsheetId,
@@ -749,7 +837,7 @@ async function getPendingReminders(spreadsheetId) {
 async function markReminderSent(spreadsheetId, rowNumber) {
   const auth   = getAuth();
   const client = await auth.getClient();
-  const sheets = google.sheets({ version: "v4", auth: client });
+  const sheets = getThrottledSheets(client);
 
   await sheets.spreadsheets.values.update({
     spreadsheetId,
@@ -774,7 +862,7 @@ async function markReminderSent(spreadsheetId, rowNumber) {
 async function applyColumnCenterAlignment(spreadsheetId, tabName, endColumn = "K") {
   const auth   = getAuth();
   const client = await auth.getClient();
-  const sheets = google.sheets({ version: "v4", auth: client });
+  const sheets = getThrottledSheets(client);
 
   const meta  = await sheets.spreadsheets.get({ spreadsheetId });
   const sheet = meta.data.sheets?.find((s) => s.properties.title === tabName);
