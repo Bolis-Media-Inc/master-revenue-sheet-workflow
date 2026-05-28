@@ -58,28 +58,56 @@ function getAuth() {
  * Append a single row and return the 1-indexed row number that was written.
  * Returns null if the row number can't be determined from the API response.
  */
-async function appendRow(spreadsheetId, tabName, rowValues) {
+async function appendRow(spreadsheetId, tabName, rowValues, opts = {}) {
   const auth   = getAuth();
   const client = await auth.getClient();
   const sheets = google.sheets({ version: "v4", auth: client });
 
-  // A:K constrains the "find last row" lookup to columns A–K only.
-  // OVERWRITE means "write to the next empty row" without inserting/shifting rows —
-  // this prevents blank-row interleaving when the sheet has data beyond column K.
-  const result = await sheets.spreadsheets.values.append({
+  // ── Deterministic append ───────────────────────────────────────────────────
+  // Don't use spreadsheets.values.append + table auto-detection — it gets
+  // confused by:
+  //   - explicit `false` checkboxes in col A (which read as values, not empty)
+  //   - stray data in cols beyond K (NIF Reminder, Native Posted, etc.) that
+  //     Sheets sometimes treats as part of "the table"
+  //   - past appends that landed in misaligned columns and now anchor future
+  //     appends to the wrong row
+  //
+  // Instead: read the "anchor column" (the column that's always populated for
+  // real rows, never has dropdowns/checkboxes) to find the true last row,
+  // then write directly. Two API calls vs one, but bulletproof.
+  //
+  //   Master sheet:    col A = Forwarded checkbox → anchor on col B (Client)
+  //   Per-page sheet:  col A = Client Name        → anchor on col A
+  //
+  // Pass `opts.anchorColumn` to override (default "B"). Pass `opts.endColumn`
+  // to set the rightmost column of the write range (default "K" for master).
+  const anchorColumn = opts.anchorColumn || "B";
+  const endColumn    = opts.endColumn    || "K";
+
+  const colData = await sheets.spreadsheets.values.get({
     spreadsheetId,
-    range: `${tabName}!A:K`,
-    valueInputOption: "USER_ENTERED", // Lets Sheets parse dates and currency strings
-    insertDataOption: "OVERWRITE",
-    requestBody: {
-      values: [rowValues],
-    },
+    range: `${tabName}!${anchorColumn}:${anchorColumn}`,
+    majorDimension: "COLUMNS",
+  });
+  const colValues = (colData.data.values && colData.data.values[0]) || [];
+  // Walk backwards to find the last non-empty cell (handles sparse history)
+  let lastFilledRow = 0;
+  for (let i = colValues.length - 1; i >= 0; i--) {
+    if (colValues[i] != null && String(colValues[i]).trim() !== "") {
+      lastFilledRow = i + 1; // values array is 0-indexed, sheet rows are 1-indexed
+      break;
+    }
+  }
+  const targetRow = lastFilledRow + 1;
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range: `${tabName}!A${targetRow}:${endColumn}${targetRow}`,
+    valueInputOption: "USER_ENTERED",
+    requestBody: { values: [rowValues] },
   });
 
-  // Parse row number from updatedRange e.g. "'2026 Ad Overview'!A245:K245"
-  const updatedRange = result.data.updates?.updatedRange || "";
-  const rowMatch     = updatedRange.match(/[A-Z](\d+):/);
-  return rowMatch ? parseInt(rowMatch[1]) : null;
+  return targetRow;
 }
 
 /**

@@ -845,7 +845,8 @@ async function handleAdMessage(ctx) {
 
       const row = buildPageRow(item);
       try {
-        await appendRow(sheetId, PAGE_TAB_NAME, row);
+        // Per-page sheets: col A = Client Name (always filled), cols go A→H
+        await appendRow(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "A", endColumn: "H" });
         pageSheetCount++;
         console.log(`[adHandler] ✅ Page sheet write: @${item.pageHandle} → "${PAGE_TAB_NAME}"`);
       } catch (err) {
