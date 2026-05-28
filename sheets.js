@@ -180,6 +180,65 @@ async function markForwardedBatch(spreadsheetId, tabName, rowNumbers) {
 }
 
 /**
+ * Apply center horizontal alignment to a list of rows in one batchUpdate.
+ * Used at the end of brief processing so new rows match the team's
+ * existing per-page-sheet formatting convention (everything centered)
+ * without requiring 50+ sheets to be manually formatted column-wide.
+ *
+ * Cost: 1 spreadsheets.get + 1 spreadsheets.batchUpdate per sheet,
+ * regardless of how many rows are being formatted. Silent no-op on
+ * empty input — keeps callers from having to guard.
+ *
+ * @param {string} spreadsheetId
+ * @param {string} tabName
+ * @param {number[]} rowNumbers       1-indexed row numbers
+ * @param {string}   [endColumn="K"]  Rightmost column to format (e.g. "K" for
+ *                                    master, "H" for per-page sheets)
+ */
+async function applyCenterAlignmentBatch(spreadsheetId, tabName, rowNumbers, endColumn = "K") {
+  const rows = (rowNumbers || []).filter((n) => Number.isFinite(n) && n > 0);
+  if (rows.length === 0) return;
+
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: "v4", auth: client });
+
+  const meta  = await sheets.spreadsheets.get({ spreadsheetId });
+  const sheet = meta.data.sheets?.find((s) => s.properties.title === tabName);
+  if (!sheet) {
+    console.warn(`[sheets] applyCenterAlignmentBatch: tab "${tabName}" not found`);
+    return;
+  }
+  const sheetId = sheet.properties.sheetId;
+  // Convert end column letter to 0-indexed column count (A=1, B=2, ..., K=11)
+  const endColumnIndex = endColumn.toUpperCase().charCodeAt(0) - "A".charCodeAt(0) + 1;
+
+  // One repeatCell request per row — sets horizontalAlignment without
+  // touching any other cell properties (so checkboxes, validations,
+  // values, etc. all stay put).
+  const requests = rows.map((rowNumber) => ({
+    repeatCell: {
+      range: {
+        sheetId,
+        startRowIndex:    rowNumber - 1,
+        endRowIndex:      rowNumber,
+        startColumnIndex: 0,
+        endColumnIndex:   endColumnIndex,
+      },
+      cell: {
+        userEnteredFormat: { horizontalAlignment: "CENTER" },
+      },
+      fields: "userEnteredFormat.horizontalAlignment",
+    },
+  }));
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: { requests },
+  });
+}
+
+/**
  * Get the date value from the last populated row in column D (Date column).
  * Returns a normalised date string like "Fri 3/6/26", or null if not found.
  */
@@ -663,6 +722,7 @@ async function markReminderSent(spreadsheetId, rowNumber) {
 
 module.exports = {
   appendRow, markForwarded, markForwardedBatch,
+  applyCenterAlignmentBatch,
   getLastDate, appendSeparatorRow,
   updateStatusToLive, updateAdPrice, updateAdDate, deleteAdRows,
   appendReminder, appendRemindersBatch, getPendingReminders, markReminderSent,

@@ -12,7 +12,7 @@
  */
 
 const { parseAdMessage }       = require("../parser");
-const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch } = require("../sheets");
+const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch } = require("../sheets");
 const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
@@ -728,6 +728,9 @@ async function handleReplayCommand(ctx) {
             const rowNum = await appendRow(MASTER_SHEET_ID, TAB_NAME, buildRow(parsedItem));
             if (rowNum) {
               adBriefs.updatePageSheetRows(dbPage.id, { masterSheetRow: rowNum }).catch(() => {});
+              // Center-align the backfilled row to match the rest of the sheet
+              applyCenterAlignmentBatch(MASTER_SHEET_ID, TAB_NAME, [rowNum], "K")
+                .catch(() => {});
               console.log(`[adHandler] 🩹 /replay backfilled master sheet row ${rowNum} for @${handle}`);
             }
           } catch (err) {
@@ -745,6 +748,8 @@ async function handleReplayCommand(ctx) {
               );
               if (rowNum) {
                 adBriefs.updatePageSheetRows(dbPage.id, { pageSheetRow: rowNum }).catch(() => {});
+                applyCenterAlignmentBatch(sheetId, PAGE_TAB_NAME, [rowNum], "H")
+                  .catch(() => {});
                 console.log(`[adHandler] 🩹 /replay backfilled per-page row ${rowNum} for @${handle}`);
               }
             } catch (err) {
@@ -1017,6 +1022,10 @@ async function handleAdMessage(ctx) {
     // masterRowByHandle: handle → 1-indexed row number (used later to tick checkbox)
     const masterRowByHandle = new Map();
 
+    // Row numbers we successfully wrote — flushed to a single batched
+    // applyCenterAlignmentBatch call at the end so new rows match the team's
+    // existing centered-formatting convention without N extra API calls.
+    const masterRowsToFormat = [];
     if (MASTER_SHEET_ID && !PLACEHOLDER_PATTERN.test(MASTER_SHEET_ID)) {
 
       let successCount = 0;
@@ -1025,6 +1034,7 @@ async function handleAdMessage(ctx) {
         try {
           const rowNumber = await appendRow(MASTER_SHEET_ID, TAB_NAME, row);
           successCount++;
+          if (rowNumber) masterRowsToFormat.push(rowNumber);
           if (item.pageHandle && rowNumber) {
             masterRowByHandle.set(item.pageHandle, rowNumber);
             // Persist master row number to DB so we can audit + retry missing writes
@@ -1040,6 +1050,13 @@ async function handleAdMessage(ctx) {
         }
       }
       console.log(`[adHandler] ✅ Master sheet: wrote ${successCount}/${parsedList.length} row(s) (tab: "${TAB_NAME}")`);
+
+      // Batched format call — center-aligns all newly-written rows in one shot
+      if (masterRowsToFormat.length > 0) {
+        applyCenterAlignmentBatch(MASTER_SHEET_ID, TAB_NAME, masterRowsToFormat, "K")
+          .then(() => console.log(`[adHandler] 🎨 Master sheet: centered ${masterRowsToFormat.length} row(s)`))
+          .catch((err) => console.error(`[adHandler] ❌ Center-align master: ${err.message}`));
+      }
     } else {
       console.warn("[adHandler] MASTER_SHEET_ID not configured — skipping master sheet.");
     }
@@ -1051,6 +1068,9 @@ async function handleAdMessage(ctx) {
     // Set ENABLED_PAGES=artistswithoutautotune to start; expand as validated.
     // Set ENABLED_PAGES=* to enable for all pages.
     let pageSheetCount = 0;
+    // Group successful per-page writes by sheetId so we can format them in
+    // one batchUpdate per sheet at the end (rather than one per row).
+    const perPageRowsToFormat = new Map(); // sheetId → number[]
     for (const item of parsedList) {
       if (!item.pageHandle || !isPageEnabled(item.pageHandle)) continue;
 
@@ -1065,6 +1085,10 @@ async function handleAdMessage(ctx) {
         // Per-page sheets: col A = Client Name (always filled), cols go A→H
         const pageSheetRowNum = await appendRow(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "A", endColumn: "H" });
         pageSheetCount++;
+        if (pageSheetRowNum) {
+          if (!perPageRowsToFormat.has(sheetId)) perPageRowsToFormat.set(sheetId, []);
+          perPageRowsToFormat.get(sheetId).push(pageSheetRowNum);
+        }
         // Persist per-page sheet row to DB for audit + retry visibility
         const pageRowId = pageRowIdByHandle.get(item.pageHandle.toLowerCase());
         if (pageRowId && pageSheetRowNum) {
@@ -1078,6 +1102,14 @@ async function handleAdMessage(ctx) {
     }
     if (pageSheetCount > 0) {
       console.log(`[adHandler] ✅ Individual page sheets: wrote ${pageSheetCount} row(s)`);
+    }
+
+    // Batched center-align across all per-page sheets touched by this brief.
+    // One batchUpdate per unique sheet (so a 25-page brief = 25 format calls
+    // but each is independent — different spreadsheets, no quota cross-contamination).
+    for (const [sheetId, rows] of perPageRowsToFormat) {
+      applyCenterAlignmentBatch(sheetId, PAGE_TAB_NAME, rows, "H")
+        .catch((err) => console.error(`[adHandler] ❌ Center-align page sheet ${sheetId.slice(0, 8)}…: ${err.message}`));
     }
 
     // ── Forward content + ad brief to each page's Telegram destination ─────────
