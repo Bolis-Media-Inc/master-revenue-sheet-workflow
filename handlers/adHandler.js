@@ -1514,11 +1514,17 @@ async function handleAdMessage(ctx) {
           if (rowNumber) masterRowsToFormat.push(rowNumber);
           if (item.pageHandle && rowNumber) {
             masterRowByHandle.set(item.pageHandle, rowNumber);
-            // Persist master row number to DB so we can audit + retry missing writes
+            // Persist master row number to DB. Awaited with explicit error
+            // logging so we can match this against the per-page DB update —
+            // if master succeeds and per-page fails (the symptom we saw),
+            // both logs will be present in Railway and we can compare.
             const pageRowId = pageRowIdByHandle.get(item.pageHandle.toLowerCase());
             if (pageRowId) {
-              adBriefs.updatePageSheetRows(pageRowId, { masterSheetRow: rowNumber })
-                .catch(() => {}); // fire-and-forget; logged inside the helper
+              try {
+                await adBriefs.updatePageSheetRows(pageRowId, { masterSheetRow: rowNumber });
+              } catch (dbErr) {
+                console.error(`[adHandler] ❌ DB persist master_sheet_row for @${item.pageHandle}: ${dbErr.message}`);
+              }
             }
           }
         } catch (err) {
@@ -1566,13 +1572,24 @@ async function handleAdMessage(ctx) {
           if (!perPageRowsToFormat.has(sheetId)) perPageRowsToFormat.set(sheetId, []);
           perPageRowsToFormat.get(sheetId).push(pageSheetRowNum);
         }
-        // Persist per-page sheet row to DB for audit + retry visibility
+        // Persist per-page sheet row to DB for audit + retry visibility.
+        // Was previously fire-and-forget with .catch(() => {}) but production
+        // showed this update silently failing for every brief — DB rows had
+        // master_sheet_row set but page_sheet_row=null even though the bot
+        // logged "Page sheet write" successfully. Switched to await+explicit
+        // error logging so any failure mode (network, supabase quota, etc.)
+        // surfaces in Railway logs instead of hiding behind .catch().
         const pageRowId = pageRowIdByHandle.get(item.pageHandle.toLowerCase());
         if (pageRowId && pageSheetRowNum) {
-          adBriefs.updatePageSheetRows(pageRowId, { pageSheetRow: pageSheetRowNum })
-            .catch(() => {});
+          try {
+            await adBriefs.updatePageSheetRows(pageRowId, { pageSheetRow: pageSheetRowNum });
+          } catch (dbErr) {
+            console.error(`[adHandler] ❌ DB persist page_sheet_row for @${item.pageHandle} (page_row=${pageRowId.slice(0,8)}, sheet_row=${pageSheetRowNum}): ${dbErr.message}`);
+          }
+        } else if (!pageRowId) {
+          console.warn(`[adHandler] ⚠️ DB persist skipped: no pageRowId mapping for @${item.pageHandle} (handle key lookup miss; map has ${pageRowIdByHandle.size} entries)`);
         }
-        console.log(`[adHandler] ✅ Page sheet write: @${item.pageHandle} → "${PAGE_TAB_NAME}"`);
+        console.log(`[adHandler] ✅ Page sheet write: @${item.pageHandle} → "${PAGE_TAB_NAME}" (sheet row ${pageSheetRowNum}, db row ${pageRowId ? pageRowId.slice(0,8) : "n/a"})`);
       } catch (err) {
         console.error(`[adHandler] ❌ Page sheet error for @${item.pageHandle}: ${err.message}`);
       }
