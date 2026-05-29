@@ -1001,25 +1001,53 @@ async function postWizardReviewCard(telegram, sessionId, wizardSession, submitte
     ? `user ${u.userId}`
     : "unknown submitter";
 
+  // Review card with Approve/Reject buttons. Wrapped in retry-on-429
+  // because Telegram rate-limits bots posting to the same group at
+  // ~20 msgs/min; busy moments hit the cap and Marcel's submissions
+  // surfaced "Submission incomplete" errors instead of waiting + retrying.
+  // Telegram returns the wait time in `e.parameters.retry_after` (seconds).
   let card = null;
-  try {
-    card = await telegram.sendMessage(
-      SALES_TEAM_CHAT,
-      `🛂 *Pending sales review* — submitted by ${submitter}\n` +
-      `_Approve to post to Internal Network Ads (30s cancel window)_`,
-      {
-        parse_mode: "Markdown",
-        reply_markup: {
-          inline_keyboard: [[
-            { text: "✅ Approve & post", callback_data: `wreview:approve:${sessionId}` },
-            { text: "❌ Reject",         callback_data: `wreview:reject:${sessionId}`  },
-          ]],
+  const REVIEW_RETRIES = 3;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= REVIEW_RETRIES; attempt++) {
+    try {
+      card = await telegram.sendMessage(
+        SALES_TEAM_CHAT,
+        `🛂 *Pending sales review* — submitted by ${submitter}\n` +
+        `_Approve to post to Internal Network Ads (30s cancel window)_`,
+        {
+          parse_mode: "Markdown",
+          reply_markup: {
+            inline_keyboard: [[
+              { text: "✅ Approve & post", callback_data: `wreview:approve:${sessionId}` },
+              { text: "❌ Reject",         callback_data: `wreview:reject:${sessionId}`  },
+            ]],
+          },
         },
-      },
-    );
-  } catch (e) {
-    console.error("[wizard] review card send:", e.message);
-    return { ok: false, error: `Posted creative + brief but the Approve/Reject card failed: ${e.message}` };
+      );
+      break; // success
+    } catch (e) {
+      lastErr = e;
+      const retryAfterSec =
+        e.parameters?.retry_after ||
+        e.response?.parameters?.retry_after ||
+        (typeof e.description === "string" && e.description.match(/retry after (\d+)/i)?.[1]) ||
+        null;
+      const is429 = e.code === 429 || /429|too many requests/i.test(e.message || "");
+      if (is429 && retryAfterSec && attempt < REVIEW_RETRIES) {
+        const waitMs = (parseInt(retryAfterSec, 10) + 1) * 1000;
+        console.warn(`[wizard] review card 429 (attempt ${attempt}/${REVIEW_RETRIES}) — waiting ${waitMs / 1000}s before retry`);
+        await new Promise((r) => setTimeout(r, waitMs));
+        continue;
+      }
+      // Non-429 OR last attempt → surface the failure
+      console.error(`[wizard] review card send failed (attempt ${attempt}/${REVIEW_RETRIES}):`, e.message);
+      return { ok: false, error: `Posted creative + brief but the Approve/Reject card failed: ${e.message}` };
+    }
+  }
+  if (!card) {
+    // Defensive: loop ended without card and without returning from catch
+    return { ok: false, error: `Posted creative + brief but the Approve/Reject card failed: ${lastErr?.message || "unknown"}` };
   }
 
   if (card) {
