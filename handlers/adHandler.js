@@ -1038,6 +1038,18 @@ async function handleSyncSheetsCommand(ctx) {
     }
 
     // ── Per-page sheet backfill ─────────────────────────────────────────
+    // Safety guard: if the page was already forwarded (forwarded_at set),
+    // the bot's brief-processing path already reached + completed the
+    // per-page sheet write loop — so a row DOES exist in the per-page
+    // sheet, even though the inline DB persist may have failed (the silent-
+    // failure bug fixed in 8f497b2). Re-writing here would create a
+    // DUPLICATE row. Skip with a note instead.
+    if (!row.page_sheet_row && row.forwarded_at) {
+      console.log(`[adHandler] ⏭️ /syncsheets: skipping per-page write for @${row.page_handle} — forwarded_at set, row likely exists in sheet but DB lost track`);
+      pageAlreadyOk++;
+      processed++;
+      continue;
+    }
     if (!row.page_sheet_row) {
       // Fuzzy-resolve in case the DB row has a typo'd handle (e.g.
       // historical @dankquilius vs registered @dankquillius). Avoids
