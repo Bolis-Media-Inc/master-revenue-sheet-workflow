@@ -1001,17 +1001,35 @@ async function postWizardReviewCard(telegram, sessionId, wizardSession, submitte
     ? `user ${u.userId}`
     : "unknown submitter";
 
-  // Review card with Approve/Reject buttons. Wrapped in retry-on-429
-  // because Telegram rate-limits bots posting to the same group at
-  // ~20 msgs/min; busy moments hit the cap and Marcel's submissions
-  // surfaced "Submission incomplete" errors instead of waiting + retrying.
-  // Telegram returns the wait time in `e.parameters.retry_after` (seconds).
-  let card = null;
-  const REVIEW_RETRIES = 3;
+  // Post review card with retry-on-429 + auto-persist on success.
+  const cardResult = await _sendReviewCardWithRetry(telegram, sessionId, submitter);
+  if (!cardResult.ok) return cardResult;
+  return { ok: true };
+}
+
+/**
+ * Post the Approve/Reject review card for a given session_id to the
+ * monetization chat, with retry-on-429 (5 attempts, honoring Telegram's
+ * retry_after between each). On success, persists review_msg in DB.
+ *
+ * Used by:
+ *   - postWizardReviewCard (the main wizard submit flow)
+ *   - /repostreview admin command (recovery for sessions where the
+ *     initial send hit a sustained 429 and exhausted retries)
+ *
+ * Returns { ok, error?, card? }. The card field is the sent Message
+ * object on success — useful if the caller wants the message_id.
+ */
+async function _sendReviewCardWithRetry(telegram, sessionId, submitter) {
+  if (!SALES_TEAM_CHAT) {
+    return { ok: false, error: "SALES_TEAM_CHAT_ID is not set on Greg's Railway service" };
+  }
+
+  const REVIEW_RETRIES = 5; // bumped from 3 — sustained 429s need more headroom
   let lastErr = null;
   for (let attempt = 1; attempt <= REVIEW_RETRIES; attempt++) {
     try {
-      card = await telegram.sendMessage(
+      const card = await telegram.sendMessage(
         SALES_TEAM_CHAT,
         `🛂 *Pending sales review* — submitted by ${submitter}\n` +
         `_Approve to post to Internal Network Ads (30s cancel window)_`,
@@ -1025,7 +1043,11 @@ async function postWizardReviewCard(telegram, sessionId, wizardSession, submitte
           },
         },
       );
-      break; // success
+      // Persist on success so future /repostreview can detect already-posted
+      await sessionsLib.updateSession(sessionId, {
+        review_msg: { chatId: card.chat.id, messageId: card.message_id },
+      });
+      return { ok: true, card };
     } catch (e) {
       lastErr = e;
       const retryAfterSec =
@@ -1034,28 +1056,22 @@ async function postWizardReviewCard(telegram, sessionId, wizardSession, submitte
         (typeof e.description === "string" && e.description.match(/retry after (\d+)/i)?.[1]) ||
         null;
       const is429 = e.code === 429 || /429|too many requests/i.test(e.message || "");
-      if (is429 && retryAfterSec && attempt < REVIEW_RETRIES) {
-        const waitMs = (parseInt(retryAfterSec, 10) + 1) * 1000;
-        console.warn(`[wizard] review card 429 (attempt ${attempt}/${REVIEW_RETRIES}) — waiting ${waitMs / 1000}s before retry`);
-        await new Promise((r) => setTimeout(r, waitMs));
+      if (is429 && attempt < REVIEW_RETRIES) {
+        // Honor Telegram's retry_after if provided; otherwise exponential
+        // backoff starting at 5s so a "no retry_after" 429 still escalates.
+        const waitSec = retryAfterSec
+          ? parseInt(retryAfterSec, 10) + 1
+          : Math.min(5 * Math.pow(2, attempt - 1), 300); // 5, 10, 20, 40, 80 (cap 300)
+        console.warn(`[wizard] review card 429 (attempt ${attempt}/${REVIEW_RETRIES}) — waiting ${waitSec}s before retry`);
+        await new Promise((r) => setTimeout(r, waitSec * 1000));
         continue;
       }
-      // Non-429 OR last attempt → surface the failure
+      // Non-429 OR exhausted retries → surface
       console.error(`[wizard] review card send failed (attempt ${attempt}/${REVIEW_RETRIES}):`, e.message);
       return { ok: false, error: `Posted creative + brief but the Approve/Reject card failed: ${e.message}` };
     }
   }
-  if (!card) {
-    // Defensive: loop ended without card and without returning from catch
-    return { ok: false, error: `Posted creative + brief but the Approve/Reject card failed: ${lastErr?.message || "unknown"}` };
-  }
-
-  if (card) {
-    await sessionsLib.updateSession(sessionId, {
-      review_msg: { chatId: card.chat.id, messageId: card.message_id },
-    });
-  }
-  return { ok: true };
+  return { ok: false, error: `Posted creative + brief but the Approve/Reject card failed: ${lastErr?.message || "unknown"}` };
 }
 
 // Best-effort placeholder — populated after bot.launch() resolves
@@ -1923,6 +1939,76 @@ setInterval(() => {
   const cutoff = Date.now() - 10 * 60 * 1000;
   for (const [k, v] of _pendingRejectPrompts) if (v.createdAt < cutoff) _pendingRejectPrompts.delete(k);
 }, 60 * 1000).unref();
+
+// ── /repostreview — admin recovery for stuck sessions ───────────────────────
+// When the initial review-card post hit a sustained 429 and exhausted all 5
+// retries, the session lands in DB with status=pending_review but
+// review_msg=null. Admin runs:
+//
+//   /repostreview <session_id>
+//
+// and Greg re-attempts the Approve/Reject card post (with retry logic
+// included). Idempotent — if review_msg is already set, refuses to repost.
+//
+// Marcel's a14ea948 stuck session was the trigger. Admin-only since this
+// targets a specific session and shouldn't be exposed to contributors.
+bot.command("repostreview", async (ctx) => {
+  if (!isSalesAdmin(ctx.from?.id)) return; // silent for non-admins
+  const args = (ctx.message?.text || "").trim().split(/\s+/).slice(1);
+  const sessionId = args[0];
+  if (!sessionId) {
+    return ctx.reply(
+      "*Usage:* `/repostreview <session_id>`\n\n" +
+      "Look up the stuck session in Supabase ad_sessions (status=pending_review, review_msg IS NULL) and pass its `id`.",
+      { parse_mode: "Markdown" }
+    );
+  }
+  // Fetch session
+  let adSession;
+  try {
+    const { data } = await sessionsLib._supabase
+      .from("ad_sessions").select("*").eq("id", sessionId).single();
+    adSession = data;
+  } catch (err) {
+    return ctx.reply(`❌ DB lookup failed: \`${err.message}\``, { parse_mode: "Markdown" });
+  }
+  if (!adSession) {
+    return ctx.reply(`❌ No session with id \`${sessionId}\``, { parse_mode: "Markdown" });
+  }
+  if (adSession.status !== "pending_review") {
+    return ctx.reply(
+      `ℹ️ Session is in status \`${adSession.status}\` — review card only makes sense for \`pending_review\`.`,
+      { parse_mode: "Markdown" }
+    );
+  }
+  if (adSession.review_msg) {
+    return ctx.reply(
+      `ℹ️ Review card was already posted: chat \`${adSession.review_msg.chatId}\`, message \`${adSession.review_msg.messageId}\`. ` +
+      `Nothing to redo.`,
+      { parse_mode: "Markdown" }
+    );
+  }
+
+  // Reconstruct the submitter label from payload.wizard.userInfo
+  const userInfo = adSession.payload?.wizard?.userInfo || {};
+  const submitter = userInfo.username
+    ? `@${escapeMd(userInfo.username)}`
+    : userInfo.userId
+    ? `user ${userInfo.userId}`
+    : `user ${adSession.user_id}`;
+
+  await ctx.reply(`⏳ Re-posting review card for session \`${sessionId.slice(0, 8)}…\`…`, { parse_mode: "Markdown" });
+
+  const result = await _sendReviewCardWithRetry(ctx.telegram, sessionId, submitter);
+  if (result.ok) {
+    await ctx.reply(
+      `✅ Review card re-posted to monetization chat (message ${result.card.message_id}).\n` +
+      `Approve/Reject buttons are live again.`
+    );
+  } else {
+    await ctx.reply(`❌ Re-post failed: ${result.error}`);
+  }
+});
 
 // ── /setcollab — create & manage collab presets ──────────────────────────────
 
