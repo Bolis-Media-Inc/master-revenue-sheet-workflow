@@ -38,6 +38,19 @@ const ADMIN_HANDLES    = (process.env.WIZARD_ADMIN_HANDLES || "")
 const contributors = require("./lib/contributors");
 const posters      = require("./lib/posters");
 const sessionsLib  = require("./lib/sessions");
+const adBriefs     = require("./lib/adBriefs");
+// Same sheet helpers bm_tracking_bot uses — Greg now writes directly to
+// avoid Telegram's bot-to-bot delivery filter (which silently drops
+// wizard-posted briefs from bm_tracking_bot's webhook updates).
+const {
+  appendRow,
+  markForwardedBatch,
+  applyCenterAlignmentBatch,
+} = require("./sheets");
+
+const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
+const TAB_NAME        = process.env.SHEET_TAB_NAME      || "2026 Ad Overview";
+const PAGE_TAB_NAME   = process.env.PAGE_SHEET_TAB_NAME || "IG Revenue Tracker";
 
 // Escape Telegram Markdown V1 specials so user-controlled strings
 // (especially usernames containing "_") can't break entity parsing
@@ -762,10 +775,13 @@ async function postToGroup(telegram, session) {
     if (answers.caption) await telegram.sendMessage(TARGET_CHAT, answers.caption);
   };
 
+  // Returns the final brief message so callers can grab message_id for DB
+  // tracking (ad_briefs has UNIQUE(chat_id, message_id) constraint).
+  let briefMsg = null;
   if (fmt === "Standard") {
     for (const ref of content.shared) await sendDoc(ref);
     await sendCaption();
-    await telegram.sendMessage(TARGET_CHAT, buildBrief(answers));
+    briefMsg = await telegram.sendMessage(TARGET_CHAT, buildBrief(answers));
 
   } else if (fmt === "Per-creative") {
     for (const handle of answers.pages) {
@@ -776,7 +792,7 @@ async function postToGroup(telegram, session) {
       }
     }
     await sendCaption();
-    await telegram.sendMessage(TARGET_CHAT, buildBrief(answers));
+    briefMsg = await telegram.sendMessage(TARGET_CHAT, buildBrief(answers));
 
   } else if (fmt === "Collab") {
     for (const g of content.collabGroups) {
@@ -785,12 +801,13 @@ async function postToGroup(telegram, session) {
       await telegram.sendMessage(TARGET_CHAT, `Host: @${g.host}, invite:\n\n${invites}`);
     }
     await sendCaption();
-    await telegram.sendMessage(TARGET_CHAT, buildBrief(answers));
+    briefMsg = await telegram.sendMessage(TARGET_CHAT, buildBrief(answers));
 
   } else {
     await sendCaption();
-    await telegram.sendMessage(TARGET_CHAT, buildBrief(answers));
+    briefMsg = await telegram.sendMessage(TARGET_CHAT, buildBrief(answers));
   }
+  return briefMsg;
 }
 
 // ── Sales-contributor review submission ─────────────────────────────────────
@@ -1151,6 +1168,201 @@ async function forwardContentToPages(telegram, session) {
   }
 
   console.log(`[wizard] 📤 Content forwarded to ${forwardedDests.size} destination(s)`);
+}
+
+/**
+ * After approve: log the wizard-submitted brief to the same DB tables +
+ * Google Sheets that bm_tracking_bot writes to for Danielson briefs.
+ *
+ * Why this exists: Greg posts the brief to Internal Network Ads chat for
+ * human visibility, but Telegram blocks bot-to-bot message delivery — so
+ * bm_tracking_bot never sees Greg's post via webhook and can't process
+ * it. Instead, Greg directly writes the same data using the same shared
+ * libs (lib/adBriefs, sheets.js) since both services already have
+ * Supabase + Google Sheets access.
+ *
+ * Fail-soft — DB or sheet errors log but don't fail the approve flow.
+ * forwardContentToPages already sent the creatives to each page's chat
+ * by the time this runs, so the per-page sheet rows + master sheet rows
+ * are the only thing left.
+ *
+ * @param {object} ctx                Telegraf callback context (for ctx.from etc.)
+ * @param {object} session            adSession row from Supabase
+ * @param {object} session.payload    wizardState payload (answers + content)
+ * @param {object} postedMsg          The brief message Greg just posted to TARGET_CHAT
+ * @returns {Promise<{ok: boolean, briefId?: string, masterWrites: number, pageWrites: number, errors: string[]}>}
+ */
+async function logSubmittedBriefToTracking(ctx, adSession, postedMsg) {
+  const wizardState = adSession.payload?.wizard;
+  const answers     = wizardState?.answers;
+  if (!answers) return { ok: false, masterWrites: 0, pageWrites: 0, errors: ["missing wizard answers"] };
+
+  const pages = Array.isArray(answers.pages) ? answers.pages : [];
+  if (pages.length === 0) {
+    return { ok: false, masterWrites: 0, pageWrites: 0, errors: ["no pages in submission"] };
+  }
+
+  // Resolve per-page price + bulk number from the answers' wizard shape.
+  // Wizard schema: answers.priceMode = "per-page" | "same"; per-page mode
+  // stores answers.perPagePrices[handle] = { price, bulk? }; same-mode
+  // uses answers.price.
+  const perPageInfo = (handle) => {
+    if (answers.priceMode === "per-page") {
+      const pp = answers.perPagePrices?.[handle] || {};
+      return { price: pp.price != null ? parseFloat(pp.price) : null, bulk: pp.bulk || null };
+    }
+    return { price: answers.price != null ? parseFloat(answers.price) : null, bulk: null };
+  };
+
+  // Header / total price — for "per-page" sum, for "same" multiply
+  const totalPrice = pages.reduce((sum, h) => {
+    const p = perPageInfo(h).price;
+    return sum + (Number.isFinite(p) ? p : 0);
+  }, 0);
+
+  const errors = [];
+
+  // ── DB: insert ad_briefs + ad_brief_pages ──────────────────────────────
+  let briefId = null;
+  const pageRowIdByHandle = new Map();
+  try {
+    briefId = await adBriefs.insertBrief({
+      telegramChatId:    Number(TARGET_CHAT),
+      telegramMessageId: postedMsg?.message_id || 0,
+      senderUserId:      ctx.from?.id ?? null,
+      senderHandle:      ctx.from?.username ?? null,
+      rawText:           buildBrief(answers),       // canonical brief text
+      client:            answers.client,
+      category:          answers.adType,
+      totalPrice,
+      postType:          answers.postType,
+      postDuration:      answers.duration,
+      nif:               answers.nif && answers.nif !== "none" ? answers.nif : null,
+      datePosted:        formatGregDatePosted(postedMsg),
+      timeMst:           answers.time || null,
+      sharedCaption:     answers.caption || null,
+      bundleFormat:      `wizard-${(answers.format || "standard").toLowerCase()}`,
+    });
+    if (briefId) {
+      const pageRows = pages.map((handle) => {
+        const info = perPageInfo(handle);
+        return {
+          pageHandle: handle.toLowerCase(),
+          bulkNum:    info.bulk,
+          pagePrice:  Number.isFinite(info.price) ? info.price : null,
+        };
+      });
+      const inserted = await adBriefs.insertBriefPages(briefId, pageRows);
+      for (const [h, id] of inserted) pageRowIdByHandle.set(h, id);
+      console.log(`[wizard] 📥 Logged wizard brief ${briefId.slice(0, 8)}… (${pageRowIdByHandle.size}/${pages.length} pages)`);
+    }
+  } catch (err) {
+    errors.push(`db insert: ${err.message}`);
+    console.error(`[wizard] ❌ DB persist error: ${err.message}`);
+    // Continue — try sheet writes even if DB failed
+  }
+
+  // ── Master sheet rows ──────────────────────────────────────────────────
+  let masterWrites = 0;
+  const masterRowsToFormat = [];
+  const masterRowsToTickForwarded = [];
+  if (MASTER_SHEET_ID && !PLACEHOLDER_PATTERN.test(MASTER_SHEET_ID)) {
+    for (const handle of pages) {
+      const info = perPageInfo(handle);
+      const row = [
+        "",                                              // A: Forwarded (will tick below)
+        answers.client,                                  // B: Client Name
+        answers.adType,                                  // C: Ad Type
+        formatGregDatePosted(postedMsg),                 // D: Date
+        answers.time || "",                              // E: Time (MST)
+        `@${handle}`,                                    // F: Page
+        info.bulk || "",                                 // G: Bulk #
+        info.price != null ? `$${info.price}` : "",      // H: Price
+        "Scheduled",                                     // I: Status
+        "",                                              // J: Views
+        answers.nif && answers.nif !== "none" ? answers.nif : "",  // K: NIF
+      ];
+      try {
+        const rowNum = await appendRow(MASTER_SHEET_ID, TAB_NAME, row);
+        if (rowNum) {
+          masterWrites++;
+          masterRowsToFormat.push(rowNum);
+          masterRowsToTickForwarded.push(rowNum); // greg already forwarded by the time we run
+          const pageRowId = pageRowIdByHandle.get(handle.toLowerCase());
+          if (pageRowId) {
+            await adBriefs.updatePageSheetRows(pageRowId, { masterSheetRow: rowNum }).catch(() => {});
+          }
+        }
+      } catch (err) {
+        errors.push(`master @${handle}: ${err.message}`);
+        console.error(`[wizard] ❌ Master row @${handle}: ${err.message}`);
+      }
+    }
+    if (masterRowsToFormat.length > 0) {
+      applyCenterAlignmentBatch(MASTER_SHEET_ID, TAB_NAME, masterRowsToFormat, "K")
+        .catch(() => {});
+    }
+    if (masterRowsToTickForwarded.length > 0) {
+      markForwardedBatch(MASTER_SHEET_ID, TAB_NAME, masterRowsToTickForwarded)
+        .then(() => console.log(`[wizard] ✅ Master Forwarded ticked: ${masterRowsToTickForwarded.length}`))
+        .catch((err) => console.error(`[wizard] ❌ markForwarded: ${err.message}`));
+    }
+  }
+
+  // ── Per-page sheet rows ───────────────────────────────────────────────
+  let pageWrites = 0;
+  for (const handle of pages) {
+    const sheetId = pagesRegistry.getSheetId(handle) ||
+                    pagesRegistry.getSheetId(handle.replace(/[._]/g, ""));
+    if (!sheetId || PLACEHOLDER_PATTERN.test(sheetId)) continue;
+    const info = perPageInfo(handle);
+    const row = [
+      answers.client,                                  // A: Client Name
+      answers.adType,                                  // B: Ad Type
+      info.bulk || "",                                 // C: Bulk #
+      formatGregDatePosted(postedMsg),                 // D: Date Posted
+      answers.postType || "",                          // E: Post Type
+      answers.duration || "",                          // F: Post Duration
+      info.price != null ? `$${info.price}` : "",      // G: Ad Price
+      "",                                              // H: Notes
+    ];
+    try {
+      const rowNum = await appendRow(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "A", endColumn: "H" });
+      if (rowNum) {
+        pageWrites++;
+        const pageRowId = pageRowIdByHandle.get(handle.toLowerCase());
+        if (pageRowId) {
+          await adBriefs.updatePageSheetRows(pageRowId, { pageSheetRow: rowNum }).catch(() => {});
+          // Also mark forwarded — Greg's forwardContentToPages already did the chat send
+          await adBriefs.markPageForwarded(pageRowId, { pageSheetRow: rowNum }).catch(() => {});
+        }
+        applyCenterAlignmentBatch(sheetId, PAGE_TAB_NAME, [rowNum], "H").catch(() => {});
+      }
+    } catch (err) {
+      errors.push(`page @${handle}: ${err.message}`);
+      console.error(`[wizard] ❌ Per-page row @${handle}: ${err.message}`);
+    }
+  }
+
+  console.log(
+    `[wizard] 📊 Tracking writes done — master: ${masterWrites}/${pages.length}, page: ${pageWrites}/${pages.length}, errors: ${errors.length}`
+  );
+  return { ok: errors.length === 0, briefId, masterWrites, pageWrites, errors };
+}
+
+/**
+ * Format the brief's posted-at timestamp to the sheet's date convention
+ * ("Tue 5/27/26"). Uses postedMsg.date when available; falls back to now.
+ */
+function formatGregDatePosted(postedMsg) {
+  const d = postedMsg?.date ? new Date(postedMsg.date * 1000) : new Date();
+  return d.toLocaleDateString("en-US", {
+    timeZone: "America/Phoenix",
+    weekday: "short",
+    month:   "numeric",
+    day:     "numeric",
+    year:    "2-digit",
+  });
 }
 
 // ── Edit wizard message in place ──────────────────────────────────────────────
@@ -2154,8 +2366,19 @@ bot.on("callback_query", async (ctx) => {
         chatId:  wizardState.sourceChatId,
       };
 
-      await postToGroup(ctx.telegram, replaySession);
+      const postedMsg = await postToGroup(ctx.telegram, replaySession);
       await forwardContentToPages(ctx.telegram, replaySession);
+
+      // ── Log to DB + sheets (bypass bm_tracking_bot) ───────────────────
+      // Telegram's bot-to-bot delivery filter blocks bm_tracking_bot from
+      // seeing wizard-posted briefs via webhook. We write directly to the
+      // same DB tables + Google Sheets bm_tracking_bot uses for Danielson
+      // briefs. Fail-soft — errors logged but don't fail the approve.
+      try {
+        await logSubmittedBriefToTracking(ctx, adSession, postedMsg);
+      } catch (err) {
+        console.error(`[wizard] logSubmittedBriefToTracking unexpected: ${err.message}`);
+      }
 
       // Bump bulk/campaign template ref counters if the contributor used one
       if (wizardState.bulkTemplateId) {
