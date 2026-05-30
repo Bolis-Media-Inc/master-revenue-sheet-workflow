@@ -141,15 +141,13 @@ function _parseDateToken(s) {
     const month = MONTHS[monthM[1].toLowerCase()];
     const day   = parseInt(monthM[2], 10);
     const year  = monthM[3] ? parseInt(monthM[3], 10) : guessYear(month, day);
-    const d = new Date(year, month, day);
-    if (!isNaN(d.getTime())) return formatSheetDate(d);
+    return _formatYMD(year, month, day);
   }
 
   // ISO yyyy-mm-dd
   const isoM = lower.match(/\b(\d{4})-(\d{1,2})-(\d{1,2})\b/);
   if (isoM) {
-    const d = new Date(parseInt(isoM[1], 10), parseInt(isoM[2], 10) - 1, parseInt(isoM[3], 10));
-    if (!isNaN(d.getTime())) return formatSheetDate(d);
+    return _formatYMD(parseInt(isoM[1], 10), parseInt(isoM[2], 10) - 1, parseInt(isoM[3], 10));
   }
 
   // m/d or m/d/yy or m/d/yyyy  (also m-d-yy style). Anchor to word
@@ -161,11 +159,27 @@ function _parseDateToken(s) {
     if (month < 0 || month > 11 || day < 1 || day > 31) return null;
     let year = slashM[3] ? parseInt(slashM[3], 10) : guessYear(month, day);
     if (year < 100) year += 2000;
-    const d = new Date(year, month, day);
-    if (!isNaN(d.getTime())) return formatSheetDate(d);
+    return _formatYMD(year, month, day);
   }
 
   return null;
+}
+
+/**
+ * Format a Year/Month/Day triple as "Tue 5/27/26" matching the sheet
+ * convention. Pinned to noon UTC during Date construction so that
+ * formatting with America/Phoenix (UTC-7) doesn't slip back a day —
+ * a Railway-UTC process constructing `new Date(2026, 4, 27)` got
+ * midnight UTC which is 5pm previous-day in AZ, producing "Tue 5/26/26"
+ * for a user-typed "5/27" (off-by-one bug Connor saw on Lola Young).
+ */
+function _formatYMD(year, monthIdx, day) {
+  // Date.UTC pins a timezone-independent instant; noon ensures no edge
+  // condition rolls the date when re-projected to any timezone west of
+  // UTC+12 or east of UTC-12 (i.e. any real-world location).
+  const d = new Date(Date.UTC(year, monthIdx, day, 12, 0, 0));
+  if (isNaN(d.getTime())) return null;
+  return formatSheetDate(d);
 }
 
 function guessYear(month, day) {
