@@ -369,7 +369,17 @@ function getCollabBundlesByPage(chatId, adMessageId) {
 
   // "Host: @handle, invite: @a @b @c"
   // Handles may appear on separate lines within the same message text.
-  const HOST_RE = /^Host:\s*@([\w.]+)(?:,\s*|\s+)invite:\s*([\s\S]+)/i;
+  //
+  // Separator between @handle and "invite:" is permissive — `[,\s]+`
+  // matches any mix of commas + whitespace so all of these parse:
+  //   "Host: @page, invite:"   — standard
+  //   "Host: @page , invite:"  — extra space before comma (Connor's typo case)
+  //   "Host: @page  invite:"   — no comma, just whitespace
+  //   "Host: @page,\ninvite:"  — newline after comma
+  // Pre-fix only the "@page," form parsed cleanly, so any operator typing
+  // a space before the comma silently lost their whole host block's media
+  // attribution.
+  const HOST_RE = /^Host:\s*@([\w.]+)\s*[,\s]+\s*invite:\s*([\s\S]+)/i;
 
   // Quick bail — if there are no Host: messages, this isn't a collab ad
   if (!preceding.some((m) => HOST_RE.test((m.text || "").trim()))) return null;
