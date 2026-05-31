@@ -232,32 +232,38 @@ async function forwardMessages(fromChatId, toChatId, messageIds) {
 async function sendFile(chatId, buffer, opts = {}) {
   try {
     const client = await getClient();
-    const sent = await client.sendFile(chatId, {
+    // gramJS requires resolved entities for supergroup/channel numeric IDs
+    // (needs access_hash). getEntity caches per-session after first lookup.
+    const entity = await client.getEntity(Number(chatId));
+    console.log(`[userClient] sendFile → ${chatId} (${buffer.length} bytes, doc=${opts.asDocument !== false})…`);
+    const sent = await client.sendFile(entity, {
       file:           buffer,
       caption:        opts.caption,
       fileName:       opts.filename,
-      forceDocument:  opts.asDocument !== false, // default to document
+      forceDocument:  opts.asDocument !== false,
     });
+    console.log(`[userClient] ✅ sendFile → ${chatId} msg ${sent?.id}`);
     return { ok: true, message_id: sent?.id };
   } catch (err) {
-    console.error(`[userClient] sendFile → ${chatId} (${buffer.length} bytes): ${err.message}`);
+    console.error(`[userClient] ❌ sendFile → ${chatId} (${buffer?.length} bytes): ${err.message}`);
     return { ok: false, error: err.message };
   }
 }
 
 /**
  * Send a text-only message AS THE USER ACCOUNT and return the sent
- * message_id (the existing sendMessage above doesn't return). Used by
- * the wizard's approve flow so we have the brief's message_id for any
- * downstream lookups.
+ * message_id. Resolves entity first for numeric chat IDs.
  */
 async function sendText(chatId, text) {
   try {
     const client = await getClient();
-    const sent = await client.sendMessage(chatId, { message: text });
+    const entity = await client.getEntity(Number(chatId));
+    console.log(`[userClient] sendText → ${chatId} (${text.length} chars)…`);
+    const sent = await client.sendMessage(entity, { message: text });
+    console.log(`[userClient] ✅ sendText → ${chatId} msg ${sent?.id}`);
     return { ok: true, message_id: sent?.id };
   } catch (err) {
-    console.error(`[userClient] sendText → ${chatId}: ${err.message}`);
+    console.error(`[userClient] ❌ sendText → ${chatId}: ${err.message}`);
     return { ok: false, error: err.message };
   }
 }
