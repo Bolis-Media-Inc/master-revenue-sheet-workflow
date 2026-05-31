@@ -2550,6 +2550,16 @@ bot.command("repostreview", async (ctx) => {
   }
 });
 
+// ── /mystatus — sales contributor's own submission history ───────────────────
+// DM-only, only visible to active sales contributors. Lets them check the
+// state of their /ad submissions (pending / approved / rejected / posted)
+// + verify that "Posted" submissions actually landed in sheets + per-page
+// chats. Each user only sees their own (enforced in handler by user_id
+// filter, not by admin role).
+const { handleMyStatus } = require("./handlers/myStatusHandler");
+bot.command("mystatus",      (ctx) => handleMyStatus(ctx));
+bot.command("mysubmissions", (ctx) => handleMyStatus(ctx)); // alias
+
 // ── /setcollab — create & manage collab presets ──────────────────────────────
 
 // Collab preset structure:
