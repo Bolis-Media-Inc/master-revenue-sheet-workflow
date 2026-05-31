@@ -25,6 +25,7 @@
 require("dotenv").config();
 const { TelegramClient, Api } = require("telegram");
 const { StringSession }       = require("telegram/sessions");
+const { CustomFile }          = require("telegram/client/uploads");
 
 const API_ID      = parseInt(process.env.TELEGRAM_API_ID  || "0", 10);
 const API_HASH    = process.env.TELEGRAM_API_HASH          || "";
@@ -235,11 +236,17 @@ async function sendFile(chatId, buffer, opts = {}) {
     // gramJS requires resolved entities for supergroup/channel numeric IDs
     // (needs access_hash). getEntity caches per-session after first lookup.
     const entity = await client.getEntity(Number(chatId));
-    console.log(`[userClient] sendFile → ${chatId} (${buffer.length} bytes, doc=${opts.asDocument !== false})…`);
+    // Wrap the Buffer with CustomFile so the filename actually sticks on
+    // upload. Passing a raw Buffer + fileName option does NOT propagate
+    // the name — gramJS uploads it as "unnamed" with mime "data". The
+    // bm_tracking_bot bundle scanner relies on the @<handle>.<ext>
+    // filename to attribute media per-page, so this is load-bearing.
+    const filename = opts.filename || `upload-${Date.now()}.bin`;
+    const customFile = new CustomFile(filename, buffer.length, "", buffer);
+    console.log(`[userClient] sendFile → ${chatId} (${buffer.length} bytes, name=${filename}, doc=${opts.asDocument !== false})…`);
     const sent = await client.sendFile(entity, {
-      file:           buffer,
+      file:           customFile,
       caption:        opts.caption,
-      fileName:       opts.filename,
       forceDocument:  opts.asDocument !== false,
     });
     console.log(`[userClient] ✅ sendFile → ${chatId} msg ${sent?.id}`);
