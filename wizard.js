@@ -1226,7 +1226,15 @@ async function postAsUserClient(telegram, replaySession) {
 
   // Helper: download a media ref via Greg's bot, upload via userClient.
   // ref shape: { fileId, kind: "photo"|"video"|"document"|"animation"|"audio", fromChatId?, msgId? }
-  async function uploadOne(ref) {
+  //
+  // opts.handle — when set, file is named "@<handle>[ (N)].<ext>" so
+  // bm_tracking_bot's getFilenameBundlesByPage scanner attributes the
+  // upload to that page (same convention Danielson uses for manual
+  // posts). Without it, files land as anonymous names and the scanner
+  // can't tell which page they belong to — per-page forwarding then
+  // drops the media. opts.index suffixes "(N)" for the 2nd+ file of
+  // the same handle; the scanner regex tolerates that suffix already.
+  async function uploadOne(ref, opts = {}) {
     if (!ref?.fileId) return { ok: false, error: "no fileId" };
     try {
       const fileLink = await telegram.getFileLink(ref.fileId);
@@ -1237,7 +1245,11 @@ async function postAsUserClient(telegram, replaySession) {
                 : ref.kind === "video" ? "mp4"
                 : ref.kind === "audio" ? "mp3"
                 : "bin";
-      const filename = `${ref.kind}-${String(ref.fileId).slice(-8)}.${ext}`;
+      const handle  = opts.handle ? String(opts.handle).replace(/^@/, "") : null;
+      const idxPart = opts.index && opts.index > 0 ? ` (${opts.index + 1})` : "";
+      const filename = handle
+        ? `@${handle}${idxPart}.${ext}`
+        : `${ref.kind}-${String(ref.fileId).slice(-8)}.${ext}`;
       return await userClient.sendFile(TARGET_CHAT, buffer, { filename, asDocument: true });
     } catch (err) {
       console.error(`[wizard] postAsUserClient uploadOne(${ref.kind}): ${err.message}`);
@@ -1245,21 +1257,46 @@ async function postAsUserClient(telegram, replaySession) {
     }
   }
 
-  // 1. Media (per format)
+  // 1. Media (per format) — file names matter here.
+  //
+  // Standard:
+  //   • 1 page → name all slides "@<handle>.<ext>" so the filename
+  //     scanner attributes every slide to that one page.
+  //   • N pages → leave anonymous so getFilenameBundlesByPage skips
+  //     and getStandardBundle (preceding-media walk) takes over,
+  //     handing the same set to every page (matches Danielson's
+  //     "shared media for all" convention).
+  //
+  // Per-creative: each handle's batch is per-page by definition →
+  // name with that handle. Keep posting the "@handle^" label too as
+  // defense-in-depth (label scanner is a separate path).
+  //
+  // Collab: per-host bundles → name with the host handle. The collab
+  // scanner uses Host: markers (not filenames), so this is cosmetic
+  // for the brief but keeps the filename convention consistent.
   if (fmt === "Standard") {
-    for (const ref of (content.shared || [])) await uploadOne(ref);
+    const pages = answers.pages || [];
+    const handle = pages.length === 1 ? pages[0] : null;
+    const shared = content.shared || [];
+    for (let i = 0; i < shared.length; i++) {
+      await uploadOne(shared[i], { handle, index: i });
+    }
   } else if (fmt === "Per-creative") {
     for (const handle of (answers.pages || [])) {
       const msgs = content.byHandle?.[handle] || [];
       if (msgs.length) {
-        // Per-page label first
+        // Per-page label first (kept for compat with label scanner)
         await userClient.sendText(TARGET_CHAT, `${handle}^`);
-        for (const ref of msgs) await uploadOne(ref);
+        for (let i = 0; i < msgs.length; i++) {
+          await uploadOne(msgs[i], { handle, index: i });
+        }
       }
     }
   } else if (fmt === "Collab") {
     for (const g of (content.collabGroups || [])) {
-      for (const ref of g.media) await uploadOne(ref);
+      for (let i = 0; i < g.media.length; i++) {
+        await uploadOne(g.media[i], { handle: g.host, index: i });
+      }
       const invites = g.invites.map((h) => `@${h}`).join("\n");
       await userClient.sendText(TARGET_CHAT, `Host: @${g.host}, invite:\n\n${invites}`);
     }
