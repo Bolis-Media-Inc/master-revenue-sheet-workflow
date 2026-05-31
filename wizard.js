@@ -767,19 +767,32 @@ async function postToGroup(telegram, session) {
   const fmt = answers.format;
   // All media goes as documents — sales-team convention. sendCapturedAsDocument
   // uses the captured file_id when available and falls back to copyMessage
-  // for legacy refs that pre-date the file_id capture.
-  const sendDoc = (ref) => sendCapturedAsDocument(telegram, TARGET_CHAT, ref);
+  // for legacy refs that pre-date the file_id capture. Returns the sent
+  // message (so we can record its message_id for the Tracker handoff).
+  const sendDoc = async (ref) => sendCapturedAsDocument(telegram, TARGET_CHAT, ref);
 
-  // Helper: send caption if one was set
+  // Track all message_ids posted so we can hand them off to bm_tracking_bot
+  // via the ingest-wizard-brief HTTP API. Per-page maps stay empty for
+  // formats that don't produce per-page-specific media (Standard, Collab use
+  // sharedMediaMsgIds; Per-creative uses mediaByHandle).
+  const sharedMediaMsgIds = []; // for Standard
+  const mediaByHandle = {};     // for Per-creative
+  const collabMediaByGroup = []; // for Collab — array per group, each {handles, mediaMsgIds}
+  let captionMsgId = null;
+  let briefMsg = null;
+
   const sendCaption = async () => {
-    if (answers.caption) await telegram.sendMessage(TARGET_CHAT, answers.caption);
+    if (answers.caption) {
+      const m = await telegram.sendMessage(TARGET_CHAT, answers.caption);
+      captionMsgId = m?.message_id || null;
+    }
   };
 
-  // Returns the final brief message so callers can grab message_id for DB
-  // tracking (ad_briefs has UNIQUE(chat_id, message_id) constraint).
-  let briefMsg = null;
   if (fmt === "Standard") {
-    for (const ref of content.shared) await sendDoc(ref);
+    for (const ref of content.shared) {
+      const m = await sendDoc(ref);
+      if (m?.message_id) sharedMediaMsgIds.push(m.message_id);
+    }
     await sendCaption();
     briefMsg = await telegram.sendMessage(TARGET_CHAT, buildBrief(answers));
 
@@ -788,7 +801,12 @@ async function postToGroup(telegram, session) {
       const msgs = content.byHandle[handle] || [];
       if (msgs.length) {
         await telegram.sendMessage(TARGET_CHAT, `${handle}^`);
-        for (const ref of msgs) await sendDoc(ref);
+        const ids = [];
+        for (const ref of msgs) {
+          const m = await sendDoc(ref);
+          if (m?.message_id) ids.push(m.message_id);
+        }
+        mediaByHandle[handle] = ids;
       }
     }
     await sendCaption();
@@ -796,9 +814,17 @@ async function postToGroup(telegram, session) {
 
   } else if (fmt === "Collab") {
     for (const g of content.collabGroups) {
-      for (const ref of g.media) await sendDoc(ref);
+      const ids = [];
+      for (const ref of g.media) {
+        const m = await sendDoc(ref);
+        if (m?.message_id) ids.push(m.message_id);
+      }
       const invites = g.invites.map((h) => `@${h}`).join("\n");
       await telegram.sendMessage(TARGET_CHAT, `Host: @${g.host}, invite:\n\n${invites}`);
+      collabMediaByGroup.push({
+        handles: [g.host, ...g.invites],
+        mediaMsgIds: ids,
+      });
     }
     await sendCaption();
     briefMsg = await telegram.sendMessage(TARGET_CHAT, buildBrief(answers));
@@ -807,7 +833,14 @@ async function postToGroup(telegram, session) {
     await sendCaption();
     briefMsg = await telegram.sendMessage(TARGET_CHAT, buildBrief(answers));
   }
-  return briefMsg;
+
+  return {
+    briefMsg,
+    captionMsgId,
+    sharedMediaMsgIds,    // Standard format → every page gets these
+    mediaByHandle,        // Per-creative → handle → message_ids
+    collabMediaByGroup,   // Collab → array of {handles, mediaMsgIds}
+  };
 }
 
 // ── Sales-contributor review submission ─────────────────────────────────────
@@ -1168,6 +1201,112 @@ async function forwardContentToPages(telegram, session) {
   }
 
   console.log(`[wizard] 📤 Content forwarded to ${forwardedDests.size} destination(s)`);
+}
+
+/**
+ * Hand off an approved wizard submission to bm_tracking_bot via the
+ * Tracker service's /api/ingest-wizard-brief HTTP endpoint.
+ *
+ * Greg has the parsed brief data + message_ids of everything it just
+ * posted to Internal Network Ads. Tracker (bm_tracking_bot) is a
+ * member of every per-page IG Ads chat AND has access to Internal
+ * Network Ads, so it can forwardMessage the media from source → dest
+ * without needing file_ids (which are bot-scoped). Tracker also owns
+ * the sheets/DB code paths so we don't duplicate them in Greg.
+ *
+ * Reads WIZARD_INGEST_TOKEN + TRACKER_INGEST_URL from env. Logs on
+ * failure but never throws — the user-visible part of the approve
+ * flow (chat post + DM) already succeeded before this runs.
+ */
+async function handoffToTracker(ctx, adSession, replaySession, postResult) {
+  const TRACKER_URL  = process.env.TRACKER_INGEST_URL || "";
+  const INGEST_TOKEN = process.env.WIZARD_INGEST_TOKEN || "";
+  if (!TRACKER_URL || !INGEST_TOKEN) {
+    console.warn("[wizard] handoffToTracker: TRACKER_INGEST_URL or WIZARD_INGEST_TOKEN not set — skipping");
+    return;
+  }
+
+  const answers = replaySession.answers;
+  const pages   = Array.isArray(answers.pages) ? answers.pages : [];
+  if (!pages.length || !postResult.briefMsg) return;
+
+  // Resolve per-page price + bulk number from wizard answers shape
+  const perPageInfo = (handle) => {
+    if (answers.priceMode === "per-page") {
+      const pp = answers.perPagePrices?.[handle] || {};
+      return { price: pp.price != null ? parseFloat(pp.price) : null, bulk: pp.bulk || null };
+    }
+    return { price: answers.price != null ? parseFloat(answers.price) : null, bulk: null };
+  };
+
+  // Build per-page media message_id mapping based on format
+  const mediaForPage = (handle) => {
+    if (answers.format === "Standard") {
+      return postResult.sharedMediaMsgIds || [];
+    }
+    if (answers.format === "Per-creative") {
+      return postResult.mediaByHandle?.[handle] || [];
+    }
+    if (answers.format === "Collab") {
+      // Find the group this handle belongs to
+      for (const g of (postResult.collabMediaByGroup || [])) {
+        if (g.handles.includes(handle)) return g.mediaMsgIds;
+      }
+      return [];
+    }
+    return [];
+  };
+
+  const payload = {
+    source_chat_id: Number(TARGET_CHAT),
+    brief: {
+      brief_message_id:   postResult.briefMsg.message_id,
+      raw_text:           buildBrief(answers),
+      client:             answers.client,
+      category:           answers.adType,
+      post_type:          answers.postType,
+      post_duration:      answers.duration,
+      nif:                answers.nif && answers.nif !== "none" ? answers.nif : null,
+      date_posted:        formatGregDatePosted(postResult.briefMsg),
+      time_mst:           answers.time || null,
+      caption_text:       answers.caption || null,
+      caption_message_id: postResult.captionMsgId || null,
+    },
+    pages: pages.map((handle) => {
+      const info = perPageInfo(handle);
+      return {
+        handle,
+        price:             info.price,
+        bulk_num:          info.bulk,
+        media_message_ids: mediaForPage(handle),
+      };
+    }),
+    sender: {
+      telegram_user_id:  ctx.from?.id ?? adSession.user_id ?? null,
+      telegram_username: ctx.from?.username ?? null,
+      session_id:        adSession.id,
+    },
+  };
+
+  console.log(`[wizard] → Handing off to Tracker (${pages.length} page(s), brief msg ${payload.brief.brief_message_id})`);
+  try {
+    const res = await fetch(TRACKER_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type":   "application/json",
+        "X-Ingest-Token": INGEST_TOKEN,
+      },
+      body: JSON.stringify(payload),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      console.error(`[wizard] handoff HTTP ${res.status}:`, JSON.stringify(body));
+      return;
+    }
+    console.log(`[wizard] ✅ Handoff result:`, JSON.stringify(body.writes), body.errors?.length ? `errors=${body.errors.length}` : "");
+  } catch (err) {
+    console.error(`[wizard] handoff failed: ${err.message}`);
+  }
 }
 
 /**
@@ -2366,18 +2505,26 @@ bot.on("callback_query", async (ctx) => {
         chatId:  wizardState.sourceChatId,
       };
 
-      const postedMsg = await postToGroup(ctx.telegram, replaySession);
-      await forwardContentToPages(ctx.telegram, replaySession);
+      // ── Greg posts to Internal Network Ads chat (humans see it) ──────
+      // postToGroup returns all the message_ids we just posted so we can
+      // hand them off to bm_tracking_bot — Tracker uses forwardMessage
+      // (not file_id re-upload) which avoids file_id-scope-per-bot
+      // issues and avoids needing Greg as a member of every page chat.
+      const postResult = await postToGroup(ctx.telegram, replaySession);
 
-      // ── Log to DB + sheets (bypass bm_tracking_bot) ───────────────────
-      // Telegram's bot-to-bot delivery filter blocks bm_tracking_bot from
-      // seeing wizard-posted briefs via webhook. We write directly to the
-      // same DB tables + Google Sheets bm_tracking_bot uses for Danielson
-      // briefs. Fail-soft — errors logged but don't fail the approve.
+      // ── Hand off to bm_tracking_bot for sheets + per-page forwards ───
+      // Telegram blocks bot-to-bot message delivery, so bm_tracking_bot
+      // can't react to Greg's post via webhook. Instead, we POST a
+      // structured payload to its HTTP API. bm_tracking_bot then:
+      //   - writes master + per-page sheet rows
+      //   - forwards media (via forwardMessage from Internal Network Ads
+      //     to each page's IG Ads chat — bm_tracking_bot is in all of them)
+      //   - persists ad_briefs + ad_brief_pages for /syncsheets visibility
+      // Fail-soft — errors logged but don't fail the approve.
       try {
-        await logSubmittedBriefToTracking(ctx, adSession, postedMsg);
+        await handoffToTracker(ctx, adSession, replaySession, postResult);
       } catch (err) {
-        console.error(`[wizard] logSubmittedBriefToTracking unexpected: ${err.message}`);
+        console.error(`[wizard] handoffToTracker unexpected: ${err.message}`);
       }
 
       // Bump bulk/campaign template ref counters if the contributor used one
@@ -4015,13 +4162,12 @@ bot.on(["photo", "video", "document", "animation"], async (ctx) => {
 // Operators get the highest fidelity by uploading via "Send as File"
 // (the prompt at the content step now mentions this).
 async function sendCapturedAsDocument(telegram, chatId, ref) {
-  if (!ref) return;
+  if (!ref) return null;
 
   // Path 1: already a document → file_id passthrough
   if (ref.fileId && (ref.kind === "document" || ref.kind === "animation")) {
     try {
-      await telegram.sendDocument(chatId, ref.fileId);
-      return;
+      return await telegram.sendDocument(chatId, ref.fileId);
     } catch (e) {
       console.warn(`[wizard] sendDocument(${ref.kind}) passthrough failed: ${e.message}`);
     }
@@ -4039,18 +4185,20 @@ async function sendCapturedAsDocument(telegram, chatId, ref) {
                 : ref.kind === "audio" ? "mp3"
                 : "bin";
       const filename = `${ref.kind}-${String(ref.fileId).slice(-8)}.${ext}`;
-      await telegram.sendDocument(chatId, { source: buffer, filename });
-      return;
+      return await telegram.sendDocument(chatId, { source: buffer, filename });
     } catch (e) {
       console.warn(`[wizard] download+reupload(${ref.kind}) failed: ${e.message} — falling back to copyMessage`);
     }
   }
 
-  // Path 3: copyMessage fallback (preserves original media type, last resort)
+  // Path 3: copyMessage fallback (preserves original media type, last resort).
+  // copyMessage returns { message_id } (no other fields), shape-compatible
+  // with sendDocument's return for our purposes (we only read .message_id).
   if (ref.fromChatId && ref.msgId) {
-    try { await telegram.copyMessage(chatId, ref.fromChatId, ref.msgId); }
+    try { return await telegram.copyMessage(chatId, ref.fromChatId, ref.msgId); }
     catch (e) { console.error(`[wizard] copyMessage fallback failed: ${e.message}`); }
   }
+  return null;
 }
 
 // ── Sales intelligence startup ────────────────────────────────────────────────

@@ -134,6 +134,9 @@ if (WEBHOOK_URL) {
   const webhookPath    = "/webhook";
   const webhookFullUrl = `${WEBHOOK_URL}${webhookPath}`;
 
+  const { ingestWizardBrief } = require("./handlers/wizardIngestHandler");
+  const INGEST_TOKEN = process.env.WIZARD_INGEST_TOKEN || "";
+
   server = http.createServer((req, res) => {
     if (req.method === "POST" && req.url === webhookPath) {
       let body = "";
@@ -146,6 +149,34 @@ if (WEBHOOK_URL) {
           await bot.handleUpdate(update);
         } catch (err) {
           console.error("Webhook handler error:", err.message);
+        }
+      });
+    } else if (req.method === "POST" && req.url === "/api/ingest-wizard-brief") {
+      // Greg → Tracker handoff for wizard-approved submissions.
+      // Greg posts the brief + media to Internal Network Ads (since Greg
+      // is a member there) then hands off to Tracker via this endpoint so
+      // bm_tracking_bot can do per-page forwarding (it's in every IG Ads
+      // chat) + write sheets + persist DB. Avoids needing Greg's bot to
+      // join every page chat individually.
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", async () => {
+        try {
+          // Auth: shared secret in header
+          const provided = req.headers["x-ingest-token"] || "";
+          if (!INGEST_TOKEN || provided !== INGEST_TOKEN) {
+            res.writeHead(401, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "unauthorized" }));
+            return;
+          }
+          const payload = JSON.parse(body);
+          const result = await ingestWizardBrief(bot.telegram, payload);
+          res.writeHead(result.ok ? 200 : 500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(result));
+        } catch (err) {
+          console.error("[ingest-wizard-brief]", err);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
         }
       });
     } else {
