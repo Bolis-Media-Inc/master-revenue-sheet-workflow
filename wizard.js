@@ -21,6 +21,7 @@ const path            = require("path");
 const { Telegraf, Markup } = require("telegraf");
 const cron            = require("node-cron");
 const brain           = require("./brain");
+const userClient      = require("./userClient");
 const pagesRegistry   = require("./lib/pages");
 const postedHandler   = require("./handlers/postedHandler");
 const apiServer       = require("./lib/api");
@@ -1201,6 +1202,73 @@ async function forwardContentToPages(telegram, session) {
   }
 
   console.log(`[wizard] 📤 Content forwarded to ${forwardedDests.size} destination(s)`);
+}
+
+/**
+ * Forward the wizard-posted media + caption from Internal Network Ads
+ * to each per-page IG Ads chat using sales_bolismedia's user-account
+ * session. Bypasses Telegram's bot-to-bot delivery filter (which would
+ * block bm_tracking_bot from forwarding these).
+ *
+ * Per-page mapping:
+ *   Standard format → every page gets sharedMediaMsgIds
+ *   Per-creative    → each page gets its handle's mediaByHandle[handle]
+ *   Collab          → each page gets its group's mediaMsgIds
+ *
+ * Caption is forwarded to every destination (one shared caption per brief).
+ * Fail-soft — failures logged per page, not raised.
+ */
+async function forwardMediaViaUserClient(replaySession, postResult) {
+  const answers = replaySession.answers;
+  const pages   = Array.isArray(answers.pages) ? answers.pages : [];
+  if (!pages.length) return;
+
+  // Build per-page list of media message_ids based on format
+  const mediaForPage = (handle) => {
+    if (answers.format === "Standard") {
+      return postResult.sharedMediaMsgIds || [];
+    }
+    if (answers.format === "Per-creative") {
+      return postResult.mediaByHandle?.[handle] || [];
+    }
+    if (answers.format === "Collab") {
+      for (const g of (postResult.collabMediaByGroup || [])) {
+        if (g.handles.includes(handle)) return g.mediaMsgIds;
+      }
+      return [];
+    }
+    return [];
+  };
+
+  // Deduplicate destinations (multiple handles may share one IG Ads chat)
+  const seenDests = new Set();
+  let forwardedDests = 0;
+  let failedDests   = 0;
+
+  for (const handle of pages) {
+    const canonical = pagesRegistry.resolveHandle(handle) || handle;
+    const destChatId = pagesRegistry.getChatId(canonical);
+    if (!destChatId || PLACEHOLDER_PATTERN.test(String(destChatId))) continue;
+    const destKey = String(destChatId);
+    if (seenDests.has(destKey)) continue;
+    seenDests.add(destKey);
+
+    // Collect message_ids to forward to this chat: caption (if any) + this page's media
+    const msgIds = [];
+    if (postResult.captionMsgId) msgIds.push(postResult.captionMsgId);
+    msgIds.push(...mediaForPage(handle));
+    if (msgIds.length === 0) continue;
+
+    const result = await userClient.forwardMessages(Number(TARGET_CHAT), Number(destChatId), msgIds);
+    if (result.ok) {
+      forwardedDests++;
+      console.log(`[wizard] 📤 userClient forwarded ${msgIds.length} msg(s) → @${handle} (${destChatId})`);
+    } else {
+      failedDests++;
+      console.error(`[wizard] ❌ userClient forward → @${handle}: ${result.error}`);
+    }
+  }
+  console.log(`[wizard] userClient forward summary: ${forwardedDests}/${forwardedDests + failedDests} dests OK`);
 }
 
 /**
@@ -2512,19 +2580,31 @@ bot.on("callback_query", async (ctx) => {
       // issues and avoids needing Greg as a member of every page chat.
       const postResult = await postToGroup(ctx.telegram, replaySession);
 
-      // ── Hand off to bm_tracking_bot for sheets + per-page forwards ───
-      // Telegram blocks bot-to-bot message delivery, so bm_tracking_bot
-      // can't react to Greg's post via webhook. Instead, we POST a
-      // structured payload to its HTTP API. bm_tracking_bot then:
+      // ── Hand off to bm_tracking_bot for sheets + DB + per-page brief send ──
+      // Tracker does:
       //   - writes master + per-page sheet rows
-      //   - forwards media (via forwardMessage from Internal Network Ads
-      //     to each page's IG Ads chat — bm_tracking_bot is in all of them)
       //   - persists ad_briefs + ad_brief_pages for /syncsheets visibility
-      // Fail-soft — errors logged but don't fail the approve.
+      //   - sends the per-page brief text to each page's chat
+      //
+      // It does NOT forward media + caption — Telegram's bot-to-bot filter
+      // blocks bm_tracking_bot from accessing Greg's posts (forwardMessage
+      // returns "message not found", file_ids are bot-scoped). Greg handles
+      // media + caption forwarding via sales_bolismedia userClient below.
       try {
         await handoffToTracker(ctx, adSession, replaySession, postResult);
       } catch (err) {
         console.error(`[wizard] handoffToTracker unexpected: ${err.message}`);
+      }
+
+      // ── Forward media + caption to per-page chats via userClient ─────
+      // sales_bolismedia is in every IG Ads chat AND is a user account
+      // (not a bot), so it can forward Greg's bot-posted messages from
+      // Internal Network Ads to each page's chat without hitting the
+      // bot-to-bot delivery filter.
+      try {
+        await forwardMediaViaUserClient(replaySession, postResult);
+      } catch (err) {
+        console.error(`[wizard] forwardMediaViaUserClient unexpected: ${err.message}`);
       }
 
       // Bump bulk/campaign template ref counters if the contributor used one

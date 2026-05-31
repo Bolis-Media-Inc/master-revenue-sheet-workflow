@@ -1,30 +1,24 @@
 /**
- * userClient.js — Telegram User Account Clients
+ * userClient.js — Telegram User Account Client (sales)
  *
- * Two real-user MTProto connections, both via gramjs:
+ * Connects to @sales_bolismedia via gramjs for the features that
+ * legitimately need a user identity:
  *
- *   1. SALES (@sales_bolismedia) — the default. Handles recaps, message
- *      listening (onNewMessage), and anything that needs to act AS the
- *      sales identity. Required.
+ *   - sendRecap — daily recap message posted AS the sales account
+ *   - onNewMessage — passive message listener for brain.js auto-capture
+ *   - getMessagesSince — recap aggregation across all chats
  *
- *   2. OPS (operations account) — optional second session. The ops
- *      account is the one that *creates* every new page's IG Ads chat,
- *      so it's a member of every chat from inception (sales sometimes
- *      isn't added for a while). Used for chat search / lookup so the
- *      /admin/page-registry "Find chat" feature surfaces fresh chats
- *      the moment they're created.
+ * Chat lookup / dialog search used to live here too (as searchChats,
+ * with an optional ops session fallback). That's been removed — user-
+ * account features that aren't strictly Greg's domain (chat discovery,
+ * bulk bot-invite, etc.) should live in Digi instead. See architecture
+ * doc / Connor's "Greg owns the API, Digi owns user-account tasks"
+ * framing.
  *
  * Env vars:
- *   Sales (required):
- *     TELEGRAM_API_ID       — from https://my.telegram.org (numeric)
- *     TELEGRAM_API_HASH     — from https://my.telegram.org (string)
- *     TELEGRAM_SESSION      — session string from setup-session.js
- *
- *   Ops (optional — falls back to sales for chat search if unset):
- *     OPS_TELEGRAM_API_ID
- *     OPS_TELEGRAM_API_HASH
- *     OPS_TELEGRAM_SESSION
- *
+ *   TELEGRAM_API_ID         — from https://my.telegram.org (numeric)
+ *   TELEGRAM_API_HASH       — from https://my.telegram.org (string)
+ *   TELEGRAM_SESSION        — session string from setup-session.js
  *   GREG_SALES_CHAT         — recap target chat (group username or id)
  */
 
@@ -32,21 +26,14 @@ require("dotenv").config();
 const { TelegramClient, Api } = require("telegram");
 const { StringSession }       = require("telegram/sessions");
 
-// Sales session (legacy default — required)
 const API_ID      = parseInt(process.env.TELEGRAM_API_ID  || "0", 10);
 const API_HASH    = process.env.TELEGRAM_API_HASH          || "";
 const SESSION_STR = process.env.TELEGRAM_SESSION           || "";
 const SALES_CHAT  = process.env.GREG_SALES_CHAT            || "";
 
-// Ops session (optional — used for chat lookup only)
-const OPS_API_ID      = parseInt(process.env.OPS_TELEGRAM_API_ID  || "0", 10);
-const OPS_API_HASH    = process.env.OPS_TELEGRAM_API_HASH          || "";
-const OPS_SESSION_STR = process.env.OPS_TELEGRAM_SESSION           || "";
+let _client = null;
 
-let _client    = null;  // sales
-let _opsClient = null;  // ops
-
-// ── Connect (sales) ───────────────────────────────────────────────────────────
+// ── Connect ───────────────────────────────────────────────────────────────────
 
 async function getClient() {
   if (_client?.connected) return _client;
@@ -65,27 +52,8 @@ async function getClient() {
   });
 
   await _client.connect();
-  console.log("[userClient] ✅ Connected as @sales_bolismedia (sales)");
+  console.log("[userClient] ✅ Connected as @sales_bolismedia");
   return _client;
-}
-
-// ── Connect (ops) ─────────────────────────────────────────────────────────────
-// Returns null when ops env vars aren't configured — callers should
-// fall back to the sales client. Lazy-instantiated on first use.
-
-async function getOpsClient() {
-  if (_opsClient?.connected) return _opsClient;
-  if (!OPS_API_ID || !OPS_API_HASH || !OPS_SESSION_STR) return null;
-
-  const session = new StringSession(OPS_SESSION_STR);
-  _opsClient = new TelegramClient(session, OPS_API_ID, OPS_API_HASH, {
-    connectionRetries: 5,
-    useWSS: false,
-  });
-
-  await _opsClient.connect();
-  console.log("[userClient] ✅ Connected as operations account (chat-lookup channel)");
-  return _opsClient;
 }
 
 // ── Send message to a chat ────────────────────────────────────────────────────
@@ -128,68 +96,6 @@ async function listChats() {
     name:  d.title || d.name || "Unknown",
     type:  d.isGroup ? "group" : d.isChannel ? "channel" : "private",
   }));
-}
-
-// ── Search chats by name substring ───────────────────────────────────────────
-// Powers Digi's /admin/page-registry "Find chat by handle" lookup.
-//
-// Prefers the OPS account because operations creates every IG Ads chat
-// — so ops is a member from second zero. The sales account sometimes
-// isn't added for a while after a new page comes online, which would
-// make freshly-created chats invisible to a sales-only search.
-//
-// Falls back to the sales client if ops env vars aren't configured.
-// Higher dialog limit than listChats() (500) since the account is in
-// 100+ chats and a stale cap would silently miss matches.
-async function searchChats(query, { limit = 20 } = {}) {
-  if (!query) return [];
-  const q = String(query).trim().toLowerCase();
-  if (!q) return [];
-
-  // Try ops first; if anything fails (SESSION_REVOKED, AUTH_KEY_*, etc.)
-  // null out the cached client so the next attempt re-reads env vars
-  // and reconnects, then fall back to sales for this request.
-  let client;
-  let dialogs;
-  try {
-    client = (await getOpsClient()) || (await getClient());
-    dialogs = await client.getDialogs({ limit: 500 });
-  } catch (e) {
-    const msg = e?.message || String(e);
-    console.error(`[userClient] searchChats via ops failed: ${msg}`);
-    // Force a fresh connect on next call. If ops env vars are still
-    // bad, getOpsClient will throw again and we'll fall back to sales
-    // again — but at least we won't keep returning the same dead handle.
-    if (_opsClient) {
-      try { await _opsClient.disconnect(); } catch (_) {}
-      _opsClient = null;
-    }
-    // Retry once explicitly via the sales client so this request still
-    // returns useful results instead of the operator seeing the error.
-    try {
-      const sales = await getClient();
-      dialogs = await sales.getDialogs({ limit: 500 });
-    } catch (e2) {
-      throw new Error(`ops dialog fetch failed (${msg}); sales fallback also failed (${e2.message})`);
-    }
-  }
-
-  const matches = [];
-  for (const d of dialogs) {
-    const name = d.title || d.name || "";
-    if (!name) continue;
-    if (!name.toLowerCase().includes(q)) continue;
-    matches.push({
-      id:   d.id?.toString(),
-      name,
-      type: d.isGroup ? "group" : d.isChannel ? "channel" : "private",
-    });
-    if (matches.length >= limit) break;
-  }
-  // Rank: shorter names first (more specific matches usually win), then
-  // alphabetical for stable ordering.
-  matches.sort((a, b) => a.name.length - b.name.length || a.name.localeCompare(b.name));
-  return matches;
 }
 
 // ── Get messages from all chats since a given date ───────────────────────────
@@ -285,7 +191,38 @@ async function onNewMessage(callback) {
 
 async function disconnect() {
   if (_client?.connected)    { await _client.disconnect();    _client    = null; }
-  if (_opsClient?.connected) { await _opsClient.disconnect(); _opsClient = null; }
 }
 
-module.exports = { getClient, getOpsClient, sendMessage, sendRecap, getRecentMessages, listChats, searchChats, getMessagesSince, onNewMessage, disconnect };
+/**
+ * Forward messages from one chat to another via the user account.
+ *
+ * Why this exists: Telegram blocks BOT accounts from forwarding messages
+ * posted by OTHER bots (the bot-to-bot delivery filter). User accounts
+ * aren't subject to that filter, so when Greg-the-bot posts to Internal
+ * Network Ads and we need to fan those messages out to each per-page
+ * IG Ads chat, we use sales_bolismedia's user session (which is in every
+ * relevant chat) to do the forwarding.
+ *
+ * @param {number|string} fromChatId  Source chat ID (numeric, with -100 prefix for supergroups/channels)
+ * @param {number|string} toChatId    Destination chat ID
+ * @param {number[]}      messageIds  Message IDs in source chat to forward
+ * @returns {Promise<{ok: boolean, error?: string}>}
+ */
+async function forwardMessages(fromChatId, toChatId, messageIds) {
+  if (!messageIds || messageIds.length === 0) return { ok: true };
+  try {
+    const client = await getClient();
+    // gramJS's forwardMessages wraps Api.messages.ForwardMessages — accepts
+    // numeric chat IDs and handles peer resolution internally.
+    await client.forwardMessages(toChatId, {
+      messages: messageIds.map(Number),
+      fromPeer: fromChatId,
+    });
+    return { ok: true };
+  } catch (err) {
+    console.error(`[userClient] forwardMessages ${fromChatId}→${toChatId} (${messageIds.length} msg): ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
+module.exports = { getClient, sendMessage, sendRecap, getRecentMessages, listChats, getMessagesSince, onNewMessage, disconnect, forwardMessages };

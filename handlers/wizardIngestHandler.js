@@ -203,10 +203,13 @@ async function ingestWizardBrief(telegram, payload) {
     }
   }
 
-  // ── 4. Forward media + caption + per-page brief to each page chat ───────
-  // bm_tracking_bot is a member of every per-page chat AND a member of
-  // source_chat (Internal Network Ads), so forwardMessage from source to
-  // each dest works with just message_id refs — no file_id handling.
+  // ── 4. Send per-page brief text to each page chat ───────────────────────
+  // ONLY the brief text — media + caption forwarding is handled by Greg
+  // using a user-account session (sales_bolismedia). Bot accounts can't
+  // forwardMessage other bots' posts (Telegram's bot-to-bot filter), and
+  // file_ids are bot-scoped so re-sending via sendDocument doesn't work
+  // either. User accounts aren't subject to that filter, so Greg does it
+  // post-handoff via userClient.forwardMessages.
   for (const p of pages) {
     const handle = String(p.handle).toLowerCase();
     const canonicalHandle = pagesRegistry.resolveHandle(handle) || handle;
@@ -216,50 +219,21 @@ async function ingestWizardBrief(telegram, payload) {
       continue;
     }
 
-    let pageOk = true;
-    // 4a. Forward per-page media messages
-    for (const msgId of (p.media_message_ids || [])) {
-      try {
-        await telegram.forwardMessage(String(destChatId), Number(source_chat_id), Number(msgId));
-      } catch (err) {
-        pageOk = false;
-        errors.push(`forward msg ${msgId} → @${handle}: ${err.message}`);
-        console.error(`[ingest-wizard-brief] ❌ forwardMessage ${msgId} → @${handle}: ${err.message}`);
-      }
-    }
-
-    // 4b. Forward shared caption (if it was sent as a separate message)
-    if (brief.caption_message_id) {
-      try {
-        await telegram.forwardMessage(String(destChatId), Number(source_chat_id), Number(brief.caption_message_id));
-      } catch (err) {
-        errors.push(`forward caption → @${handle}: ${err.message}`);
-      }
-    }
-
-    // 4c. Send the per-page brief text. We just send the full brief; per-page
-    // rewriting (strip other pages, show only this page's price) can be added
-    // later if needed — Danielson briefs the same way for the parent post.
     try {
       const perPageBrief = buildPerPageBrief(brief, p);
       await telegram.sendMessage(String(destChatId), perPageBrief);
-    } catch (err) {
-      pageOk = false;
-      errors.push(`brief → @${handle}: ${err.message}`);
-      console.error(`[ingest-wizard-brief] ❌ Brief send → @${handle}: ${err.message}`);
-    }
-
-    if (pageOk) {
       writes.forwarded_chats++;
-      // Mark forwarded in DB
+      // Mark forwarded — Greg's userClient takes care of media+caption next
       const pageRowId = pageRowIdByHandle.get(handle);
       if (pageRowId) {
         await adBriefs.markPageForwarded(pageRowId, {}).catch(() => {});
       }
-    } else {
+    } catch (err) {
+      errors.push(`brief → @${handle}: ${err.message}`);
+      console.error(`[ingest-wizard-brief] ❌ Brief send → @${handle}: ${err.message}`);
       const pageRowId = pageRowIdByHandle.get(handle);
       if (pageRowId) {
-        await adBriefs.markPageForwardError(pageRowId, `partial forward failure (see errors)`).catch(() => {});
+        await adBriefs.markPageForwardError(pageRowId, err.message).catch(() => {});
       }
     }
   }
