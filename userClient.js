@@ -195,25 +195,14 @@ async function disconnect() {
 
 /**
  * Forward messages from one chat to another via the user account.
- *
- * Why this exists: Telegram blocks BOT accounts from forwarding messages
- * posted by OTHER bots (the bot-to-bot delivery filter). User accounts
- * aren't subject to that filter, so when Greg-the-bot posts to Internal
- * Network Ads and we need to fan those messages out to each per-page
- * IG Ads chat, we use sales_bolismedia's user session (which is in every
- * relevant chat) to do the forwarding.
- *
- * @param {number|string} fromChatId  Source chat ID (numeric, with -100 prefix for supergroups/channels)
- * @param {number|string} toChatId    Destination chat ID
- * @param {number[]}      messageIds  Message IDs in source chat to forward
- * @returns {Promise<{ok: boolean, error?: string}>}
+ * (Kept for backwards compat; new flow prefers sendFile / sendMessage
+ * direct posting via this same user session so bm_tracking_bot's webhook
+ * sees the post naturally and processes via its normal handleAdMessage.)
  */
 async function forwardMessages(fromChatId, toChatId, messageIds) {
   if (!messageIds || messageIds.length === 0) return { ok: true };
   try {
     const client = await getClient();
-    // gramJS's forwardMessages wraps Api.messages.ForwardMessages — accepts
-    // numeric chat IDs and handles peer resolution internally.
     await client.forwardMessages(toChatId, {
       messages: messageIds.map(Number),
       fromPeer: fromChatId,
@@ -225,4 +214,52 @@ async function forwardMessages(fromChatId, toChatId, messageIds) {
   }
 }
 
-module.exports = { getClient, sendMessage, sendRecap, getRecentMessages, listChats, getMessagesSince, onNewMessage, disconnect, forwardMessages };
+/**
+ * Upload a file (Buffer) to a Telegram chat AS THE USER ACCOUNT
+ * (sales_bolismedia). Used when Greg the bot has the file via Marcel's
+ * DM but we need the post to appear from a USER so bm_tracking_bot
+ * (which is blocked from seeing other bots' messages by Telegram's
+ * bot-to-bot filter) can pick it up via its normal webhook.
+ *
+ * @param {number|string} chatId
+ * @param {Buffer}        buffer   Raw file contents
+ * @param {object}        [opts]
+ * @param {string}        [opts.filename]   Filename to attach (Telegram uses this for downloads)
+ * @param {string}        [opts.caption]    Caption text shown under the file
+ * @param {boolean}       [opts.asDocument] Force document-style upload (recommended for consistency with the team's brief format)
+ * @returns {Promise<{ok: boolean, message_id?: number, error?: string}>}
+ */
+async function sendFile(chatId, buffer, opts = {}) {
+  try {
+    const client = await getClient();
+    const sent = await client.sendFile(chatId, {
+      file:           buffer,
+      caption:        opts.caption,
+      fileName:       opts.filename,
+      forceDocument:  opts.asDocument !== false, // default to document
+    });
+    return { ok: true, message_id: sent?.id };
+  } catch (err) {
+    console.error(`[userClient] sendFile → ${chatId} (${buffer.length} bytes): ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
+/**
+ * Send a text-only message AS THE USER ACCOUNT and return the sent
+ * message_id (the existing sendMessage above doesn't return). Used by
+ * the wizard's approve flow so we have the brief's message_id for any
+ * downstream lookups.
+ */
+async function sendText(chatId, text) {
+  try {
+    const client = await getClient();
+    const sent = await client.sendMessage(chatId, { message: text });
+    return { ok: true, message_id: sent?.id };
+  } catch (err) {
+    console.error(`[userClient] sendText → ${chatId}: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
+module.exports = { getClient, sendMessage, sendRecap, getRecentMessages, listChats, getMessagesSince, onNewMessage, disconnect, forwardMessages, sendFile, sendText };

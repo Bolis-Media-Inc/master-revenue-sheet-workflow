@@ -1205,6 +1205,83 @@ async function forwardContentToPages(telegram, session) {
 }
 
 /**
+ * Post the entire approved wizard brief to TARGET_CHAT (Internal Network
+ * Ads) AS THE USER ACCOUNT sales_bolismedia, NOT as Greg the bot.
+ *
+ * Why: Telegram blocks bot-to-bot message delivery — bm_tracking_bot
+ * would never see Greg's bot posts via webhook. By posting as a user,
+ * bm_tracking_bot's webhook fires naturally and the brief flows through
+ * the same handleAdMessage path Danielson briefs use (parse → sheet
+ * writes → per-page chat forwards → DB tracking → /syncsheets-visible).
+ *
+ * Implementation: Greg's bot has Marcel's file_ids; downloads each via
+ * Bot API getFileLink, hands the buffer to userClient.sendFile which
+ * uploads via sales_bolismedia's gramJS session.
+ *
+ * Returns { ok, briefMsgId } or { ok: false, error }.
+ */
+async function postAsUserClient(telegram, replaySession) {
+  const { answers, content } = replaySession;
+  const fmt = answers.format;
+
+  // Helper: download a media ref via Greg's bot, upload via userClient.
+  // ref shape: { fileId, kind: "photo"|"video"|"document"|"animation"|"audio", fromChatId?, msgId? }
+  async function uploadOne(ref) {
+    if (!ref?.fileId) return { ok: false, error: "no fileId" };
+    try {
+      const fileLink = await telegram.getFileLink(ref.fileId);
+      const res = await fetch(fileLink.toString());
+      if (!res.ok) throw new Error(`fetch ${res.status}`);
+      const buffer = Buffer.from(await res.arrayBuffer());
+      const ext = ref.kind === "photo" ? "jpg"
+                : ref.kind === "video" ? "mp4"
+                : ref.kind === "audio" ? "mp3"
+                : "bin";
+      const filename = `${ref.kind}-${String(ref.fileId).slice(-8)}.${ext}`;
+      return await userClient.sendFile(TARGET_CHAT, buffer, { filename, asDocument: true });
+    } catch (err) {
+      console.error(`[wizard] postAsUserClient uploadOne(${ref.kind}): ${err.message}`);
+      return { ok: false, error: err.message };
+    }
+  }
+
+  // 1. Media (per format)
+  if (fmt === "Standard") {
+    for (const ref of (content.shared || [])) await uploadOne(ref);
+  } else if (fmt === "Per-creative") {
+    for (const handle of (answers.pages || [])) {
+      const msgs = content.byHandle?.[handle] || [];
+      if (msgs.length) {
+        // Per-page label first
+        await userClient.sendText(TARGET_CHAT, `${handle}^`);
+        for (const ref of msgs) await uploadOne(ref);
+      }
+    }
+  } else if (fmt === "Collab") {
+    for (const g of (content.collabGroups || [])) {
+      for (const ref of g.media) await uploadOne(ref);
+      const invites = g.invites.map((h) => `@${h}`).join("\n");
+      await userClient.sendText(TARGET_CHAT, `Host: @${g.host}, invite:\n\n${invites}`);
+    }
+  }
+
+  // 2. Caption (if any)
+  if (answers.caption) {
+    await userClient.sendText(TARGET_CHAT, answers.caption);
+  }
+
+  // 3. The brief itself — bm_tracking_bot's handleAdMessage will parse
+  // this and run the full pipeline because it now appears as a user
+  // message from sales_bolismedia.
+  const briefRes = await userClient.sendText(TARGET_CHAT, buildBrief(answers));
+  if (!briefRes.ok) {
+    return { ok: false, error: `brief send failed: ${briefRes.error}` };
+  }
+  console.log(`[wizard] 📤 Posted brief as sales_bolismedia (msg ${briefRes.message_id})`);
+  return { ok: true, briefMsgId: briefRes.message_id };
+}
+
+/**
  * Forward the wizard-posted media + caption from Internal Network Ads
  * to each per-page IG Ads chat using sales_bolismedia's user-account
  * session. Bypasses Telegram's bot-to-bot delivery filter (which would
@@ -2573,38 +2650,20 @@ bot.on("callback_query", async (ctx) => {
         chatId:  wizardState.sourceChatId,
       };
 
-      // ── Greg posts to Internal Network Ads chat (humans see it) ──────
-      // postToGroup returns all the message_ids we just posted so we can
-      // hand them off to bm_tracking_bot — Tracker uses forwardMessage
-      // (not file_id re-upload) which avoids file_id-scope-per-bot
-      // issues and avoids needing Greg as a member of every page chat.
-      const postResult = await postToGroup(ctx.telegram, replaySession);
-
-      // ── Hand off to bm_tracking_bot for sheets + DB + per-page brief send ──
-      // Tracker does:
-      //   - writes master + per-page sheet rows
-      //   - persists ad_briefs + ad_brief_pages for /syncsheets visibility
-      //   - sends the per-page brief text to each page's chat
-      //
-      // It does NOT forward media + caption — Telegram's bot-to-bot filter
-      // blocks bm_tracking_bot from accessing Greg's posts (forwardMessage
-      // returns "message not found", file_ids are bot-scoped). Greg handles
-      // media + caption forwarding via sales_bolismedia userClient below.
-      try {
-        await handoffToTracker(ctx, adSession, replaySession, postResult);
-      } catch (err) {
-        console.error(`[wizard] handoffToTracker unexpected: ${err.message}`);
-      }
-
-      // ── Forward media + caption to per-page chats via userClient ─────
-      // sales_bolismedia is in every IG Ads chat AND is a user account
-      // (not a bot), so it can forward Greg's bot-posted messages from
-      // Internal Network Ads to each page's chat without hitting the
-      // bot-to-bot delivery filter.
-      try {
-        await forwardMediaViaUserClient(replaySession, postResult);
-      } catch (err) {
-        console.error(`[wizard] forwardMediaViaUserClient unexpected: ${err.message}`);
+      // ── Post brief to Internal Network Ads AS sales_bolismedia ────────
+      // The post must appear from a USER account (not from Greg the bot)
+      // so bm_tracking_bot's webhook fires — Telegram blocks bot-to-bot
+      // message delivery, so a Greg-bot post would be invisible.
+      // postAsUserClient downloads each Marcel-DM media via Greg's bot,
+      // re-uploads via sales_bolismedia gramJS session. bm_tracking_bot
+      // then sees and processes via its normal handleAdMessage path:
+      //   parse → bundle scan → per-page forwarding → sheet writes →
+      //   DB tracking → master Forwarded checkbox.
+      // No more inter-service handoff needed — same pipeline as a
+      // Danielson-posted brief.
+      const postRes = await postAsUserClient(ctx.telegram, replaySession);
+      if (!postRes.ok) {
+        console.error(`[wizard] postAsUserClient failed: ${postRes.error}`);
       }
 
       // Bump bulk/campaign template ref counters if the contributor used one
