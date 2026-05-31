@@ -1246,10 +1246,17 @@ async function postAsUserClient(telegram, replaySession) {
                 : ref.kind === "audio" ? "mp3"
                 : "bin";
       const handle  = opts.handle ? String(opts.handle).replace(/^@/, "") : null;
-      const idxPart = opts.index && opts.index > 0 ? ` (${opts.index + 1})` : "";
+      // Anonymous name uses "slide (N).<ext>" so the multi-page Standard
+      // case looks clean in the Telegram UI ("slide (1).jpg" etc.)
+      // instead of "photo-a3b8c9d2.jpg". Critically, the leading "slide"
+      // has NO "@" prefix, so getFilenameBundlesByPage's @<handle>.<ext>
+      // regex won't match and the bundle falls through to
+      // getStandardBundle — every page gets the full shared set.
+      const slideIdx = opts.index !== undefined ? ` (${opts.index + 1})` : "";
+      const idxPart  = opts.index && opts.index > 0 ? ` (${opts.index + 1})` : "";
       const filename = handle
         ? `@${handle}${idxPart}.${ext}`
-        : `${ref.kind}-${String(ref.fileId).slice(-8)}.${ext}`;
+        : `slide${slideIdx}.${ext}`;
       return await userClient.sendFile(TARGET_CHAT, buffer, { filename, asDocument: true });
     } catch (err) {
       console.error(`[wizard] postAsUserClient uploadOne(${ref.kind}): ${err.message}`);
