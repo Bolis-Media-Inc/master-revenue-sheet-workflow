@@ -38,6 +38,46 @@ if (!_supabase) {
   console.warn("[messageBuffer] SUPABASE_URL not set — persistence disabled, buffer is RAM-only");
 }
 
+// ── Dedup helpers for shared media (task #41) ────────────────────────────────
+//
+// Operators sometimes upload the same file multiple times in one brief (e.g.
+// Danielson uploaded IMG_3448.JPG twice within one batch — same iPhone
+// filename, same byte count, but DIFFERENT Telegram file_ids since each
+// upload event is a distinct message). The bundle scanners walk backwards
+// and would surface every copy as a separate cover in /resolve — operator
+// burden + visual noise.
+//
+// _mediaKey() produces a stable identity from (filename, file_size). When
+// the key matches a previously-added shared item, we skip the duplicate.
+// Walking is backwards-from-brief, so the FIRST instance we see is the
+// closest to the brief; we keep that and drop earlier-uploaded duplicates.
+//
+// Photos don't carry file_name → can't dedupe → always pushed (rare in
+// document-heavy ads, never seen as duplicates in practice).
+
+function _mediaKey(msg) {
+  if (!msg) return null;
+  const doc = msg.document || msg.video || msg.audio;
+  if (!doc) return null;
+  const name = doc.file_name;
+  const size = doc.file_size;
+  // Need both to safely dedupe — without size, two unrelated files with
+  // the same iPhone name (rare but possible across users) would collide.
+  if (!name || size == null) return null;
+  return `${name}|${size}`;
+}
+
+function _addUniqueShared(sharedMedia, msg, seenKeys) {
+  const key = _mediaKey(msg);
+  if (!key) {
+    sharedMedia.unshift(msg); // photo or untracked kind — can't dedupe
+    return;
+  }
+  if (seenKeys.has(key)) return; // duplicate — drop
+  seenKeys.add(key);
+  sharedMedia.unshift(msg);
+}
+
 /**
  * Hydrate the in-memory buffer from Supabase on startup. Must be awaited
  * before the webhook starts processing messages.
@@ -252,6 +292,7 @@ function getContentBundlesByPage(chatId, adMessageId) {
 
   const byHandle = new Map();
   const sharedMedia = []; // media not claimed by any label going backwards
+  const sharedSeen  = new Set(); // (file_name, file_size) keys for dedup
   let pendingContent = []; // media collected since the last label (going backwards)
   // Pending label info for label-AFTER-media convention. When we encounter
   // a label with no preceding media, the next media we see (going backwards)
@@ -304,7 +345,13 @@ function getContentBundlesByPage(chatId, adMessageId) {
       //     label as pending; the next media we walk into belongs to it.
       if (pendingContent.length > 0) {
         if (isStory) {
-          for (const m of pendingContent) sharedMedia.push(m);
+          // Dedupe — these are appended to sharedMedia going chronologically
+          for (const m of pendingContent) {
+            const k = _mediaKey(m);
+            if (k && sharedSeen.has(k)) continue;
+            if (k) sharedSeen.add(k);
+            sharedMedia.push(m);
+          }
         } else {
           byHandle.set(handlePart, { media: [...pendingContent], caption: captionPart });
         }
@@ -321,7 +368,7 @@ function getContentBundlesByPage(chatId, adMessageId) {
         // (per kind) instead of via pendingContent so a subsequent label
         // doesn't re-claim it.
         if (pendingLabel.kind === "story") {
-          sharedMedia.unshift(msg);
+          _addUniqueShared(sharedMedia, msg, sharedSeen);
         } else {
           const existing = byHandle.get(pendingLabel.handle) || { media: [], caption: null };
           existing.media.unshift(msg);
@@ -359,9 +406,14 @@ function getContentBundlesByPage(chatId, adMessageId) {
 
   // Anything left in pendingContent at the end = media that appeared
   // before any label going backwards = chronologically OLDER than any
-  // @story-flushed media already in sharedMedia. Prepend to preserve
-  // chronological order in sharedMedia.
-  sharedMedia.unshift(...pendingContent);
+  // @story-flushed media already in sharedMedia. Prepend (with dedup)
+  // to preserve chronological order in sharedMedia.
+  for (const m of pendingContent) {
+    const k = _mediaKey(m);
+    if (k && sharedSeen.has(k)) continue;
+    if (k) sharedSeen.add(k);
+    sharedMedia.unshift(m);
+  }
 
   return {
     byHandle,
@@ -534,6 +586,7 @@ function getFilenameBundlesByPage(chatId, adMessageId) {
 
   const byHandle = new Map();
   const sharedMedia = []; // chronological — collected newest-first then reversed below
+  const sharedSeen  = new Set(); // (file_name, file_size) keys for dedup
   let foundAny = false;
 
   // A "handle list" message is a standalone text containing ONLY @-handles
@@ -603,8 +656,9 @@ function getFilenameBundlesByPage(chatId, adMessageId) {
       } else {
         // Media without an @-filename and no handle-list → shared bundle
         // (e.g. slides 2-4 for all pages). Collect newest-first; we'll
-        // reverse at the end to restore chronological order.
-        sharedMedia.unshift(msg);
+        // reverse at the end to restore chronological order. Dedup by
+        // (file_name, file_size) — drops repeat uploads of the same file.
+        _addUniqueShared(sharedMedia, msg, sharedSeen);
       }
 
     } else if (!text) {
@@ -613,6 +667,7 @@ function getFilenameBundlesByPage(chatId, adMessageId) {
       // Strong "previous ad" signal — stop here. Drop sharedMedia
       // collected up to now, those came from before the previous brief.
       sharedMedia.length = 0;
+      sharedSeen.clear();
       pendingHandleList = null;
       break;
     } else if (HANDLE_LIST_RE.test(text)) {
@@ -700,10 +755,13 @@ function getStandardBundle(chatId, adMessageId) {
   const preceding = buf.slice(0, adIdx);
 
   const sharedMedia = [];
+  const sharedSeen  = new Set(); // (file_name, file_size) keys — dedup
 
   // Walk backwards from the message just before the brief. Collect media,
   // skip non-brief text (admin chatter, captions, annotations like
   // "8 covers ^"), stop hard if we encounter a previous ad brief.
+  // Dedup by (file_name, file_size) so the same upload posted twice
+  // doesn't show up as two separate covers in /resolve.
   for (let i = preceding.length - 1; i >= 0; i--) {
     const msg  = preceding[i];
     const text = (msg.text || "").trim();
@@ -713,7 +771,7 @@ function getStandardBundle(chatId, adMessageId) {
     );
 
     if (hasMedia) {
-      sharedMedia.unshift(msg); // unshift to preserve chronological order
+      _addUniqueShared(sharedMedia, msg, sharedSeen);
       continue;
     }
     if (!text) continue;
