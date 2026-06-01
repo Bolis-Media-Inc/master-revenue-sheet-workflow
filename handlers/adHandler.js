@@ -880,11 +880,13 @@ async function handleReplayCommand(ctx) {
     const briefHandleCountRpl = ready.length;
     const useFilenamesRpl  = format === "filename";
     const isStandardRpl    = format === "standard";
+    const useLabelsRpl     = format === "label";
     const attribCountRpl   = activeBundle?.byHandle.size || 0;
     const sharedCountRpl   = sharedBundle.media.length;
-    const ambiguousPartialRpl = useFilenamesRpl && briefHandleCountRpl > 1 && attribCountRpl < briefHandleCountRpl && sharedCountRpl > 0;
-    const ambiguousNoLabelsRpl = isStandardRpl && briefHandleCountRpl >= 2 && sharedCountRpl >= briefHandleCountRpl;
-    if (ambiguousPartialRpl || ambiguousNoLabelsRpl) {
+    const ambiguousPartialRpl   = useFilenamesRpl && briefHandleCountRpl > 1 && attribCountRpl < briefHandleCountRpl && sharedCountRpl > 0;
+    const ambiguousNoLabelsRpl  = isStandardRpl && briefHandleCountRpl >= 2 && sharedCountRpl >= briefHandleCountRpl;
+    const ambiguousLabelMissRpl = useLabelsRpl && briefHandleCountRpl > 1 && attribCountRpl < briefHandleCountRpl && sharedCountRpl > 0;
+    if (ambiguousPartialRpl || ambiguousNoLabelsRpl || ambiguousLabelMissRpl) {
       // Look for an existing session for this brief
       const { data: existingSessions } = await adBriefs._supabase
         .from("pending_brief_assignments")
@@ -936,7 +938,7 @@ async function handleReplayCommand(ctx) {
               `⏸️ *Brief paused — assigning covers below*\n` +
               `─────────────────────────\n` +
               `*Pages:* ${briefHandleCountRpl} · *Unlabeled covers:* ${unattributedRefs.length}\n` +
-              `*Type:* ${ambiguousNoLabelsRpl ? "no labels at all" : "partial labels"}\n\n` +
+              `*Type:* ${ambiguousNoLabelsRpl ? "no labels at all" : ambiguousLabelMissRpl ? "label-format misattribution" : "partial labels"}\n\n` +
               `Refusing to re-forward — would re-send wrong covers to every page.\n` +
               `Tap a page button under each cover below to assign. Phase 3 auto-forwards when all are done.`,
               { parse_mode: "Markdown" }
@@ -1943,7 +1945,17 @@ async function handleAdMessage(ctx) {
         && briefHandleCount >= 2
         && sharedBundle.media.length >= briefHandleCount     // at least 1 cover per page expected
       );
-      const isAmbiguousBrief = ambiguousPartial || ambiguousNoLabels;
+      // Per-page-label format can also be ambiguous: the scanner detected
+      // SOMETHING that looked label-like (e.g. "Covers for ALL ^") but
+      // didn't actually attribute any of the brief's pages. Symptom:
+      // detectedFormat="per-page-label" but attributedCount < pages.
+      const ambiguousLabelMiss = (
+        detectedFormat === "per-page-label"
+        && briefHandleCount > 1
+        && attributedCount < briefHandleCount
+        && sharedBundle.media.length > 0
+      );
+      const isAmbiguousBrief = ambiguousPartial || ambiguousNoLabels || ambiguousLabelMiss;
       let isPaused = false;
       if (isAmbiguousBrief && briefRowId && adBriefs._supabase) {
         try {
@@ -1976,7 +1988,8 @@ async function handleAdMessage(ctx) {
           const sessionShort = pba.id.slice(0, 8);
           const briefShort   = briefRowId.slice(0, 8);
           const briefSnippet = (ctx.message?.text || "").split("\n").slice(0, 2).join("\n");
-          console.warn(`[adHandler] ⏸️ PAUSED BRIEF ${briefShort} — ${ambiguousNoLabels ? "no labels" : "partial labels"}, session ${sessionShort}, auto-triggering assignment UI`);
+          const ambKind = ambiguousNoLabels ? "no labels" : ambiguousLabelMiss ? "label-format misattribution" : "partial labels";
+          console.warn(`[adHandler] ⏸️ PAUSED BRIEF ${briefShort} — ${ambKind}, session ${sessionShort}, auto-triggering assignment UI`);
 
           if (adminId) {
             // Send heads-up first, then the interactive UI (header + per-cover
