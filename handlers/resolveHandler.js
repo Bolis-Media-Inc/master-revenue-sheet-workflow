@@ -366,13 +366,35 @@ async function postAssignmentUI(telegram, chatId, sessionId, opts = {}) {
 
 async function handleAssignmentCallback(ctx) {
   try {
-    if (!isAdmin(ctx.from?.id)) {
-      return ctx.answerCbQuery("Not authorized.", { show_alert: false });
-    }
     const data = ctx.callbackQuery?.data || "";
     const m = data.match(/^ca:([0-9a-f-]+):([^:]+):(.+)$/);
     if (!m) return ctx.answerCbQuery("Bad callback.", { show_alert: false });
     const [, sessionId, msgId, target] = m;
+
+    // Auth: either WIZARD_ADMIN_USER_ID matches OR the tap happened in the
+    // same chat where the UI was posted (the bot already gated who can see
+    // those prompts by choosing which chat to deliver them to — that IS
+    // the auth boundary). This lets the Tracker service work even if
+    // WIZARD_ADMIN_USER_ID isn't set on it (only Greg's service has it
+    // historically).
+    let authorized = isAdmin(ctx.from?.id);
+    if (!authorized) {
+      const tapChatId = ctx.callbackQuery?.message?.chat?.id;
+      if (tapChatId) {
+        const { data: sess } = await supabase
+          .from("pending_brief_assignments")
+          .select("prompt_chat_id")
+          .eq("id", sessionId)
+          .single();
+        if (sess?.prompt_chat_id && Number(sess.prompt_chat_id) === Number(tapChatId)) {
+          authorized = true;
+        }
+      }
+    }
+    if (!authorized) {
+      console.warn(`[resolve] callback denied — user ${ctx.from?.id} session ${sessionId.slice(0, 8)} chat ${ctx.callbackQuery?.message?.chat?.id}`);
+      return ctx.answerCbQuery("Not authorized.", { show_alert: false });
+    }
 
     const updated = await saveAssignment(sessionId, msgId, target);
 
