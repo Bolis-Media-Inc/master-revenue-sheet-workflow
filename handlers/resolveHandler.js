@@ -387,9 +387,172 @@ async function handleAssignmentCallback(ctx) {
 
     const done = assignedCount >= totalCovers;
     await ctx.answerCbQuery(done ? `✅ All ${totalCovers} assigned` : `Saved (${assignedCount}/${totalCovers})`, { show_alert: false });
+
+    // ── Phase 3: auto-forward when all assignments are in ─────────────────
+    // Last tap just landed → resume forwarding using the manual mapping.
+    // For each assigned cover, send it to the target page's chat. "Shared"
+    // assignments fan out to every page. "Skip" drops the cover entirely.
+    // Then forward the brief text to each page so they have full context.
+    if (done) {
+      runPhase3Forward(ctx, updated).catch((err) => {
+        console.error("[resolve] Phase 3 forward failed:", err.message);
+      });
+    }
   } catch (err) {
     console.error("[resolve] callback error:", err.message);
     try { await ctx.answerCbQuery(`❌ ${err.message}`, { show_alert: true }); } catch (_) {}
+  }
+}
+
+// ── Phase 3: re-forward correctly attributed media when /resolve completes ──
+
+async function fetchPageChats(handles) {
+  if (!supabase) return new Map();
+  const { data, error } = await supabase
+    .from("pages")
+    .select("handle, chat_id, auto_forward")
+    .in("handle", handles);
+  if (error) {
+    console.error(`[resolve] fetchPageChats: ${error.message}`);
+    return new Map();
+  }
+  const map = new Map();
+  for (const row of data || []) {
+    if (row.auto_forward && row.chat_id) {
+      map.set(row.handle.toLowerCase(), row.chat_id);
+    }
+  }
+  return map;
+}
+
+async function fetchBriefById(briefId) {
+  const { data, error } = await supabase
+    .from("ad_briefs")
+    .select("id, telegram_chat_id, telegram_message_id, client, raw_text, shared_caption")
+    .eq("id", briefId)
+    .single();
+  if (error) {
+    console.error(`[resolve] fetchBriefById: ${error.message}`);
+    return null;
+  }
+  return data;
+}
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+async function sendByKind(telegram, chatId, kind, fileId) {
+  if (kind === "video")     return telegram.sendVideo(chatId, fileId);
+  if (kind === "audio")     return telegram.sendAudio(chatId, fileId);
+  if (kind === "animation") return telegram.sendAnimation(chatId, fileId);
+  if (kind === "document")  return telegram.sendDocument(chatId, fileId);
+  return telegram.sendPhoto(chatId, fileId);
+}
+
+/**
+ * Run the corrected per-page forward using the manual cover-to-page mapping
+ * stored in pending_brief_assignments. Each assigned cover goes to exactly
+ * one page (or all pages if "shared"). Skipped covers are dropped.
+ *
+ * Also forwards the brief text to each destination so the page has full
+ * context. Caption text and the original brief itself live in the source
+ * chat — re-forward those by message_id from there.
+ *
+ * Fail-soft: per-cover errors are logged, not raised. Final summary edits
+ * the resolve session's header to show the outcome.
+ */
+async function runPhase3Forward(ctx, session) {
+  const brief = await fetchBriefById(session.brief_id);
+  if (!brief) {
+    await ctx.telegram.sendMessage(ctx.callbackQuery.message.chat.id,
+      "❌ Phase 3: couldn't fetch brief from DB — re-run /replay manually."
+    ).catch(() => {});
+    return;
+  }
+  const pages = session.pages || [];
+  const pageChats = await fetchPageChats(pages);
+  const assignments = session.assignments || {};
+  const unattributed = session.unattributed || [];
+
+  // Build msg_id → target handles map ("shared" expands to all pages,
+  // "skip" maps to [] which means don't forward this cover at all).
+  const targetsByMsgId = new Map();
+  for (const cover of unattributed) {
+    const a = assignments[String(cover.msg_id)];
+    if (a === undefined || a === "skip") {
+      targetsByMsgId.set(cover.msg_id, []);
+      continue;
+    }
+    if (a === "shared") {
+      targetsByMsgId.set(cover.msg_id, pages.filter((p) => pageChats.has(p)));
+      continue;
+    }
+    const idx = parseInt(a, 10);
+    if (!isNaN(idx) && pages[idx] && pageChats.has(pages[idx])) {
+      targetsByMsgId.set(cover.msg_id, [pages[idx]]);
+    } else {
+      targetsByMsgId.set(cover.msg_id, []);
+    }
+  }
+
+  // Send each cover to its target(s), then the brief to every page.
+  // Small sleep between sends to dodge Telegram's per-chat flood limits.
+  let sentCount = 0;
+  let errCount  = 0;
+  const errors  = [];
+  for (const cover of unattributed) {
+    const targets = targetsByMsgId.get(cover.msg_id) || [];
+    for (const handle of targets) {
+      const destChatId = pageChats.get(handle);
+      try {
+        await sendByKind(ctx.telegram, destChatId, cover.kind || "photo", cover.file_id);
+        sentCount++;
+        await sleep(80);
+      } catch (err) {
+        errCount++;
+        errors.push(`@${handle}: ${err.message}`);
+        console.error(`[resolve] Phase 3 send to @${handle}: ${err.message}`);
+      }
+    }
+  }
+
+  // Forward the brief text to every page that received any cover
+  const destHandles = pages.filter((p) => pageChats.has(p));
+  for (const handle of destHandles) {
+    try {
+      await ctx.telegram.forwardMessage(
+        String(pageChats.get(handle)),
+        String(brief.telegram_chat_id),
+        Number(brief.telegram_message_id)
+      );
+      await sleep(80);
+    } catch (err) {
+      console.error(`[resolve] Phase 3 brief forward → @${handle}: ${err.message}`);
+    }
+  }
+
+  // Mark session done — flips status from "resolved" to "resolved" (already
+  // there) but records prompt edits below. Future: add "completed_at"
+  // column to distinguish "all assigned" from "all forwarded".
+  await supabase
+    .from("pending_brief_assignments")
+    .update({ status: "resolved" })
+    .eq("id", session.id);
+
+  const summaryText =
+    `✅ *Phase 3 complete*\n` +
+    `─────────────────────────\n` +
+    `Covers sent: ${sentCount}\n` +
+    `Errors:      ${errCount}\n` +
+    `Brief forwarded to: ${destHandles.length}/${pages.length} pages\n\n` +
+    (errCount > 0
+      ? `*Errors:*\n${errors.slice(0, 5).map((e) => "  • " + md(e)).join("\n")}` +
+        (errors.length > 5 ? `\n  …and ${errors.length - 5} more (check logs)` : "")
+      : `_Run \`/syncsheets\` to backfill master + per-page sheet rows._`);
+
+  try {
+    await ctx.telegram.sendMessage(ctx.callbackQuery.message.chat.id, summaryText, { parse_mode: "Markdown" });
+  } catch (err) {
+    console.error(`[resolve] Phase 3 summary post: ${err.message}`);
   }
 }
 

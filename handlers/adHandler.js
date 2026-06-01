@@ -846,6 +846,88 @@ async function handleReplayCommand(ctx) {
     ).catch(() => {});
   }
 
+  // ── Ambiguity gate (mirror of adHandler's pause logic) ──────────────────
+  // If this brief is ambiguous (multi-page with unlabeled covers) and we
+  // have a DB row, refuse to re-forward — would just blast wrong covers
+  // again. Operator runs /resolve to assign first; Phase 3 (resolveHandler)
+  // re-forwards with the correct mapping when assignments complete.
+  if (dbBriefForBackfill?.id && adBriefs._supabase) {
+    const briefHandleCountRpl = ready.length;
+    const useFilenamesRpl  = format === "filename";
+    const isStandardRpl    = format === "standard";
+    const attribCountRpl   = activeBundle?.byHandle.size || 0;
+    const sharedCountRpl   = sharedBundle.media.length;
+    const ambiguousPartialRpl = useFilenamesRpl && briefHandleCountRpl > 1 && attribCountRpl < briefHandleCountRpl && sharedCountRpl > 0;
+    const ambiguousNoLabelsRpl = isStandardRpl && briefHandleCountRpl >= 2 && sharedCountRpl >= briefHandleCountRpl;
+    if (ambiguousPartialRpl || ambiguousNoLabelsRpl) {
+      // Look for an existing session for this brief
+      const { data: existingSessions } = await adBriefs._supabase
+        .from("pending_brief_assignments")
+        .select("id, status, assignments, unattributed")
+        .eq("brief_id", dbBriefForBackfill.id)
+        .order("created_at", { ascending: false })
+        .limit(1);
+      const existing = existingSessions?.[0];
+      const allAssigned = existing && (
+        existing.status === "resolved"
+        || (Array.isArray(existing.unattributed) && existing.unattributed.length > 0
+            && Object.keys(existing.assignments || {}).length >= existing.unattributed.length)
+      );
+      if (existing && !allAssigned) {
+        await ctx.reply(
+          `⏸️ This brief has an open assignment session — \`/resolve ${existing.id.slice(0, 8)}\` to continue.\n` +
+          `Assigned so far: ${Object.keys(existing.assignments || {}).length}/${(existing.unattributed || []).length}.`,
+          { parse_mode: "Markdown" }
+        ).catch(() => {});
+        return;
+      }
+      if (!existing) {
+        // Create a new session — same shape as adHandler's pause block
+        const unattributedRefs = sharedBundle.media.map((m, i) => {
+          const ref = extractMediaRef(m);
+          return ref ? { ...ref, idx: i, msg_id: m.message_id || `synth-${i}`, file_name: m.document?.file_name || m.video?.file_name || null } : null;
+        }).filter(Boolean);
+        const briefPagesArr = [...new Set(parsedList.map((p) => p.pageHandle?.toLowerCase()).filter(Boolean))];
+        try {
+          const { data: pba } = await adBriefs._supabase
+            .from("pending_brief_assignments")
+            .insert({
+              brief_id:         dbBriefForBackfill.id,
+              source_chat_id:   Number(sourceChatId),
+              brief_message_id: briefMessageId,
+              brief_text:       (briefText || "").slice(0, 1000),
+              pages:            briefPagesArr,
+              unattributed:     unattributedRefs,
+              assignments:      {},
+              status:           "awaiting",
+              expires_at:       new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+            })
+            .select()
+            .single();
+          if (pba) {
+            await ctx.reply(
+              `⏸️ *Brief paused — needs cover assignments*\n` +
+              `─────────────────────────\n` +
+              `*Pages:* ${briefHandleCountRpl} · *Unlabeled covers:* ${unattributedRefs.length}\n` +
+              `*Type:* ${ambiguousNoLabelsRpl ? "no labels at all" : "partial labels"}\n\n` +
+              `Refusing to re-forward — would re-send wrong covers to every page.\n` +
+              `→ \`/resolve ${pba.id.slice(0, 8)}\` to assign each cover to a page.\n` +
+              `Phase 3 will auto-re-forward the corrected covers when you're done.`,
+              { parse_mode: "Markdown" }
+            ).catch(() => {});
+            return;
+          }
+        } catch (err) {
+          console.error(`[adHandler] /replay pause-session create failed: ${err.message}`);
+          // Fall through — better to forward than to silently fail
+        }
+      }
+      // If allAssigned but we got here, fall through to forward (Phase 3
+      // hook from resolveHandler will normally pre-empt, but allow manual
+      // /replay to flush anyway).
+    }
+  }
+
   // Run forwarding loop
   let ok = 0;
   const errors = [];
@@ -1796,49 +1878,88 @@ async function handleAdMessage(ctx) {
         `fallback media: ${fallbackMedia.length})`,
       );
 
-      // ── Ambiguous-brief detection ────────────────────────────────────────
-      // Catches the case where a poster (e.g. Danielson) sent a multi-page
-      // brief with SOME @-named covers but most unlabeled. Today the
-      // filename scanner attributes the labeled ones to their pages and
-      // dumps the rest into shared.media → every page receives every
-      // cover, including covers meant for OTHER pages. The brief still
-      // forwards (current behavior preserved so nothing breaks tonight),
-      // but Connor gets a DM heads-up + the brief is logged so we know
-      // when to follow up. Phase 2 will add interactive cover-to-page
-      // assignment with inline buttons.
+      // ── Ambiguous-brief detection + PAUSE ────────────────────────────────
+      // Two ambiguity shapes we catch here:
+      //
+      //   1. PARTIAL labeling: some covers @-named, others not. Filename
+      //      scanner attributes the labeled ones but the unlabeled covers
+      //      go into shared → wrong attribution for half the pages.
+      //
+      //   2. NO labeling at all on a multi-page brief: standard fallback
+      //      runs and bundles every preceding media item as "shared" →
+      //      every page receives every cover indiscriminately (Danielson's
+      //      "Justin @FruitSnacks California Candidates" case fit this).
+      //
+      // When detected, instead of silently misforwarding, we PAUSE: create
+      // a pending_brief_assignments row + tell the admin to /resolve.
+      // The forward block below checks this flag and skips per-page sends.
       const briefHandleCount = new Set(
         parsedList.map((p) => p.pageHandle?.toLowerCase()).filter(Boolean),
       ).size;
-      const isAmbiguousBrief = (
-        useFilenames                                // poster intended filename attribution
-        && briefHandleCount > 1                     // multi-page brief
-        && attributedCount < briefHandleCount       // some pages have no cover
-        && sharedBundle.media.length > 0            // unlabeled media exists
+      const ambiguousPartial = (
+        useFilenames
+        && briefHandleCount > 1
+        && attributedCount < briefHandleCount
+        && sharedBundle.media.length > 0
       );
-      if (isAmbiguousBrief) {
-        const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
-        const senderTag = ctx.from?.username
-          ? `@${ctx.from.username}`
-          : [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(" ") || `user ${ctx.from?.id}`;
-        const attributedHandles = [...(activeBundle?.byHandle.keys() || [])].map((h) => `@${h}`).join(", ");
-        const unattributed      = [...new Set(parsedList.map((p) => p.pageHandle?.toLowerCase()).filter(Boolean))]
-          .filter((h) => !activeBundle?.byHandle.has(h)).map((h) => `@${h}`).join(", ");
-        const briefSnippet = (ctx.message?.text || "").split("\n").slice(0, 3).join("\n");
-        const warnText =
-          "⚠️ *Ambiguous brief detected*\n" +
-          "─────────────────────────\n" +
-          `*Poster:* ${senderTag.replace(/[_*`\[]/g, (c) => "\\" + c)}\n` +
-          `*Brief:* \`${briefSnippet.replace(/[_*`\[]/g, (c) => "\\" + c).slice(0, 200)}\`\n\n` +
-          `*Pages in brief:* ${briefHandleCount}\n` +
-          `*Covers labeled:* ${attributedCount} (${attributedHandles || "none"})\n` +
-          `*Covers unlabeled:* ${sharedBundle.media.length} — being broadcast to ALL pages incl. ${unattributed || "others"}\n\n` +
-          `Forwarding will proceed with shared-cover behavior. To fix per-page attribution either:\n` +
-          `• Ask poster to rename covers \`@<handle>.jpg\` and run \`/replay\` on this brief\n` +
-          `• Wait for Phase 2 of /resolve (interactive cover-to-page assignment)`;
-        console.warn(`[adHandler] ⚠️ AMBIGUOUS BRIEF — ${briefHandleCount} pages, ${attributedCount} attributed, ${sharedBundle.media.length} unlabeled. Notifying admin.`);
-        if (adminId) {
-          ctx.telegram.sendMessage(adminId, warnText, { parse_mode: "Markdown" })
-            .catch((err) => console.error(`[adHandler] ambiguous-brief DM failed: ${err.message}`));
+      const ambiguousNoLabels = (
+        detectedFormat === "standard"
+        && briefHandleCount >= 2
+        && sharedBundle.media.length >= briefHandleCount     // at least 1 cover per page expected
+      );
+      const isAmbiguousBrief = ambiguousPartial || ambiguousNoLabels;
+      let isPaused = false;
+      if (isAmbiguousBrief && briefRowId && adBriefs._supabase) {
+        try {
+          const unattributedRefs = sharedBundle.media.map((m, i) => extractMediaRef(m)
+            ? { ...extractMediaRef(m), idx: i, msg_id: m.message_id || `synth-${i}`, file_name: m.document?.file_name || m.video?.file_name || null }
+            : null
+          ).filter(Boolean);
+          const briefPages = [...new Set(parsedList.map((p) => p.pageHandle?.toLowerCase()).filter(Boolean))];
+
+          // Create paused session — /resolve picks it up
+          const { data: pba, error: pbaErr } = await adBriefs._supabase
+            .from("pending_brief_assignments")
+            .insert({
+              brief_id:         briefRowId,
+              source_chat_id:   Number(chatId),
+              brief_message_id: ctx.message.message_id,
+              brief_text:       (text || "").slice(0, 1000),
+              pages:            briefPages,
+              unattributed:     unattributedRefs,
+              assignments:      {},
+              status:           "awaiting",
+              expires_at:       new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+            })
+            .select()
+            .single();
+          if (pbaErr) throw new Error(pbaErr.message);
+
+          isPaused = true;
+          const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+          const sessionShort = pba.id.slice(0, 8);
+          const briefShort   = briefRowId.slice(0, 8);
+          const briefSnippet = (ctx.message?.text || "").split("\n").slice(0, 2).join("\n");
+          const warnText =
+            "⏸️ *Brief paused for cover assignment*\n" +
+            "─────────────────────────\n" +
+            `*Brief:* \`${briefSnippet.replace(/[_*`\[]/g, (c) => "\\" + c).slice(0, 160)}…\`\n` +
+            `*Pages:* ${briefHandleCount}\n` +
+            `*Unlabeled covers:* ${unattributedRefs.length}\n` +
+            `*Type:* ${ambiguousNoLabels ? "no labels at all" : "partial labels"}\n\n` +
+            `Per-page forwarding *did not run* — would have misattributed covers.\n` +
+            `Run \`/resolve ${briefShort}\` to assign each cover to a page.\n` +
+            `Or have the poster rename files \`@<handle>.jpg\` + \`/replay\`.`;
+          console.warn(`[adHandler] ⏸️ PAUSED BRIEF ${briefShort} — ${ambiguousNoLabels ? "no labels" : "partial labels"}, session ${sessionShort}`);
+          if (adminId) {
+            ctx.telegram.sendMessage(adminId, warnText, { parse_mode: "Markdown" })
+              .catch((err) => console.error(`[adHandler] paused-brief DM failed: ${err.message}`));
+          }
+        } catch (err) {
+          console.error(`[adHandler] ambiguous-brief pause failed (forwarding will proceed): ${err.message}`);
+          // Fail-open — if we can't persist the paused session, fall through
+          // to current behavior rather than blocking the forward entirely
+          isPaused = false;
         }
       }
 
@@ -1925,6 +2046,18 @@ async function handleAdMessage(ctx) {
       const uniqueHandles = [...new Set(
         parsedList.map((p) => p.pageHandle).filter((h) => h && isPageEnabled(h))
       )];
+
+      // PAUSED: ambiguous-brief gate fired above. Skip per-page forwarding
+      // entirely — operator will resolve via /resolve, which triggers a
+      // re-forward with the correct cover-to-page mapping (Phase 3).
+      if (isPaused) {
+        console.log(`[adHandler] ⏸️ Per-page forwarding skipped — brief paused for /resolve. ${uniqueHandles.length} pages will be sent once assignments complete.`);
+        // Keep sheet writes etc. that already happened above — those are
+        // idempotent and operator can /syncsheets to confirm. We just don't
+        // send the Telegram forwards yet.
+        clearBufferUpTo(chatId, ctx.message.message_id);
+        return;
+      }
 
       let forwardOk      = 0;
       let forwardSkipped = 0;
