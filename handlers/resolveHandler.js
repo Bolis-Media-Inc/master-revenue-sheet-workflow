@@ -26,11 +26,13 @@
  * shouldn't be reassigning other people's per-page attribution.
  */
 
-const { createClient } = require("@supabase/supabase-js");
-
-const supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY)
-  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY)
-  : null;
+// Reuse the existing Supabase client from lib/sessions — it already has the
+// right env var names (SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY) and is
+// initialized once. Creating a separate client here with the wrong env var
+// name (SUPABASE_SERVICE_KEY vs SUPABASE_SERVICE_ROLE_KEY) caused a null
+// client → "Cannot read properties of null (reading 'from')" when the
+// auto-post UI tried to query pending_brief_assignments.
+const { _supabase: supabase } = require("../lib/sessions");
 
 function isAdmin(telegramId) {
   const id = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
