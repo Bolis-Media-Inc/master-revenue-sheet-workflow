@@ -125,6 +125,49 @@ function addMessage(message) {
 }
 
 /**
+ * Apply a Telegram edit to the in-memory + persisted buffer.
+ *
+ * Called from bot.on("edited_message", ...) — when a sender edits a
+ * caption/brief/text after posting, Telegram fires a separate webhook
+ * with the new payload. Without this, /replay + /resolve forward the
+ * stale pre-edit text forever.
+ *
+ * Strategy: replace the row in-place (same chat_id + message_id), keep
+ * buffer position so scanner ordering doesn't change. If the message
+ * isn't in the buffer (aged out), persist to DB anyway so a future
+ * hydrateFromDb sees the latest version.
+ */
+function updateMessage(editedMessage) {
+  if (!editedMessage?.chat?.id || !editedMessage?.message_id) return;
+
+  const chatId = String(editedMessage.chat.id);
+  const buf = _buffers.get(chatId);
+  let inBuffer = false;
+  if (buf) {
+    const idx = buf.findIndex((m) => m.message_id === editedMessage.message_id);
+    if (idx >= 0) {
+      buf[idx] = editedMessage;
+      inBuffer = true;
+    }
+  }
+
+  // Mirror to DB — upsert overwrites the prior row's message_json column.
+  // Done even when not in buffer (e.g. message aged out of the in-memory
+  // window but is still in DB for a future /replay or hydrate).
+  if (_supabase) {
+    _supabase.from("message_buffer").upsert({
+      chat_id:      Number(chatId),
+      message_id:   editedMessage.message_id,
+      message_json: editedMessage,
+    }, { onConflict: "chat_id,message_id" }).then(({ error }) => {
+      if (error) console.error("[messageBuffer] edit persist error:", error.message);
+    });
+  }
+  const preview = (editedMessage.text || editedMessage.caption || "").slice(0, 60).replace(/\n/g, " ");
+  console.log(`[messageBuffer] ✏️ edit: chat=${chatId} msg=${editedMessage.message_id} buffer=${inBuffer ? "yes" : "no"} preview="${preview}"`);
+}
+
+/**
  * Return up to `count` messages that immediately preceded `beforeMessageId`
  * in the given chat.
  *
@@ -689,6 +732,7 @@ function getStandardBundle(chatId, adMessageId) {
 
 module.exports = {
   addMessage,
+  updateMessage,
   getPrecedingMessages,
   getContentBundlesByPage,
   getCollabBundlesByPage,

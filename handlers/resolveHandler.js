@@ -544,9 +544,22 @@ async function runPhase3Forward(ctx, session) {
     }
   }
 
-  // Forward the brief text to every page that received any cover
+  // Send caption text + forward brief to every page that received covers.
+  // Caption is in ad_briefs.shared_caption (populated during initial brief
+  // processing OR /replay's bundle scan). Sent as a text message BEFORE
+  // the brief forward so the IG team can copy it as the post caption.
   const destHandles = pages.filter((p) => pageChats.has(p));
   for (const handle of destHandles) {
+    // 1. Caption text (if present)
+    if (brief.shared_caption && brief.shared_caption.trim()) {
+      try {
+        await ctx.telegram.sendMessage(String(pageChats.get(handle)), brief.shared_caption);
+        await sleep(80);
+      } catch (err) {
+        console.error(`[resolve] Phase 3 caption send → @${handle}: ${err.message}`);
+      }
+    }
+    // 2. Brief itself
     try {
       await ctx.telegram.forwardMessage(
         String(pageChats.get(handle)),

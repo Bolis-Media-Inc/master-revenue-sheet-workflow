@@ -822,6 +822,31 @@ async function handleReplayCommand(ctx) {
     sharedBundle.media.length > 0 ||
     fallbackMedia.length > 0;
 
+  // Refresh shared_caption + shared_media in ad_briefs from the current
+  // buffer scan. Without this, Phase 3 (resolveHandler) reads stale
+  // values OR null — and crucially, if Danielson edited the caption
+  // after the original brief landed, this re-scan picks up the new text
+  // (the buffer now tracks edits via bot.on("edited_message"), so the
+  // scan output above reflects whatever's current in Telegram).
+  if (dbBriefForBackfill?.id && adBriefs._supabase) {
+    const sharedMediaRefs = sharedBundle.media.map(extractMediaRef).filter(Boolean);
+    const newCaption      = sharedBundle.caption || null;
+    if (newCaption || sharedMediaRefs.length > 0) {
+      adBriefs._supabase
+        .from("ad_briefs")
+        .update({
+          shared_caption: newCaption,
+          shared_media:   sharedMediaRefs.length > 0 ? sharedMediaRefs : null,
+          bundle_format:  format,
+        })
+        .eq("id", dbBriefForBackfill.id)
+        .then(({ error }) => {
+          if (error) console.error(`[adHandler] /replay refresh bundle: ${error.message}`);
+          else console.log(`[adHandler] 🔁 /replay refreshed ad_briefs shared_caption + ${sharedMediaRefs.length} shared_media`);
+        });
+    }
+  }
+
   // DB-backed media: if buffer is empty but we have JSONB page_media or
   // shared_media populated from a prior brief capture, we can still
   // re-attach media via sendPhoto/sendVideo using the stored file_ids.

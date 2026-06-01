@@ -12,7 +12,7 @@ const cron = require("node-cron");
 const { Telegraf } = require("telegraf");
 const { handleAdMessage }    = require("./handlers/adHandler");
 const { handleAuditCommand } = require("./handlers/auditHandler");
-const { addMessage, hydrateFromDb } = require("./messageBuffer");
+const { addMessage, updateMessage, hydrateFromDb } = require("./messageBuffer");
 const { checkAndFireReminders } = require("./reminders");
 
 // ── Validate required env vars ─────────────────────────────────────────────────
@@ -42,6 +42,14 @@ bot.on("message", (ctx) => {
   if (ctx.message) addMessage(ctx.message);
   handleAuditCommand(ctx); // reply-based audit commands (price update / takedown / creative update)
   handleAdMessage(ctx);    // new ad detection + sheet logging + forwarding
+});
+
+// ── Edit listener — propagate caption/text edits into the buffer ─────────────
+// Without this, /replay and /resolve forward the pre-edit text forever
+// (e.g. Danielson edited "Any caption works" → "How did we end up back here?"
+// and our buffer kept the original). Updates in-memory + persists to DB.
+bot.on("edited_message", (ctx) => {
+  if (ctx.editedMessage) updateMessage(ctx.editedMessage);
 });
 
 // ── Auto-capture chat IDs when bot is added to a new chat ────────────────────
