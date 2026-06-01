@@ -1720,6 +1720,52 @@ async function handleAdMessage(ctx) {
         `fallback media: ${fallbackMedia.length})`,
       );
 
+      // ── Ambiguous-brief detection ────────────────────────────────────────
+      // Catches the case where a poster (e.g. Danielson) sent a multi-page
+      // brief with SOME @-named covers but most unlabeled. Today the
+      // filename scanner attributes the labeled ones to their pages and
+      // dumps the rest into shared.media → every page receives every
+      // cover, including covers meant for OTHER pages. The brief still
+      // forwards (current behavior preserved so nothing breaks tonight),
+      // but Connor gets a DM heads-up + the brief is logged so we know
+      // when to follow up. Phase 2 will add interactive cover-to-page
+      // assignment with inline buttons.
+      const briefHandleCount = new Set(
+        parsedList.map((p) => p.pageHandle?.toLowerCase()).filter(Boolean),
+      ).size;
+      const isAmbiguousBrief = (
+        useFilenames                                // poster intended filename attribution
+        && briefHandleCount > 1                     // multi-page brief
+        && attributedCount < briefHandleCount       // some pages have no cover
+        && sharedBundle.media.length > 0            // unlabeled media exists
+      );
+      if (isAmbiguousBrief) {
+        const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+        const senderTag = ctx.from?.username
+          ? `@${ctx.from.username}`
+          : [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(" ") || `user ${ctx.from?.id}`;
+        const attributedHandles = [...(activeBundle?.byHandle.keys() || [])].map((h) => `@${h}`).join(", ");
+        const unattributed      = [...new Set(parsedList.map((p) => p.pageHandle?.toLowerCase()).filter(Boolean))]
+          .filter((h) => !activeBundle?.byHandle.has(h)).map((h) => `@${h}`).join(", ");
+        const briefSnippet = (ctx.message?.text || "").split("\n").slice(0, 3).join("\n");
+        const warnText =
+          "⚠️ *Ambiguous brief detected*\n" +
+          "─────────────────────────\n" +
+          `*Poster:* ${senderTag.replace(/[_*`\[]/g, (c) => "\\" + c)}\n` +
+          `*Brief:* \`${briefSnippet.replace(/[_*`\[]/g, (c) => "\\" + c).slice(0, 200)}\`\n\n` +
+          `*Pages in brief:* ${briefHandleCount}\n` +
+          `*Covers labeled:* ${attributedCount} (${attributedHandles || "none"})\n` +
+          `*Covers unlabeled:* ${sharedBundle.media.length} — being broadcast to ALL pages incl. ${unattributed || "others"}\n\n` +
+          `Forwarding will proceed with shared-cover behavior. To fix per-page attribution either:\n` +
+          `• Ask poster to rename covers \`@<handle>.jpg\` and run \`/replay\` on this brief\n` +
+          `• Wait for Phase 2 of /resolve (interactive cover-to-page assignment)`;
+        console.warn(`[adHandler] ⚠️ AMBIGUOUS BRIEF — ${briefHandleCount} pages, ${attributedCount} attributed, ${sharedBundle.media.length} unlabeled. Notifying admin.`);
+        if (adminId) {
+          ctx.telegram.sendMessage(adminId, warnText, { parse_mode: "Markdown" })
+            .catch((err) => console.error(`[adHandler] ambiguous-brief DM failed: ${err.message}`));
+        }
+      }
+
       // ── Persist bundle info to DB ────────────────────────────────────────
       // Now that bundle detection has run, attach shared media/caption + format
       // to the brief row, and per-page media/caption to each page row. Media
