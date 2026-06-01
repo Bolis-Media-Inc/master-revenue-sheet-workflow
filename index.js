@@ -142,6 +142,51 @@ cron.schedule("*/15 * * * *", () => {
   );
 });
 
+// ── Pending-brief worker — poll every 30 seconds ─────────────────────────────
+// Picks up direct-posted briefs whose 2-min debounce window has elapsed,
+// re-reads the latest text from message_buffer (post-edit if any), and runs
+// the full handleAdMessage pipeline. See lib/pendingBriefs.js + task #47.
+const pendingBriefs = require("./lib/pendingBriefs");
+const { getMessages } = require("./messageBuffer");
+cron.schedule("*/30 * * * * *", async () => {
+  try {
+    const due = await pendingBriefs.claimDue();
+    if (due.length === 0) return;
+    console.log(`[cron] pending-briefs: ${due.length} due`);
+    for (const row of due) {
+      const chatIdStr = String(row.chat_id);
+      // Re-fetch the latest text from in-memory buffer — captures any edits
+      // that arrived during the debounce window via bot.on("edited_message")
+      const buf = getMessages(chatIdStr);
+      const msg = buf.find((m) => m.message_id === Number(row.message_id));
+      if (!msg) {
+        console.warn(`[cron] pending-brief ${chatIdStr}/${row.message_id} not in buffer — marking failed`);
+        await pendingBriefs.markFailed(row.chat_id, row.message_id, new Error("not in buffer"));
+        continue;
+      }
+      // Synthetic Telegraf-shaped context for handleAdMessage
+      const fakeCtx = {
+        message:                  msg,
+        chat:                     msg.chat,
+        from:                     msg.from,
+        telegram:                 bot.telegram,
+        _isDeferredProcessing:    true, // prevents re-enqueueing in the defer gate
+        reply: (text, extra) => bot.telegram.sendMessage(msg.chat.id, text, extra),
+      };
+      try {
+        await handleAdMessage(fakeCtx);
+        await pendingBriefs.markProcessed(row.chat_id, row.message_id);
+        console.log(`[cron] ✅ processed pending brief ${chatIdStr}/${row.message_id}`);
+      } catch (err) {
+        console.error(`[cron] ❌ pending brief ${chatIdStr}/${row.message_id} failed: ${err.message}`);
+        await pendingBriefs.markFailed(row.chat_id, row.message_id, err);
+      }
+    }
+  } catch (err) {
+    console.error(`[cron] pending-briefs worker error: ${err.message}`);
+  }
+});
+
 // ── Launch: webhook on Railway, polling locally ───────────────────────────────
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const PORT        = parseInt(process.env.PORT || "3000");

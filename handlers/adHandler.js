@@ -1627,6 +1627,41 @@ async function handleAdMessage(ctx) {
     // Not an ad message — ignore silently
     if (!parsed) return;
 
+    // ── Debounce direct briefs (task #47) ───────────────────────────────────
+    // Operators sometimes post a brief, immediately notice a typo (wrong day
+    // number, wrong price, wrong client), and edit the message. Without a
+    // buffer, the bot has already processed the original text — forwarded to
+    // 20+ chats, written wrong rows to sheets, persisted the wrong DB row.
+    //
+    // Defer direct posts by BRIEF_DEBOUNCE_MS (default 2 min). During the
+    // wait, edit_message webhook (task #40) updates message_buffer in place.
+    // The cron worker (index.js) picks up due briefs, re-reads the latest
+    // text from message_buffer, and replays this same handleAdMessage with
+    // ctx._isDeferredProcessing=true to skip the defer gate.
+    //
+    // Skips:
+    //   • Wizard handoffs (from=sales_bolismedia) — those went through
+    //     Greg's admin approval, no edits expected
+    //   • Already-deferred replays (ctx._isDeferredProcessing) — would loop
+    //   • Debounce disabled (BRIEF_DEBOUNCE_MS<=0)
+    const isWizardPost = ctx.from?.username === "sales_bolismedia";
+    if (!ctx._isDeferredProcessing && !isWizardPost) {
+      try {
+        const pendingBriefs = require("../lib/pendingBriefs");
+        if (pendingBriefs.DEBOUNCE_MS > 0) {
+          const deferred = await pendingBriefs.defer(ctx.chat.id, ctx.message.message_id);
+          if (deferred !== undefined) {
+            const debounceSec = Math.round(pendingBriefs.DEBOUNCE_MS / 1000);
+            console.log(`[adHandler] ⏳ Deferred brief ${ctx.message.message_id} for ${debounceSec}s (edit window)`);
+            return; // cron will re-call handleAdMessage in DEBOUNCE_MS
+          }
+        }
+      } catch (err) {
+        console.error(`[adHandler] defer failed (processing immediately): ${err.message}`);
+        // Fall through to immediate processing — fail-open
+      }
+    }
+
     // Dedup: skip if we already processed this exact message (webhook retry / restart replay)
     const msgId = ctx.message.message_id;
     if (_recentlyProcessed.has(msgId)) {
