@@ -498,14 +498,21 @@ async function handleReplayCommand(ctx) {
   //   1. Reply mode — reply to the brief, use reply_to_message
   //   2. Search mode — campaign name follows /replay (before any @handles)
   let briefText, briefMessageId, sourceChatId, briefDate;
+  // Sender of the original brief — needed for self-heal insertBrief() when
+  // the brief was silently dropped by an old parser bug and we need to
+  // create the ad_briefs row from scratch during /replay.
+  let briefSenderUserId = null;
+  let briefSenderHandle = null;
   const replyTo = ctx.message?.reply_to_message;
 
   if (replyTo) {
     // Reply mode — first try the replied message itself
-    briefText      = replyTo.text || replyTo.caption || "";
-    briefMessageId = replyTo.message_id;
-    sourceChatId   = String(ctx.chat.id);
-    briefDate      = new Date((replyTo.date || Math.floor(Date.now() / 1000)) * 1000);
+    briefText         = replyTo.text || replyTo.caption || "";
+    briefMessageId    = replyTo.message_id;
+    sourceChatId      = String(ctx.chat.id);
+    briefDate         = new Date((replyTo.date || Math.floor(Date.now() / 1000)) * 1000);
+    briefSenderUserId = replyTo.from?.id ?? null;
+    briefSenderHandle = replyTo.from?.username ?? null;
     if (!briefText) {
       // DB fallback — replied msg has no text but we may have captured it earlier.
       // Happens when the brief is a media-only message and the captured raw_text
@@ -627,17 +634,21 @@ async function handleReplayCommand(ctx) {
     }
 
     if (match) {
-      briefText      = match.msg.text || match.msg.caption || "";
-      briefMessageId = match.msg.message_id;
-      sourceChatId   = match.chatId;
-      briefDate      = new Date((match.msg.date || 0) * 1000);
+      briefText         = match.msg.text || match.msg.caption || "";
+      briefMessageId    = match.msg.message_id;
+      sourceChatId      = match.chatId;
+      briefDate         = new Date((match.msg.date || 0) * 1000);
+      briefSenderUserId = match.msg.from?.id ?? null;
+      briefSenderHandle = match.msg.from?.username ?? null;
       console.log(`[adHandler] 🔁 /replay search (buffer) found "${match.parsedClient}" in chat ${sourceChatId} (msg ${briefMessageId})`);
     } else {
-      // DB path — synthesize what buffer mode would have provided
-      briefText      = dbBrief.raw_text;
-      briefMessageId = dbBrief.telegram_message_id;
-      sourceChatId   = String(dbBrief.telegram_chat_id);
-      briefDate      = new Date(dbBrief.received_at);
+      // DB path — brief already exists in ad_briefs, no self-heal needed
+      briefText         = dbBrief.raw_text;
+      briefMessageId    = dbBrief.telegram_message_id;
+      sourceChatId      = String(dbBrief.telegram_chat_id);
+      briefDate         = new Date(dbBrief.received_at);
+      briefSenderUserId = dbBrief.sender_user_id ?? null;
+      briefSenderHandle = dbBrief.sender_handle ?? null;
       console.log(`[adHandler] 🔁 /replay search (DB) found "${dbBrief.client}" — brief_id=${dbBrief.id.slice(0, 8)}…`);
     }
   }
@@ -705,11 +716,75 @@ async function handleReplayCommand(ctx) {
   // time (e.g. dropped by Sheets API quota errors). When briefRowId is null
   // — either DB disabled or brief predates the capture — skip backfill
   // silently and just do pure Telegram re-forwarding.
-  const dbBriefForBackfill = await adBriefs.findBriefByTelegramMessage(
+  let dbBriefForBackfill = await adBriefs.findBriefByTelegramMessage(
     Number(sourceChatId),
     briefMessageId,
   );
   const dbPagesByHandle = new Map();
+
+  // ── Self-heal: brief in buffer but never written to DB ─────────────────
+  // Triggered when a brief came through bm_tracking_bot but was silently
+  // dropped — most commonly because the parser failed (old CPM header bug,
+  // future similar edge cases). The brief is in message_buffer (so we
+  // found it via /replay's buffer search) but never made it into
+  // ad_briefs. Without this block, /resolve has no DB row to target and
+  // the brief's audit trail is lost forever.
+  //
+  // What we do here: insert the brief row + page rows from the parsed
+  // data we already have in hand. We deliberately DON'T write to Master
+  // sheet or per-page sheets — those are handled by the existing
+  // /syncsheets command after self-heal, which keeps this block focused
+  // and avoids duplicating the sheet-writing pipeline.
+  if (!dbBriefForBackfill && parsedList.length > 0 && adBriefs._supabase) {
+    try {
+      const first = parsedList[0];
+      const totalPrice = parsedList.reduce(
+        (s, p) => s + (Number.isFinite(p.adPrice) ? p.adPrice : 0),
+        0,
+      );
+      const newBriefId = await adBriefs.insertBrief({
+        telegramChatId:    Number(sourceChatId),
+        telegramMessageId: briefMessageId,
+        senderUserId:      briefSenderUserId,
+        senderHandle:      briefSenderHandle,
+        rawText:           briefText,
+        client:            first.client ?? null,
+        category:          first.category ?? null,
+        totalPrice,
+        postType:          first.postType ?? null,
+        postDuration:      first.postDuration ?? null,
+        nif:               first.nif ?? null,
+        datePosted:        first.datePosted ?? null,
+        timeMst:           first.timeMST ?? null,
+      });
+      if (newBriefId) {
+        const pageRows = parsedList
+          .filter((p) => p.pageHandle)
+          .map((p) => ({
+            pageHandle: p.pageHandle.toLowerCase(),
+            bulkNum:    p.bulkNum || null,
+            pagePrice:  Number.isFinite(p.adPrice) ? p.adPrice : null,
+          }));
+        await adBriefs.insertBriefPages(newBriefId, pageRows);
+        console.log(`[adHandler] 🩹 /replay self-heal: created brief ${newBriefId.slice(0, 8)}… + ${pageRows.length} page rows (was missing from DB)`);
+        await ctx.reply(
+          `🩹 *Self-healed:* this brief had no DB record (likely silently dropped by an older parser bug). ` +
+          `Created \`#${newBriefId.slice(0, 8)}\` with ${pageRows.length} page row(s). ` +
+          `Now you can run \`/resolve ${newBriefId.slice(0, 8)}\` to assign covers, ` +
+          `or \`/syncsheets\` to backfill the sheet rows.`,
+          { parse_mode: "Markdown" }
+        ).catch(() => {});
+        // Re-fetch so the downstream backfill logic sees the new row
+        dbBriefForBackfill = await adBriefs.findBriefByTelegramMessage(
+          Number(sourceChatId),
+          briefMessageId,
+        );
+      }
+    } catch (err) {
+      console.error(`[adHandler] /replay self-heal failed: ${err.message}`);
+    }
+  }
+
   if (dbBriefForBackfill) {
     const dbPages = await adBriefs.getBriefPages(dbBriefForBackfill.id);
     for (const p of dbPages) dbPagesByHandle.set(p.page_handle, p);
