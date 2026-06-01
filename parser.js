@@ -38,8 +38,13 @@ function parseAdMessage(text, date) {
   }
 
   // ── Line 1: "{Client} - {Category} - ${amount}" ─────────────────────────────
+  // Allows an optional trailing parenthetical note like "($3.50 CPM)" or
+  // "(net $1,000)" — common for CPM/affiliate briefs where the headline
+  // price is $0 and the actual rate is in the parens. Without this we
+  // silently drop the brief at parse time (e.g. Danielson's "Justin
+  // @FruitSnacks California Candidates - Politics - $0 ($3.50 CPM)").
   const headerMatch = lines[0].match(
-    /^(.+?)\s*-\s*(.+?)\s*-\s*\$?([\d,]+(?:\.\d{1,2})?)$/
+    /^(.+?)\s*-\s*(.+?)\s*-\s*\$?([\d,]+(?:\.\d{1,2})?)(?:\s*\([^)]*\))?\s*$/
   );
   if (!headerMatch) return null;
 
