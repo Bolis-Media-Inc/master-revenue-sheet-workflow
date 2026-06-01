@@ -539,14 +539,15 @@ async function handleReplayCommand(ctx) {
       ).catch(() => {});
       return;
     }
-    if (requestedHandles.length === 0) {
-      await ctx.reply(
-        `❌ Search mode requires at least one @handle. ` +
-        `Example: \`/replay ${campaignName} @howeverythingworks\``,
-        { parse_mode: "Markdown" }
-      ).catch(() => {});
-      return;
-    }
+    // No @-handle filter = forward to ALL pages in the matched brief.
+    // This is the common case ("re-process this whole brief, I'm not
+    // cherry-picking pages"). Previously the command required at least
+    // one @-handle, which is overkill for the common case and surprising
+    // when the campaign name happens to contain an @-mention (e.g.
+    // "/replay Justin @FruitSnacks California Candidates" — the
+    // @FruitSnacks would be parsed as a target page filter and bail).
+    // Empty requestedHandles flows through to the forward loop below,
+    // where uniqueHandles defaults to all pages in the brief.
 
     // Search each TARGET chat's buffer for a brief matching this campaign name.
     // Match = every word in the query appears in the brief's client field
