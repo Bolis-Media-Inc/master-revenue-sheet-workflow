@@ -305,15 +305,19 @@ function extractMediaRef(msg) {
  *  H: Notes        — (blank — filled manually)
  */
 function buildPageRow(parsed) {
+  // Per-page sheets now have an SS (Sent Status) checkbox in column A.
+  // Everything else shifted right by 1. Leading "" preserves the SS
+  // column so the bot doesn't stomp on the checkbox.
   return [
-    parsed.client        || "",  // A: Client Name
-    parsed.category      || "",  // B: Ad Type
-    parsed.bulkNum       || "",  // C: Bulk #
-    parsed.datePosted    || "",  // D: Date Posted
-    parsed.postType      || "",  // E: Post Type (Reels, Carousel, Story, Feed)
-    parsed.postDuration  || "",  // F: Post Duration (Permanent, 24hr, 30 Days, etc.)
-    parsed.adPrice != null ? `$${parsed.adPrice}` : "", // G: Ad Price
-    "",                          // H: Notes
+    "",                          // A: SS checkbox — left blank (VA ticks manually)
+    parsed.client        || "",  // B: Client Name
+    parsed.category      || "",  // C: Ad Type
+    parsed.bulkNum       || "",  // D: Bulk #
+    parsed.datePosted    || "",  // E: Date Posted
+    parsed.postType      || "",  // F: Post Type (Reels, Carousel, Story, Feed)
+    parsed.postDuration  || "",  // G: Post Duration (Permanent, 24hr, 30 Days, etc.)
+    parsed.adPrice != null ? `$${parsed.adPrice}` : "", // H: Ad Price
+    "",                          // I: Notes
   ];
 }
 
@@ -1073,7 +1077,7 @@ async function handleReplayCommand(ctx) {
             try {
               const rowNum = await appendRow(
                 sheetId, PAGE_TAB_NAME, buildPageRow(parsedItem),
-                { anchorColumn: "A", endColumn: "H" },
+                { anchorColumn: "B", endColumn: "I" },
               );
               if (rowNum) {
                 adBriefs.updatePageSheetRows(dbPage.id, { pageSheetRow: rowNum }).catch(() => {});
@@ -1274,7 +1278,7 @@ async function handleSyncSheetsCommand(ctx) {
       }
       try {
         const rowNum = await appendRow(sheetId, PAGE_TAB_NAME, buildPageRow(parsedItem), {
-          anchorColumn: "A", endColumn: "H",
+          anchorColumn: "B", endColumn: "I",
         });
         if (rowNum) {
           await adBriefs.updatePageSheetRows(row.id, { pageSheetRow: rowNum });
@@ -1788,7 +1792,7 @@ async function handleAdMessage(ctx) {
       const row = buildPageRow(item);
       try {
         // Per-page sheets: col A = Client Name (always filled), cols go A→H
-        const pageSheetRowNum = await appendRow(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "A", endColumn: "H" });
+        const pageSheetRowNum = await appendRow(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "B", endColumn: "I" });
         pageSheetCount++;
         if (pageSheetRowNum) {
           if (!perPageRowsToFormat.has(sheetId)) perPageRowsToFormat.set(sheetId, []);
