@@ -319,8 +319,15 @@ function getContentBundlesByPage(chatId, adMessageId) {
       msg.animation || msg.audio || msg.sticker
     );
 
-    // A label message: text-only, non-empty, ends with "^"
-    const isLabel = !hasMedia && text.endsWith("^") && text.length > 1;
+    // A label message: text-only, non-empty, ends with "^", AND starts
+    // with "@". The @-prefix requirement is load-bearing — without it,
+    // operator annotations like "Covers for ALL ^" or "13 slides ^"
+    // get parsed as labels for a fake "@covers"/"@13" handle. That drags
+    // any preceding media out of the shared bundle and assigns it to
+    // a phantom page handle which then gets silently dropped because
+    // it's not in the brief's page list. End result: slides 2-N go
+    // missing from /resolve and never reach the per-page chats.
+    const isLabel = !hasMedia && text.startsWith("@") && text.endsWith("^") && text.length > 1;
 
     if (isLabel) {
       // Label format options:
