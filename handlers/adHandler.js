@@ -905,16 +905,27 @@ async function handleReplayCommand(ctx) {
             .select()
             .single();
           if (pba) {
+            // Send heads-up + auto-post the assignment UI right in /replay's
+            // reply context. Operator never has to type /resolve manually.
             await ctx.reply(
-              `⏸️ *Brief paused — needs cover assignments*\n` +
+              `⏸️ *Brief paused — assigning covers below*\n` +
               `─────────────────────────\n` +
               `*Pages:* ${briefHandleCountRpl} · *Unlabeled covers:* ${unattributedRefs.length}\n` +
               `*Type:* ${ambiguousNoLabelsRpl ? "no labels at all" : "partial labels"}\n\n` +
               `Refusing to re-forward — would re-send wrong covers to every page.\n` +
-              `→ \`/resolve ${pba.id.slice(0, 8)}\` to assign each cover to a page.\n` +
-              `Phase 3 will auto-re-forward the corrected covers when you're done.`,
+              `Tap a page button under each cover below to assign. Phase 3 auto-forwards when all are done.`,
               { parse_mode: "Markdown" }
             ).catch(() => {});
+            try {
+              const { postAssignmentUI } = require("./resolveHandler");
+              await postAssignmentUI(ctx.telegram, ctx.chat.id, pba.id);
+            } catch (err) {
+              console.error(`[adHandler] /replay auto-trigger UI failed: ${err.message}`);
+              await ctx.reply(
+                `⚠️ Couldn't auto-post UI (${err.message}). Run \`/resolve ${pba.id.slice(0, 8)}\` manually.`,
+                { parse_mode: "Markdown" }
+              ).catch(() => {});
+            }
             return;
           }
         } catch (err) {
@@ -1940,20 +1951,32 @@ async function handleAdMessage(ctx) {
           const sessionShort = pba.id.slice(0, 8);
           const briefShort   = briefRowId.slice(0, 8);
           const briefSnippet = (ctx.message?.text || "").split("\n").slice(0, 2).join("\n");
-          const warnText =
-            "⏸️ *Brief paused for cover assignment*\n" +
-            "─────────────────────────\n" +
-            `*Brief:* \`${briefSnippet.replace(/[_*`\[]/g, (c) => "\\" + c).slice(0, 160)}…\`\n` +
-            `*Pages:* ${briefHandleCount}\n` +
-            `*Unlabeled covers:* ${unattributedRefs.length}\n` +
-            `*Type:* ${ambiguousNoLabels ? "no labels at all" : "partial labels"}\n\n` +
-            `Per-page forwarding *did not run* — would have misattributed covers.\n` +
-            `Run \`/resolve ${briefShort}\` to assign each cover to a page.\n` +
-            `Or have the poster rename files \`@<handle>.jpg\` + \`/replay\`.`;
-          console.warn(`[adHandler] ⏸️ PAUSED BRIEF ${briefShort} — ${ambiguousNoLabels ? "no labels" : "partial labels"}, session ${sessionShort}`);
+          console.warn(`[adHandler] ⏸️ PAUSED BRIEF ${briefShort} — ${ambiguousNoLabels ? "no labels" : "partial labels"}, session ${sessionShort}, auto-triggering assignment UI`);
+
           if (adminId) {
-            ctx.telegram.sendMessage(adminId, warnText, { parse_mode: "Markdown" })
-              .catch((err) => console.error(`[adHandler] paused-brief DM failed: ${err.message}`));
+            // Send heads-up first, then the interactive UI (header + per-cover
+            // prompts with buttons). Operator never needs to type /resolve
+            // manually — the bot proactively asks the questions.
+            try {
+              await ctx.telegram.sendMessage(adminId,
+                "⏸️ *Brief paused — assigning covers below*\n" +
+                "─────────────────────────\n" +
+                `*Brief:* \`${briefSnippet.replace(/[_*`\[]/g, (c) => "\\" + c).slice(0, 160)}…\`\n` +
+                `*Pages:* ${briefHandleCount} · *Unlabeled covers:* ${unattributedRefs.length} · *Type:* ${ambiguousNoLabels ? "no labels at all" : "partial labels"}\n\n` +
+                "Per-page forwarding *did not run* — would have misattributed covers.\n" +
+                "Tap a page button under each cover below to assign. Phase 3 auto-forwards when all are done.",
+                { parse_mode: "Markdown" }
+              );
+              const { postAssignmentUI } = require("./resolveHandler");
+              await postAssignmentUI(ctx.telegram, adminId, pba.id);
+            } catch (err) {
+              console.error(`[adHandler] auto-trigger /resolve UI failed: ${err.message}`);
+              // Fallback to plain instructional message if UI post fails
+              ctx.telegram.sendMessage(adminId,
+                `⚠️ Couldn't auto-post assignment UI (${err.message}). Run \`/resolve ${sessionShort}\` manually.`,
+                { parse_mode: "Markdown" }
+              ).catch(() => {});
+            }
           }
         } catch (err) {
           console.error(`[adHandler] ambiguous-brief pause failed (forwarding will proceed): ${err.message}`);

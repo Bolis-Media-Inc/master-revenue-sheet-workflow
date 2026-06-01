@@ -283,54 +283,83 @@ async function handleResolveCommand(ctx) {
       });
     }
 
-    // Post header in the DM
-    const assignedCount = Object.keys(session.assignments || {}).length;
-    const header = await ctx.reply(renderHeaderText(session, brief, assignedCount), { parse_mode: "Markdown" });
-
-    // Post each cover as its own message with a button grid
-    const sentIds = [header.message_id];
-    for (const cover of unattributed) {
-      const existing = (session.assignments || {})[String(cover.msg_id)];
-      const caption  = `Cover \`${md(cover.file_name || cover.msg_id)}\``;
-      let sent;
-      try {
-        // Send the actual media so operator can see what they're assigning
-        const sendFn = cover.kind === "video" ? ctx.telegram.sendVideo.bind(ctx.telegram)
-                     : cover.kind === "document" || cover.kind === "animation" ? ctx.telegram.sendDocument.bind(ctx.telegram)
-                     : ctx.telegram.sendPhoto.bind(ctx.telegram);
-        sent = await sendFn(ctx.chat.id, cover.file_id, {
-          caption,
-          parse_mode: "Markdown",
-          reply_markup: existing
-            ? undefined
-            : buildCoverKeyboard(session.id, cover.msg_id, pages),
-        });
-        if (existing) {
-          // Already assigned in a previous session — show the badge
-          await ctx.telegram.editMessageCaption(ctx.chat.id, sent.message_id, undefined,
-            `${caption}\n\n${renderAssignmentBadge(existing, pages)}`,
-            { parse_mode: "Markdown" }
-          );
-        }
-      } catch (err) {
-        // Fall back to text-only prompt if media send fails (file_id may be expired)
-        sent = await ctx.reply(
-          `*Cover ${cover.idx + 1}* — couldn't preview (${md(err.message)})\n\n` +
-          `File: \`${md(cover.file_name || cover.msg_id)}\``,
-          {
-            parse_mode: "Markdown",
-            reply_markup: existing ? undefined : buildCoverKeyboard(session.id, cover.msg_id, pages),
-          }
-        );
-      }
-      sentIds.push(sent.message_id);
-    }
-
-    await setPromptMessageIds(session.id, ctx.chat.id, sentIds);
+    await postAssignmentUI(ctx.telegram, ctx.chat.id, session.id, { brief });
   } catch (err) {
     console.error("[resolve] command error:", err.message);
     try { await ctx.reply(`❌ /resolve failed: ${err.message}`); } catch (_) {}
   }
+}
+
+/**
+ * Post the full assignment UI (header card + per-cover button grids) to a
+ * chat. Used by /resolve (manual entry) AND by adHandler's pause block
+ * (auto-trigger when ambiguity detected). Saves prompt_message_ids back to
+ * the session so /resolve can resume cleanly if the operator re-runs it.
+ *
+ * @param {*} telegram   - Telegraf bot.telegram instance
+ * @param {number|string} chatId - destination (admin DM or monetization chat)
+ * @param {string} sessionId - pending_brief_assignments.id
+ * @param {object} [opts] - { brief? } pre-fetched brief if caller has it
+ */
+async function postAssignmentUI(telegram, chatId, sessionId, opts = {}) {
+  // Fetch session
+  const { data: session, error: e1 } = await supabase
+    .from("pending_brief_assignments").select("*").eq("id", sessionId).single();
+  if (e1 || !session) throw new Error(`session not found: ${e1?.message || "(unknown)"}`);
+
+  // Fetch brief (skip if caller pre-fetched)
+  let brief = opts.brief;
+  if (!brief) {
+    const { data } = await supabase
+      .from("ad_briefs").select("id, client, raw_text").eq("id", session.brief_id).single();
+    brief = data;
+  }
+
+  const pages = session.pages || [];
+  const unattributed = session.unattributed || [];
+  const existingAssignments = session.assignments || {};
+
+  // Post header
+  const assignedCount = Object.keys(existingAssignments).length;
+  const header = await telegram.sendMessage(chatId, renderHeaderText(session, brief, assignedCount), { parse_mode: "Markdown" });
+  const sentIds = [header.message_id];
+
+  // Post each cover with button grid
+  for (const cover of unattributed) {
+    const existing = existingAssignments[String(cover.msg_id)];
+    const caption  = `Cover \`${md(cover.file_name || cover.msg_id)}\``;
+    let sent;
+    try {
+      const sendFn = cover.kind === "video" ? telegram.sendVideo.bind(telegram)
+                   : cover.kind === "document" || cover.kind === "animation" ? telegram.sendDocument.bind(telegram)
+                   : telegram.sendPhoto.bind(telegram);
+      sent = await sendFn(chatId, cover.file_id, {
+        caption,
+        parse_mode: "Markdown",
+        reply_markup: existing ? undefined : buildCoverKeyboard(session.id, cover.msg_id, pages),
+      });
+      if (existing) {
+        await telegram.editMessageCaption(chatId, sent.message_id, undefined,
+          `${caption}\n\n${renderAssignmentBadge(existing, pages)}`,
+          { parse_mode: "Markdown" }
+        );
+      }
+    } catch (err) {
+      // file_id may have aged out (rare but possible for old briefs) —
+      // fall back to text-only prompt so the operator can still tap
+      sent = await telegram.sendMessage(chatId,
+        `*Cover ${cover.idx + 1}* — couldn't preview (${md(err.message)})\n\nFile: \`${md(cover.file_name || cover.msg_id)}\``,
+        {
+          parse_mode: "Markdown",
+          reply_markup: existing ? undefined : buildCoverKeyboard(session.id, cover.msg_id, pages),
+        }
+      );
+    }
+    sentIds.push(sent.message_id);
+  }
+
+  await setPromptMessageIds(session.id, chatId, sentIds);
+  return { headerMsgId: header.message_id, coverMsgIds: sentIds.slice(1) };
 }
 
 async function handleAssignmentCallback(ctx) {
@@ -559,4 +588,5 @@ async function runPhase3Forward(ctx, session) {
 module.exports = {
   handleResolveCommand,
   handleAssignmentCallback,
+  postAssignmentUI,
 };
