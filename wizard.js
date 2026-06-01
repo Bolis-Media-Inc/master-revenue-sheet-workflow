@@ -2720,6 +2720,27 @@ bot.on("callback_query", async (ctx) => {
         console.error(`[wizard] postAsUserClient failed: ${postRes.error}`);
       }
 
+      // Persist the posted brief's chatId+messageId so bm_tracking_bot's
+      // 2-min debounce gate (task #47) can distinguish a wizard handoff
+      // from a manual sales_bolismedia post. Without this, the bot would
+      // unnecessarily debounce wizard-approved briefs by 2 min — they've
+      // already been through admin approval and shouldn't wait again.
+      if (postRes.ok && postRes.briefMsgId && sessionsLib._supabase) {
+        try {
+          await sessionsLib._supabase
+            .from("ad_sessions")
+            .update({
+              internal_brief: {
+                chatId:    Number(TARGET_CHAT),
+                messageId: postRes.briefMsgId,
+              },
+            })
+            .eq("id", sessionId);
+        } catch (err) {
+          console.error(`[wizard] failed to persist internal_brief: ${err.message}`);
+        }
+      }
+
       // Bump bulk/campaign template ref counters if the contributor used one
       if (wizardState.bulkTemplateId) {
         const bidx = KNOWN_BULKS.findIndex((t) => t.id === wizardState.bulkTemplateId);

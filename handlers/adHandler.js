@@ -1640,20 +1640,42 @@ async function handleAdMessage(ctx) {
     // ctx._isDeferredProcessing=true to skip the defer gate.
     //
     // Skips:
-    //   • Wizard handoffs (from=sales_bolismedia) — those went through
-    //     Greg's admin approval, no edits expected
+    //   • Wizard handoffs — detected by querying ad_sessions for a 'sent'
+    //     session whose internal_brief matches this chat+msg. Wizard writes
+    //     that linkage in wizard.js after postAsUserClient succeeds. Beats
+    //     the simpler "sender=sales_bolismedia" check because sales might
+    //     also post manually using the same account (no wizard involved →
+    //     should be debounced normally).
     //   • Already-deferred replays (ctx._isDeferredProcessing) — would loop
     //   • Debounce disabled (BRIEF_DEBOUNCE_MS<=0)
-    const isWizardPost = ctx.from?.username === "sales_bolismedia";
-    if (!ctx._isDeferredProcessing && !isWizardPost) {
+    if (!ctx._isDeferredProcessing) {
       try {
         const pendingBriefs = require("../lib/pendingBriefs");
         if (pendingBriefs.DEBOUNCE_MS > 0) {
-          const deferred = await pendingBriefs.defer(ctx.chat.id, ctx.message.message_id);
-          if (deferred !== undefined) {
-            const debounceSec = Math.round(pendingBriefs.DEBOUNCE_MS / 1000);
-            console.log(`[adHandler] ⏳ Deferred brief ${ctx.message.message_id} for ${debounceSec}s (edit window)`);
-            return; // cron will re-call handleAdMessage in DEBOUNCE_MS
+          // Is this brief msg the result of a recent wizard approval?
+          const sessions = require("../lib/sessions");
+          let isWizardHandoff = false;
+          if (sessions._supabase) {
+            try {
+              const { data: wizMatch } = await sessions._supabase
+                .from("ad_sessions")
+                .select("id")
+                .eq("status", "sent")
+                .eq("internal_brief->>chatId",    String(ctx.chat.id))
+                .eq("internal_brief->>messageId", String(ctx.message.message_id))
+                .limit(1);
+              isWizardHandoff = !!(wizMatch && wizMatch.length > 0);
+            } catch (_) { /* fail-open — debounce if lookup errors */ }
+          }
+          if (!isWizardHandoff) {
+            const deferred = await pendingBriefs.defer(ctx.chat.id, ctx.message.message_id);
+            if (deferred !== undefined) {
+              const debounceSec = Math.round(pendingBriefs.DEBOUNCE_MS / 1000);
+              console.log(`[adHandler] ⏳ Deferred brief ${ctx.message.message_id} for ${debounceSec}s (edit window)`);
+              return; // cron will re-call handleAdMessage in DEBOUNCE_MS
+            }
+          } else {
+            console.log(`[adHandler] ⏭️  Skipping debounce — wizard handoff for msg ${ctx.message.message_id}`);
           }
         }
       } catch (err) {
