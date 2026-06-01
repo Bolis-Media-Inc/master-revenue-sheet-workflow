@@ -177,21 +177,18 @@ async function ingestWizardBrief(telegram, payload) {
       // Not necessarily an error — some pages legitimately have no per-page sheet yet
       continue;
     }
-    // Per-page sheets now have an SS checkbox in column A — everything
-    // else shifted right by 1. Leading "" preserves the SS column.
     const row = [
-      "",                                                                // A: SS (checkbox — left blank for VA)
-      brief.client || "",                                                // B: Client Name
-      brief.category || "",                                              // C: Ad Type
-      p.bulk_num || "",                                                  // D: Bulk #
-      brief.date_posted || "",                                           // E: Date Posted
-      brief.post_type || "",                                             // F: Post Type
-      brief.post_duration || "",                                         // G: Post Duration
-      Number.isFinite(p.price) ? `$${p.price}` : "",                     // H: Ad Price
-      "",                                                                // I: Notes
+      brief.client || "",                                                // A: Client Name
+      brief.category || "",                                              // B: Ad Type
+      p.bulk_num || "",                                                  // C: Bulk #
+      brief.date_posted || "",                                           // D: Date Posted
+      brief.post_type || "",                                             // E: Post Type
+      brief.post_duration || "",                                         // F: Post Duration
+      Number.isFinite(p.price) ? `$${p.price}` : "",                     // G: Ad Price
+      "",                                                                // H: Notes
     ];
     try {
-      const rowNum = await appendRow(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "B", endColumn: "I" });
+      const rowNum = await appendRow(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "A", endColumn: "H" });
       if (rowNum) {
         writes.page_rows++;
         const pageRowId = pageRowIdByHandle.get(handle);

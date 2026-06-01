@@ -608,98 +608,21 @@ async function updateAdPrice(spreadsheetId, tabName, pageHandles, clientName, ne
     return updates.length;
 
   } else {
-    // Per-page sheet — schema is now A=SS (checkbox), B=Client, C=Ad Type,
-    // D=Bulk #, E=Date Posted, F=Post Type, G=Post Duration, H=Ad Price,
-    // I=Notes. Match by client in col B, update price in col H.
+    // Page sheet — no page column, match by client name only
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId,
-      range: `${tabName}!A:I`,
+      range: `${tabName}!A:G`,
     });
     const rows    = response.data.values || [];
     const updates = [];
 
     for (let i = 0; i < rows.length; i++) {
-      const clientCell    = (rows[i]?.[1] || "").trim().toLowerCase(); // B
+      const clientCell    = (rows[i]?.[0] || "").trim().toLowerCase(); // A
       const clientMatches = !normClient || clientCell === normClient;
 
       if (clientMatches && clientCell) { // clientCell guard skips blank rows
-        updates.push({ range: `${tabName}!H${i + 1}`, values: [[newPrice]] });
+        updates.push({ range: `${tabName}!G${i + 1}`, values: [[newPrice]] });
       }
-    }
-
-    if (updates.length) {
-      await sheets.spreadsheets.values.batchUpdate({
-        spreadsheetId,
-        requestBody: { valueInputOption: "USER_ENTERED", data: updates },
-      });
-    }
-    return updates.length;
-  }
-}
-
-/**
- * Update the Campaign/Client column (B in Master, A in per-page sheets)
- * for rows matching the given page handles + old client name.
- *
- * Mirror of updateAdPrice but writes the client column instead of price.
- * Used by the relabel-brief one-off + future /update name admin command.
- *
- * @param {string}   spreadsheetId
- * @param {string}   tabName
- * @param {string[]} pageHandles   — pages to scope the update to (ignored when isMasterSheet=false since per-page sheets have no page column)
- * @param {string}   oldClient     — match this in the client cell (case-insensitive)
- * @param {string}   newClient     — write this value
- * @param {boolean}  [isMasterSheet=true]
- * @returns {Promise<number>} count of rows updated
- */
-async function updateAdClient(spreadsheetId, tabName, pageHandles, oldClient, newClient, isMasterSheet = true) {
-  const auth   = getAuth();
-  const client = await auth.getClient();
-  const sheets = getThrottledSheets(client);
-
-  const normOld = oldClient?.toLowerCase().trim() || null;
-  if (!normOld) throw new Error("updateAdClient: oldClient is required for match");
-  if (!newClient) throw new Error("updateAdClient: newClient is required");
-
-  if (isMasterSheet) {
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: `${tabName}!B:I`,
-    });
-    const rows       = response.data.values || [];
-    const normalised = (pageHandles || []).map((h) => `@${h.toLowerCase().replace(/^@/, "")}`);
-    const wantPage   = normalised.length > 0;
-    const updates    = [];
-
-    for (let i = 0; i < rows.length; i++) {
-      const clientCell = (rows[i]?.[0] || "").trim().toLowerCase(); // B
-      const pageCell   = (rows[i]?.[4] || "").trim().toLowerCase(); // F
-      if (clientCell !== normOld) continue;
-      if (wantPage && !normalised.includes(pageCell)) continue;
-      updates.push({ range: `${tabName}!B${i + 1}`, values: [[newClient]] });
-    }
-
-    if (updates.length) {
-      await sheets.spreadsheets.values.batchUpdate({
-        spreadsheetId,
-        requestBody: { valueInputOption: "USER_ENTERED", data: updates },
-      });
-    }
-    return updates.length;
-
-  } else {
-    // Per-page sheet — schema A=SS, B=Client (etc.). Match + write col B.
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: `${tabName}!A:I`,
-    });
-    const rows    = response.data.values || [];
-    const updates = [];
-
-    for (let i = 0; i < rows.length; i++) {
-      const clientCell = (rows[i]?.[1] || "").trim().toLowerCase(); // B
-      if (clientCell !== normOld) continue;
-      updates.push({ range: `${tabName}!B${i + 1}`, values: [[newClient]] });
     }
 
     if (updates.length) {
@@ -967,6 +890,6 @@ module.exports = {
   appendRow, markForwarded, markForwardedBatch,
   applyCenterAlignmentBatch, applyColumnCenterAlignment,
   getLastDate, appendSeparatorRow,
-  updateStatusToLive, updateAdPrice, updateAdClient, updateAdDate, deleteAdRows,
+  updateStatusToLive, updateAdPrice, updateAdDate, deleteAdRows,
   appendReminder, appendRemindersBatch, getPendingReminders, markReminderSent,
 };
