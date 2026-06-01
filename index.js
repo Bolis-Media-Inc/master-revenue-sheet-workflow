@@ -25,6 +25,16 @@ if (missing.length) {
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
+// ── /resolve — interactive cover-to-page assignment for ambiguous briefs ─────
+// Used when a brief lists N pages but only some covers were @-labeled.
+// Operator runs /resolve in DM with bm_tracking_bot, gets each unattributed
+// cover with inline page-buttons. Each tap saves to pending_brief_assignments.
+// Phase 3 (queued #36) wires the "all assigned" terminal state into actual
+// re-forwarding. For now it just produces the mapping for manual /replay.
+const { handleResolveCommand, handleAssignmentCallback } = require("./handlers/resolveHandler");
+bot.command("resolve", handleResolveCommand);
+bot.action(/^ca:[0-9a-f-]+:[^:]+:.+$/, handleAssignmentCallback);
+
 // ── Passive listener — fires on every message ─────────────────────────────────
 // 1. Feed every message into the rolling buffer (needed for content forwarding)
 // 2. Run the ad handler (ignores non-ads and non-target chats internally)
