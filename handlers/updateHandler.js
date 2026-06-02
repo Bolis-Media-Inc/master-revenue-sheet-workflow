@@ -266,14 +266,23 @@ async function handleUpdateCommand(ctx) {
         "Examples (reply to the brief, then type):\n" +
         "  `/update price @hitsblunt $250`\n" +
         "  `/update price @hitsblunt @dailyhoodposts $200`\n" +
-        "  `/update name New Campaign Name`",
+        "  `/update name New Campaign Name`\n\n" +
+        "_Multi-line works — each line is processed as a separate command:_\n" +
+        "```\n/update price @hitsblunt $250\n/update price @dailyhoodposts $200\n/update price @zer $100\n```",
         { parse_mode: "Markdown" }
       ).catch(() => {});
       return;
     }
-    const text = (ctx.message?.text || "").trim();
-    const m = text.match(/^\/update(?:@\w+)?\s+(\w+)\s+([\s\S]+)$/i);
-    if (!m) {
+    const fullText = (ctx.message?.text || "").trim();
+    // Multi-line: each `/update …` line is its own command. Matches the
+    // legacy `price update / takedown / creative update` pattern. Necessary
+    // to fix the "all handles got same price" bug from the single-command-
+    // matches-multiple-lines parser.
+    const updateLines = fullText
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => /^\/update(?:@\w+)?\s+/i.test(l));
+    if (updateLines.length === 0) {
       await ctx.reply(
         "Usage: `/update <subcommand> <args>`\n" +
         "Subcommands: `price`, `name` (more coming: creative, takedown, sponsor)",
@@ -281,10 +290,8 @@ async function handleUpdateCommand(ctx) {
       ).catch(() => {});
       return;
     }
-    const subcommand = m[1].toLowerCase();
-    const argsStr    = m[2].trim();
 
-    // Find the brief from the replied-to message
+    // Look up brief once, share across all sub-commands
     const briefMessageId = replyTo.message_id;
     const sourceChatId   = ctx.chat.id;
     const brief = await adBriefs.findBriefByTelegramMessage(Number(sourceChatId), briefMessageId);
@@ -296,59 +303,62 @@ async function handleUpdateCommand(ctx) {
     }
     const briefPages = await adBriefs.getBriefPages(brief.id);
 
-    let result;
-    if (subcommand === "price") {
-      const handles = _extractHandles(argsStr);
-      const priceM = argsStr.match(/\$?([\d,]+(?:\.\d{1,2})?)\s*$/);
-      if (!handles.length || !priceM) {
-        await ctx.reply(
-          "Usage: `/update price @handle [@handle…] $PRICE`",
-          { parse_mode: "Markdown" }
-        ).catch(() => {});
-        return;
+    // Run each /update line independently, accumulate results
+    const allReplies = [];
+    const totalChatEdits = { edited: 0, skipped: 0, failed: 0 };
+    for (const line of updateLines) {
+      const result = await _runOneUpdateLine(ctx, brief, briefPages, line);
+      if (result?.replies) allReplies.push(...result.replies);
+      if (result?.chatEdits) {
+        totalChatEdits.edited  += result.chatEdits.edited;
+        totalChatEdits.skipped += result.chatEdits.skipped;
+        totalChatEdits.failed  += result.chatEdits.failed;
       }
-      const newPrice = priceM[1].replace(/,/g, "");
-      result = await updatePrice(ctx, brief, briefPages, handles, newPrice);
-    } else if (subcommand === "name") {
-      const newName = argsStr.trim();
-      if (!newName) {
-        await ctx.reply("Usage: `/update name <new campaign name>`", { parse_mode: "Markdown" }).catch(() => {});
-        return;
-      }
-      result = await updateName(ctx, brief, briefPages, newName);
-    } else if (["creative", "takedown", "sponsor"].includes(subcommand)) {
-      await ctx.reply(
-        `\`/update ${subcommand}\` — not yet implemented. ` +
-        `For now use the keyword form: \`${subcommand === "takedown" ? "takedown" : subcommand + " update"} @handle\``,
-        { parse_mode: "Markdown" }
-      ).catch(() => {});
-      return;
-    } else {
-      await ctx.reply(
-        `Unknown subcommand: \`${_md(subcommand)}\`. Available: price, name. ` +
-        `Coming soon: creative, takedown, sponsor.`,
-        { parse_mode: "Markdown" }
-      ).catch(() => {});
-      return;
+      if (result?.error) allReplies.push(`⚠️ ${result.error}`);
     }
-
-    if (result?.error) {
-      await ctx.reply(`⚠️ ${result.error}`).catch(() => {});
-      return;
-    }
-
-    const ce = result?.chatEdits || { edited: 0, skipped: 0, failed: 0 };
-    const lines = [
-      `✅ */update ${subcommand}* — ${brief.client || "brief"}`,
-      ...((result?.replies || []).map((l) => "  " + l)),
+    const summary = [
+      `✅ */update* — ${brief.client || "brief"} (${updateLines.length} cmd${updateLines.length === 1 ? "" : "s"})`,
+      ...allReplies.map((l) => "  " + l),
       ``,
-      `Chat edits: ${ce.edited} edited · ${ce.skipped} skipped (no edit needed or >48h) · ${ce.failed} failed`,
+      `Chat edits: ${totalChatEdits.edited} edited · ${totalChatEdits.skipped} skipped (no edit needed or >48h) · ${totalChatEdits.failed} failed`,
     ];
-    await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
+    await ctx.reply(summary.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
+    return;
   } catch (err) {
     console.error("[update] error:", err.message);
     try { await ctx.reply(`❌ /update failed: ${err.message}`); } catch (_) {}
   }
+}
+
+/**
+ * Parse + execute a single `/update <subcommand> <args>` line. Returns
+ * { replies, chatEdits, error } for the caller to aggregate. Pulled out
+ * of the main handler so multi-line invocations can loop cleanly.
+ */
+async function _runOneUpdateLine(ctx, brief, briefPages, line) {
+  const m = line.match(/^\/update(?:@\w+)?\s+(\w+)\s+([\s\S]+)$/i);
+  if (!m) return { error: `Couldn't parse: \`${line}\`` };
+  const subcommand = m[1].toLowerCase();
+  const argsStr    = m[2].trim();
+
+  if (subcommand === "price") {
+    const handles = _extractHandles(argsStr);
+    const priceM = argsStr.match(/\$?([\d,]+(?:\.\d{1,2})?)\s*$/);
+    if (!handles.length || !priceM) {
+      return { error: `Bad syntax: \`${line}\` — expected \`/update price @handle [@handle…] $PRICE\`` };
+    }
+    const newPrice = priceM[1].replace(/,/g, "");
+    return await updatePrice(ctx, brief, briefPages, handles, newPrice);
+  }
+  if (subcommand === "name") {
+    const newName = argsStr.trim();
+    if (!newName) return { error: `Bad syntax: \`${line}\` — expected \`/update name <new name>\`` };
+    return await updateName(ctx, brief, briefPages, newName);
+  }
+  if (["creative", "takedown", "sponsor"].includes(subcommand)) {
+    return { error: `\`/update ${subcommand}\` — not yet implemented; use keyword form (\`${subcommand === "takedown" ? "takedown" : subcommand + " update"} @handle\`)` };
+  }
+  return { error: `Unknown subcommand: \`${_md(subcommand)}\` (available: price, name)` };
 }
 
 module.exports = {
