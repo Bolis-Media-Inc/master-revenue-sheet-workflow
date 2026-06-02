@@ -46,14 +46,21 @@ bot.command("update", handleUpdateCommand);
 // ── /editbrief — surgical edit of ONE bot-sent message via Telegram link ─────
 // Manual escape hatch for past briefs with NULL forwarded_message_ids.
 // `/editbrief <link>` + new text on the next lines. See handlers/editBriefHandler.js.
-const { handleEditBriefCommand } = require("./handlers/editBriefHandler");
+const { handleEditBriefCommand, maybeConsumePendingEdit } = require("./handlers/editBriefHandler");
 bot.command("editbrief", handleEditBriefCommand);
 
 // ── Passive listener — fires on every message ─────────────────────────────────
 // 1. Feed every message into the rolling buffer (needed for content forwarding)
 // 2. Run the ad handler (ignores non-ads and non-target chats internally)
-bot.on("message", (ctx) => {
+bot.on("message", async (ctx) => {
   if (ctx.message) addMessage(ctx.message);
+  // /editbrief two-message flow: if admin recently sent `/editbrief <link>`
+  // alone and this is their next message, consume it as the new text + edit.
+  // Short-circuits the rest of the message handlers when consumed.
+  try {
+    const consumed = await maybeConsumePendingEdit(ctx);
+    if (consumed) return;
+  } catch (err) { console.error("[editbrief] consume error:", err.message); }
   handleAuditCommand(ctx); // reply-based audit commands (price update / takedown / creative update)
   handleAdMessage(ctx);    // new ad detection + sheet logging + forwarding
 });
