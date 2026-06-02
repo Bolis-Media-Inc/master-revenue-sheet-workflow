@@ -43,6 +43,12 @@ bot.action(/^ca:[0-9a-f-]+:[^:]+:.+$/, handleAssignmentCallback);
 const { handleUpdateCommand } = require("./handlers/updateHandler");
 bot.command("update", handleUpdateCommand);
 
+// ── /editbrief — surgical edit of ONE bot-sent message via Telegram link ─────
+// Manual escape hatch for past briefs with NULL forwarded_message_ids.
+// `/editbrief <link>` + new text on the next lines. See handlers/editBriefHandler.js.
+const { handleEditBriefCommand } = require("./handlers/editBriefHandler");
+bot.command("editbrief", handleEditBriefCommand);
+
 // ── Passive listener — fires on every message ─────────────────────────────────
 // 1. Feed every message into the rolling buffer (needed for content forwarding)
 // 2. Run the ad handler (ignores non-ads and non-target chats internally)
