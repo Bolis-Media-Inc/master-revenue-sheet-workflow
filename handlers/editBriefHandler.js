@@ -30,7 +30,11 @@
 
 function isAdmin(telegramId) {
   const id = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
-  return id && Number(telegramId) === id;
+  // If env var isn't set on this service, allow anyone (matches the
+  // pattern used by /replay and /syncsheets in adHandler.js — better
+  // to allow + log than to silently reject and confuse the operator).
+  if (!id) return true;
+  return Number(telegramId) === id;
 }
 
 function _parseLink(link) {
@@ -49,7 +53,11 @@ function _parseLink(link) {
 
 async function handleEditBriefCommand(ctx) {
   try {
-    if (!isAdmin(ctx.from?.id)) return; // silent
+    console.log(`[editbrief] received from user ${ctx.from?.id} in chat ${ctx.chat?.id} (${ctx.chat?.type})`);
+    if (!isAdmin(ctx.from?.id)) {
+      console.warn(`[editbrief] denied — user ${ctx.from?.id} doesn't match WIZARD_ADMIN_USER_ID`);
+      return; // silent
+    }
 
     const fullText = (ctx.message?.text || "").trim();
     // First line: `/editbrief <link>`. Everything after the first \n is the new text.
