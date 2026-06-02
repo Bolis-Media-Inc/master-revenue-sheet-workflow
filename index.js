@@ -35,6 +35,14 @@ const { handleResolveCommand, handleAssignmentCallback } = require("./handlers/r
 bot.command("resolve", handleResolveCommand);
 bot.action(/^ca:[0-9a-f-]+:[^:]+:.+$/, handleAssignmentCallback);
 
+// ── /update — unified brief mutation (price, name; more subcommands TODO) ────
+// Reply to a brief in Internal Network Ads then:
+//   /update price @handle $X   — update a page's price (sheets + DB + chat edit)
+//   /update name <new name>    — rename the brief client everywhere
+// See handlers/updateHandler.js + task #31.
+const { handleUpdateCommand } = require("./handlers/updateHandler");
+bot.command("update", handleUpdateCommand);
+
 // ── Passive listener — fires on every message ─────────────────────────────────
 // 1. Feed every message into the rolling buffer (needed for content forwarding)
 // 2. Run the ad handler (ignores non-ads and non-target chats internally)

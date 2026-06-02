@@ -636,6 +636,71 @@ async function updateAdPrice(spreadsheetId, tabName, pageHandles, clientName, ne
 }
 
 /**
+ * Rename the Client/Campaign column for rows matching (oldClient + pageHandles).
+ * Mirror of updateAdPrice but writes column B (Master) or A (per-page) with
+ * a new client name instead of column H/G with a new price.
+ *
+ * Used by /update name (handlers/updateHandler.js). Building block for
+ * the future "rename campaign across the books" workflow.
+ *
+ * @returns {Promise<number>} count of rows updated
+ */
+async function updateAdClient(spreadsheetId, tabName, pageHandles, oldClient, newClient, isMasterSheet = true) {
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = getThrottledSheets(client);
+
+  const normOld = oldClient?.toLowerCase().trim() || null;
+  if (!normOld) throw new Error("updateAdClient: oldClient required");
+  if (!newClient) throw new Error("updateAdClient: newClient required");
+
+  if (isMasterSheet) {
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `${tabName}!B:I`,
+    });
+    const rows       = response.data.values || [];
+    const normalised = (pageHandles || []).map((h) => `@${h.toLowerCase().replace(/^@/, "")}`);
+    const wantPage   = normalised.length > 0;
+    const updates    = [];
+    for (let i = 0; i < rows.length; i++) {
+      const clientCell = (rows[i]?.[0] || "").trim().toLowerCase(); // B
+      const pageCell   = (rows[i]?.[4] || "").trim().toLowerCase(); // F
+      if (clientCell !== normOld) continue;
+      if (wantPage && !normalised.includes(pageCell)) continue;
+      updates.push({ range: `${tabName}!B${i + 1}`, values: [[newClient]] });
+    }
+    if (updates.length) {
+      await sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId,
+        requestBody: { valueInputOption: "USER_ENTERED", data: updates },
+      });
+    }
+    return updates.length;
+  } else {
+    // Per-page sheet: A=client. Match + rewrite col A.
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `${tabName}!A:G`,
+    });
+    const rows    = response.data.values || [];
+    const updates = [];
+    for (let i = 0; i < rows.length; i++) {
+      const clientCell = (rows[i]?.[0] || "").trim().toLowerCase(); // A
+      if (clientCell !== normOld) continue;
+      updates.push({ range: `${tabName}!A${i + 1}`, values: [[newClient]] });
+    }
+    if (updates.length) {
+      await sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId,
+        requestBody: { valueInputOption: "USER_ENTERED", data: updates },
+      });
+    }
+    return updates.length;
+  }
+}
+
+/**
  * Hard-delete rows matching the given page handles + client name.
  *
  * Master sheet (isMasterSheet = true):  match B=client + F=page.
@@ -890,6 +955,6 @@ module.exports = {
   appendRow, markForwarded, markForwardedBatch,
   applyCenterAlignmentBatch, applyColumnCenterAlignment,
   getLastDate, appendSeparatorRow,
-  updateStatusToLive, updateAdPrice, updateAdDate, deleteAdRows,
+  updateStatusToLive, updateAdPrice, updateAdClient, updateAdDate, deleteAdRows,
   appendReminder, appendRemindersBatch, getPendingReminders, markReminderSent,
 };
