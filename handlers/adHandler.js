@@ -442,9 +442,9 @@ async function forwardToPage(telegram, sourceChatId, adMessageId, originalText, 
   const perPageText = buildPerPageBriefText(originalText, pageHandle, parsedItem?.adPrice);
   if (perPageText) {
     try {
-      await telegram.sendMessage(destChatId, perPageText);
+      const sent = await telegram.sendMessage(destChatId, perPageText);
       console.log(`[adHandler] ✅ Per-page brief @${pageHandle} → ${destChatId} ($${parsedItem?.adPrice ?? "?"})`);
-      return;
+      return sent?.message_id ?? null;
     } catch (err) {
       console.error(`[adHandler] ❌ Per-page brief @${pageHandle} → ${destChatId}: ${err.message} — falling back to original forward`);
     }
@@ -454,11 +454,13 @@ async function forwardToPage(telegram, sourceChatId, adMessageId, originalText, 
 
   // Fallback: forward the original brief verbatim
   try {
-    await telegram.forwardMessage(destChatId, sourceChatId, adMessageId);
+    const sent = await telegram.forwardMessage(destChatId, sourceChatId, adMessageId);
     console.log(`[adHandler] ✅ Forward brief @${pageHandle} → ${destChatId} (full brief, rewrite skipped)`);
+    return sent?.message_id ?? null;
   } catch (err) {
     console.error(`[adHandler] ❌ Forward brief @${pageHandle} → ${destChatId}: ${err.message}`);
   }
+  return null;
 }
 
 /**
@@ -2276,7 +2278,7 @@ async function handleAdMessage(ctx) {
           // Find the parsed item for THIS handle so the per-page brief
           // rewrite can use the right price + bulkNum + nif.
           const parsedItem = parsedList.find((p) => p.pageHandle === handle);
-          await forwardToPage(
+          const briefFwdMsgId = await forwardToPage(
             ctx.telegram,
             sourceChatId,
             adMessageId,
@@ -2288,14 +2290,15 @@ async function handleAdMessage(ctx) {
           forwardOk++;
 
           // ── Mark this page forwarded in the DB ──────────────────────────────
-          // forwardToPage doesn't surface the destination message_ids, so we
-          // can't store forwarded_message_ids precisely here without a bigger
-          // refactor. The forwarded_at timestamp + master_sheet_row + page_sheet_row
-          // are enough for /replay backfill purposes.
+          // forwardToPage now returns the brief's destination message_id —
+          // load-bearing for /update price chat edits (need a valid msg_id
+          // to call editMessageText with). Earlier this was nulled out so
+          // /update price's _editForwardedBriefs found nothing to edit.
           const pageRowId = pageRowIdByHandle.get(handle.toLowerCase());
           if (pageRowId) {
             adBriefs.markPageForwarded(pageRowId, {
               masterSheetRow: masterRowByHandle.get(handle) ?? null,
+              messageIds:     briefFwdMsgId ? [briefFwdMsgId] : null,
             }).catch(() => {});
           }
 
