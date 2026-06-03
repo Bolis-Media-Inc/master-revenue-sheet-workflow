@@ -393,10 +393,10 @@ async function handleUpdateCommand(ctx) {
         "  `/update price @hitsblunt $250`\n" +
         "  `/update price @hitsblunt @dailyhoodposts $200`\n" +
         "  `/update name New Campaign Name`\n" +
-        "  `/update takedown @oddlyhorrifying`\n" +
-        "  `/update takedown @page1 @page2`\n\n" +
+        "  `/update remove @oddlyhorrifying`\n" +
+        "  `/update remove @page1 @page2`\n\n" +
         "_Multi-line works — each line is processed as a separate command:_\n" +
-        "```\n/update price @hitsblunt $250\n/update takedown @oddlyhorrifying\n```",
+        "```\n/update price @hitsblunt $250\n/update remove @oddlyhorrifying\n```",
         { parse_mode: "Markdown" }
       ).catch(() => {});
       return;
@@ -483,9 +483,10 @@ async function _runOneUpdateLine(ctx, brief, briefPages, line) {
     if (!newName) return { error: `Bad syntax: \`${line}\` — expected \`/update name <new name>\`` };
     return await updateName(ctx, brief, briefPages, newName);
   }
-  if (subcommand === "takedown") {
+  // "remove" is the primary name; "takedown" stays as a backwards-compat alias
+  if (subcommand === "remove" || subcommand === "takedown") {
     const handles = _extractHandles(argsStr);
-    if (!handles.length) return { error: `Bad syntax: \`${line}\` — expected \`/update takedown @handle [@handle…]\`` };
+    if (!handles.length) return { error: `Bad syntax: \`${line}\` — expected \`/update remove @handle [@handle…]\`` };
     return await updateTakedown(ctx, brief, briefPages, handles);
   }
   if (["creative", "sponsor"].includes(subcommand)) {
