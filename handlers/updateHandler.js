@@ -245,6 +245,132 @@ async function updateName(ctx, brief, briefPages, newName) {
   };
 }
 
+// ── Subcommand: takedown (remove page from a brief) ──────────────────────────
+
+/**
+ * /update takedown @page [@page…]
+ *
+ * Full removal of one or more pages from a brief — touches every surface:
+ *   1. Delete the bot's forwarded brief in @page's IG Ads chat
+ *      (uses forwarded_message_ids; fail-soft if NULL or >48h)
+ *   2. Delete Master sheet row for @page in this brief
+ *   3. Delete @page's per-page sheet row
+ *   4. Delete ad_brief_pages row in DB
+ *   5. Decrement ad_briefs.total_price by @page's price
+ *
+ * OTHER per-page chats are NOT edited — each per-page brief copy is
+ * already isolated to its own page (the rewrite shows only that page's
+ * line + that page's price), so removing @page doesn't affect them.
+ */
+async function updateTakedown(ctx, brief, briefPages, handles) {
+  const replies = [];
+  const chatEdits = { edited: 0, skipped: 0, failed: 0 };
+  let runningTotal = Number(brief.total_price || 0);
+
+  for (const handle of handles) {
+    const norm = handle.toLowerCase().replace(/^@/, "");
+    const pageRow = briefPages.find((p) => p.page_handle.toLowerCase() === norm);
+    if (!pageRow) {
+      replies.push(`⚠️ *@${_md(norm)}* not in this brief — skipping`);
+      continue;
+    }
+
+    // 1. Delete the bot's forwarded brief in the page's IG Ads chat
+    let chatDeleted = false;
+    let chatNote = "no msg_id";
+    if (pageRow.forwarded_message_ids?.length) {
+      const briefMsgId = pageRow.forwarded_message_ids[pageRow.forwarded_message_ids.length - 1];
+      const destChatId = pagesRegistry.getChatId(norm);
+      if (destChatId) {
+        try {
+          await ctx.telegram.deleteMessage(String(destChatId), Number(briefMsgId));
+          chatDeleted = true;
+          chatEdits.edited++;
+          chatNote = "deleted";
+        } catch (err) {
+          const msg = err?.message || String(err);
+          if (/can't be deleted|message to delete not found/i.test(msg)) {
+            chatEdits.skipped++;
+            chatNote = ">48h or already gone";
+          } else {
+            chatEdits.failed++;
+            chatNote = `err: ${msg.slice(0, 40)}`;
+            console.error(`[update takedown] delete msg @${norm}: ${msg}`);
+          }
+        }
+      } else {
+        chatEdits.skipped++;
+        chatNote = "no chat_id configured";
+      }
+    } else {
+      chatEdits.skipped++;
+    }
+
+    // 2. Delete Master sheet row
+    let masterDel = 0;
+    try {
+      if (MASTER_SHEET_ID) {
+        masterDel = await sheetsLib.deleteAdRows(MASTER_SHEET_ID, MASTER_TAB_NAME, [norm], brief.client, true);
+      }
+    } catch (err) {
+      console.error(`[update takedown] master sheet @${norm}: ${err.message}`);
+    }
+
+    // 3. Delete @page's per-page sheet row
+    let pageDel = 0;
+    const pgSheetId = pagesRegistry.getSheetId(norm);
+    if (pgSheetId) {
+      try {
+        pageDel = await sheetsLib.deleteAdRows(pgSheetId, PAGE_TAB_NAME, [norm], brief.client, false);
+      } catch (err) {
+        console.error(`[update takedown] per-page sheet @${norm}: ${err.message}`);
+      }
+    }
+
+    // 4. Delete ad_brief_pages row in DB
+    let dbDel = 0;
+    if (adBriefs._supabase) {
+      try {
+        const { data, error } = await adBriefs._supabase
+          .from("ad_brief_pages")
+          .delete()
+          .eq("brief_id", brief.id)
+          .ilike("page_handle", norm)
+          .select("id");
+        if (error) throw new Error(error.message);
+        dbDel = data?.length || 0;
+      } catch (err) {
+        console.error(`[update takedown] DB delete @${norm}: ${err.message}`);
+      }
+    }
+
+    // 5. Decrement ad_briefs.total_price
+    const removedPrice = Number(pageRow.page_price || 0);
+    if (adBriefs._supabase && removedPrice > 0) {
+      runningTotal = Math.max(0, runningTotal - removedPrice);
+      try {
+        await adBriefs._supabase
+          .from("ad_briefs")
+          .update({ total_price: runningTotal })
+          .eq("id", brief.id);
+        brief.total_price = runningTotal; // update local so subsequent handles see fresh
+      } catch (err) {
+        console.error(`[update takedown] update total_price: ${err.message}`);
+      }
+    }
+
+    replies.push(
+      `*@${_md(norm)}* removed ($${removedPrice}): ` +
+      `Chat ${chatNote} · Master ${masterDel} · Per-page ${pageDel} · DB ${dbDel}`
+    );
+  }
+
+  if (handles.length > 0 && replies.some((r) => /removed/.test(r))) {
+    replies.push(`*New brief total:* $${runningTotal}`);
+  }
+  return { replies, chatEdits };
+}
+
 // ── Main entry — parses /update and dispatches ──────────────────────────────
 
 /**
@@ -266,9 +392,11 @@ async function handleUpdateCommand(ctx) {
         "Examples (reply to the brief, then type):\n" +
         "  `/update price @hitsblunt $250`\n" +
         "  `/update price @hitsblunt @dailyhoodposts $200`\n" +
-        "  `/update name New Campaign Name`\n\n" +
+        "  `/update name New Campaign Name`\n" +
+        "  `/update takedown @oddlyhorrifying`\n" +
+        "  `/update takedown @page1 @page2`\n\n" +
         "_Multi-line works — each line is processed as a separate command:_\n" +
-        "```\n/update price @hitsblunt $250\n/update price @dailyhoodposts $200\n/update price @zer $100\n```",
+        "```\n/update price @hitsblunt $250\n/update takedown @oddlyhorrifying\n```",
         { parse_mode: "Markdown" }
       ).catch(() => {});
       return;
@@ -355,8 +483,13 @@ async function _runOneUpdateLine(ctx, brief, briefPages, line) {
     if (!newName) return { error: `Bad syntax: \`${line}\` — expected \`/update name <new name>\`` };
     return await updateName(ctx, brief, briefPages, newName);
   }
-  if (["creative", "takedown", "sponsor"].includes(subcommand)) {
-    return { error: `\`/update ${subcommand}\` — not yet implemented; use keyword form (\`${subcommand === "takedown" ? "takedown" : subcommand + " update"} @handle\`)` };
+  if (subcommand === "takedown") {
+    const handles = _extractHandles(argsStr);
+    if (!handles.length) return { error: `Bad syntax: \`${line}\` — expected \`/update takedown @handle [@handle…]\`` };
+    return await updateTakedown(ctx, brief, briefPages, handles);
+  }
+  if (["creative", "sponsor"].includes(subcommand)) {
+    return { error: `\`/update ${subcommand}\` — not yet implemented; use keyword form (\`${subcommand} update @handle\`)` };
   }
   return { error: `Unknown subcommand: \`${_md(subcommand)}\` (available: price, name)` };
 }
@@ -366,4 +499,5 @@ module.exports = {
   // exported for reuse by handlers/auditHandler.js (backwards compat)
   updatePrice,
   updateName,
+  updateTakedown,
 };
