@@ -319,15 +319,21 @@ function getContentBundlesByPage(chatId, adMessageId) {
       msg.animation || msg.audio || msg.sticker
     );
 
-    // A label message: text-only, non-empty, ends with "^", AND starts
-    // with "@". The @-prefix requirement is load-bearing — without it,
+    // A label message: text-only, non-empty, ends with "^", AND either:
+    //   (a) starts with "@" — a per-page handle, e.g. "@thefuck.tv ^"
+    //   (b) is exactly "story ^" or "stories ^" (case-insensitive) — the
+    //       legacy story-shared annotation used by FashionNova-style
+    //       briefs. No "@" prefix in the operator's convention.
+    //
+    // The @-prefix requirement on case (a) is load-bearing — without it,
     // operator annotations like "Covers for ALL ^" or "13 slides ^"
-    // get parsed as labels for a fake "@covers"/"@13" handle. That drags
-    // any preceding media out of the shared bundle and assigns it to
-    // a phantom page handle which then gets silently dropped because
-    // it's not in the brief's page list. End result: slides 2-N go
-    // missing from /resolve and never reach the per-page chats.
-    const isLabel = !hasMedia && text.startsWith("@") && text.endsWith("^") && text.length > 1;
+    // get parsed as labels for a fake "@covers"/"@13" handle and drag
+    // preceding media into a phantom page bundle. Case (b) is the one
+    // legitimate exception (story/stories is a SHARED bundle so the
+    // dragging behavior is correct), allowlisted explicitly.
+    const isStoryAnnotation = /^(stor(?:y|ies))\s*\^$/i.test(text);
+    const isLabel = !hasMedia && text.endsWith("^") && text.length > 1 &&
+      (text.startsWith("@") || isStoryAnnotation);
 
     if (isLabel) {
       // Label format options:
