@@ -617,13 +617,35 @@ function getFilenameBundlesByPage(chatId, adMessageId) {
   // Cleared when: (a) consumed by a media, (b) interrupted by any other
   // text, (c) we hit a previous-brief boundary.
   const HANDLE_LIST_RE = /^(@[\w.]+(?:\s+|$))+$/;
+  // Per-page label syntax: "@goal ^" attributes the next media (going
+  // backwards = chronologically preceding) to @goal. Same semantic as a
+  // handle list, but ending in ^. Catches mixed-format briefs where
+  // most pages use @<handle>.jpg filenames but ONE page (e.g. @goal in
+  // a sport-split Stake brief) gets per-page assets via label. Without
+  // this, the filename scanner saw the 12 @-named covers, declared
+  // useFilenames=true, and the label scanner (which DOES recognize ^
+  // labels) never ran — @goal ended up absent from byHandle and
+  // ambiguity detection paused the brief.
+  //
+  // Format: "@<handle> ^" — single handle, trailing ^. Matches loosely
+  // to tolerate "@goal^" (no space) too, since operators have used both.
+  const HANDLE_LABEL_RE = /^@([\w.]+)\s*\^$/;
   let pendingHandleList = null;
 
   function _addHandleEntry(handle, msg) {
+    // Capture any caption attached to the media itself (Telegram's
+    // .caption field on a photo/video/doc message). Mirrors what the
+    // @-filename branch does so label-attributed media also get their
+    // per-page caption forwarded. Without this, GOAL TEMPLATE png 2's
+    // "Kevin De Bruyne... Odds by @stake" caption would be dropped.
+    const mediaCaption = (msg.caption || "").trim() || null;
     if (!byHandle.has(handle)) {
-      byHandle.set(handle, { media: [msg], caption: null });
+      byHandle.set(handle, { media: [msg], caption: mediaCaption });
     } else {
-      byHandle.get(handle).media.unshift(msg);
+      const entry = byHandle.get(handle);
+      entry.media.unshift(msg);
+      // First non-null caption wins (closest to brief going backwards).
+      if (!entry.caption && mediaCaption) entry.caption = mediaCaption;
     }
   }
 
@@ -689,6 +711,13 @@ function getFilenameBundlesByPage(chatId, adMessageId) {
       // previous pending — only the closest list applies to a cover.
       pendingHandleList = (text.match(/@([\w.]+)/g) || [])
         .map((h) => h.slice(1).toLowerCase());
+    } else if (HANDLE_LABEL_RE.test(text)) {
+      // "@goal ^" / "@goal^" — single-handle label-AFTER syntax.
+      // Set pending; the next media (going backwards) attributes to
+      // this handle. Same accumulation rule as HANDLE_LIST_RE: cleared
+      // after one media consumes it, or on any non-matching text.
+      const m = text.match(HANDLE_LABEL_RE);
+      pendingHandleList = [m[1].toLowerCase()];
     } else {
       // Caption text, "13 Covers ^" annotation, admin chatter — skip and
       // keep scanning. An intervening non-handle-list text invalidates
