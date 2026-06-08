@@ -12,7 +12,7 @@
  */
 
 const { parseAdMessage }       = require("../parser");
-const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment } = require("../sheets");
+const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider } = require("../sheets");
 const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages, getStandardBundle } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
@@ -1988,6 +1988,12 @@ async function handleAdMessage(ctx) {
     // existing centered-formatting convention without N extra API calls.
     const masterRowsToFormat = [];
     if (MASTER_SHEET_ID && !PLACEHOLDER_PATTERN.test(MASTER_SHEET_ID)) {
+
+      // Insert a black day-divider bar if this brief starts a new day in the
+      // master sheet (matches the team's old by-hand day breaks). Fires once
+      // per day, above that day's first brief. Fully fail-open — never blocks
+      // the real row writes below.
+      await maybeInsertDayDivider(MASTER_SHEET_ID, TAB_NAME, parsedList[0]?.datePosted);
 
       let successCount = 0;
       for (const item of parsedList) {

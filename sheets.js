@@ -356,6 +356,112 @@ async function applyCenterAlignmentBatch(spreadsheetId, tabName, rowNumbers, end
   });
 }
 
+// Zero-width space — marks a day-divider row's anchor cell. Non-whitespace
+// (so appendRow's `.trim() !== ""` anchor check counts it and the next real
+// row lands BELOW the divider), but invisible to humans.
+const DAY_DIVIDER_MARK = "​";
+
+/**
+ * Insert a black separator bar at the start of a new day's submissions in the
+ * master sheet — the visual day-break the team used to keep by hand.
+ *
+ * Fires only when the brief's date differs from the last real data row's date
+ * (so it lands once per day, above that day's first brief). Idempotent: if the
+ * last row is already a divider, it no-ops.
+ *
+ * Mechanics: appends a row whose ANCHOR cell holds a zero-width space (so the
+ * brief rows append below it, not over it) and whose A:endColumn cells get a
+ * black background via batchUpdate — matching the old empty-black-bar look.
+ *
+ * Detection compares NORMALIZED M/D/YY (extracted by regex), so "Tue 5/26/26"
+ * vs "Wed, 5/27/26" formatting drift doesn't cause false splits.
+ *
+ * Fully fail-open: any error is logged and swallowed (returns {inserted:false})
+ * so a divider hiccup never blocks the brief's real sheet writes.
+ *
+ * @returns {Promise<{inserted: boolean, row?: number}>}
+ */
+async function maybeInsertDayDivider(spreadsheetId, tabName, briefDateStr, opts = {}) {
+  try {
+    if (!spreadsheetId || !briefDateStr) return { inserted: false };
+    const anchorColumn = opts.anchorColumn || "B"; // master: Client col
+    const dateColumn   = opts.dateColumn   || "D"; // master: Date col
+    const endColumn    = opts.endColumn    || "K";
+
+    const auth   = getAuth();
+    const client = await auth.getClient();
+    const sheets = getThrottledSheets(client);
+
+    const norm = (s) => {
+      const m = String(s || "").match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+      return m ? `${+m[1]}/${+m[2]}/${m[3].slice(-2)}` : null;
+    };
+    const briefNorm = norm(briefDateStr);
+    if (!briefNorm) return { inserted: false }; // can't parse incoming date — skip
+
+    // Last REAL data date (divider rows have empty date col, so naturally skipped)
+    const dateResp = await sheets.spreadsheets.values.get({
+      spreadsheetId, range: `${tabName}!${dateColumn}:${dateColumn}`, majorDimension: "COLUMNS",
+    });
+    const dateVals = (dateResp.data.values && dateResp.data.values[0]) || [];
+    let lastDate = null;
+    for (let i = dateVals.length - 1; i >= 0; i--) {
+      if (dateVals[i] != null && String(dateVals[i]).trim() !== "") { lastDate = dateVals[i]; break; }
+    }
+    if (!lastDate) return { inserted: false };          // no data yet → no divider before day 1
+    if (norm(lastDate) === briefNorm) return { inserted: false }; // same day → no divider
+
+    // Guard against double dividers: if the last anchored row is already a
+    // divider mark, don't stack another.
+    const anchorResp = await sheets.spreadsheets.values.get({
+      spreadsheetId, range: `${tabName}!${anchorColumn}:${anchorColumn}`, majorDimension: "COLUMNS",
+    });
+    const anchorVals = (anchorResp.data.values && anchorResp.data.values[0]) || [];
+    for (let i = anchorVals.length - 1; i >= 0; i--) {
+      const v = anchorVals[i];
+      if (v != null && String(v).trim() !== "") {
+        if (v === DAY_DIVIDER_MARK) return { inserted: false };
+        break;
+      }
+    }
+
+    // Build a blank divider row with the zero-width mark in the anchor column,
+    // then reuse appendRow (handles deterministic placement + grid-extend).
+    const colIdx = anchorColumn.toUpperCase().charCodeAt(0) - 65;
+    const endIdx = endColumn.toUpperCase().charCodeAt(0) - 65;
+    const rowValues = Array.from({ length: endIdx + 1 }, (_, i) => (i === colIdx ? DAY_DIVIDER_MARK : ""));
+    const dividerRow = await appendRow(spreadsheetId, tabName, rowValues, { anchorColumn, endColumn });
+    if (!dividerRow) return { inserted: false };
+
+    // Paint A:endColumn black.
+    const meta  = await sheets.spreadsheets.get({ spreadsheetId });
+    const sheet = meta.data.sheets?.find((s) => s.properties.title === tabName);
+    if (sheet) {
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId,
+        requestBody: {
+          requests: [{
+            repeatCell: {
+              range: {
+                sheetId: sheet.properties.sheetId,
+                startRowIndex: dividerRow - 1, endRowIndex: dividerRow,
+                startColumnIndex: 0, endColumnIndex: endIdx + 1,
+              },
+              cell: { userEnteredFormat: { backgroundColor: { red: 0, green: 0, blue: 0 } } },
+              fields: "userEnteredFormat.backgroundColor",
+            },
+          }],
+        },
+      });
+    }
+    console.log(`[sheets] ▬ Day divider inserted at row ${dividerRow} (new day: ${briefDateStr})`);
+    return { inserted: true, row: dividerRow };
+  } catch (err) {
+    console.error(`[sheets] maybeInsertDayDivider (non-fatal): ${err.message}`);
+    return { inserted: false };
+  }
+}
+
 /**
  * Get the date value from the last populated row in column D (Date column).
  * Returns a normalised date string like "Fri 3/6/26", or null if not found.
@@ -954,7 +1060,7 @@ async function applyColumnCenterAlignment(spreadsheetId, tabName, endColumn = "K
 module.exports = {
   appendRow, markForwarded, markForwardedBatch,
   applyCenterAlignmentBatch, applyColumnCenterAlignment,
-  getLastDate, appendSeparatorRow,
+  getLastDate, appendSeparatorRow, maybeInsertDayDivider,
   updateStatusToLive, updateAdPrice, updateAdClient, updateAdDate, deleteAdRows,
   appendReminder, appendRemindersBatch, getPendingReminders, markReminderSent,
 };
