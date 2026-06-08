@@ -182,7 +182,8 @@ cron.schedule("*/15 * * * *", () => {
 // re-reads the latest text from message_buffer (post-edit if any), and runs
 // the full handleAdMessage pipeline. See lib/pendingBriefs.js + task #47.
 const pendingBriefs = require("./lib/pendingBriefs");
-const { getMessages } = require("./messageBuffer");
+const { getMessages, pruneToLiveSet } = require("./messageBuffer");
+const userClient = require("./userClient");
 cron.schedule("*/30 * * * * *", async () => {
   try {
     const due = await pendingBriefs.claimDue();
@@ -190,6 +191,32 @@ cron.schedule("*/30 * * * * *", async () => {
     console.log(`[cron] pending-briefs: ${due.length} due`);
     for (const row of due) {
       const chatIdStr = String(row.chat_id);
+
+      // ── Live-state reconcile (Connor's "read the chat after 2 min" model) ──
+      // Bots never get deletion events, so the buffer accumulates ghosts from
+      // deleted brief copies / removed creatives. Before processing, ask the
+      // sales_bolismedia user account for the chat's TRUE current message IDs
+      // and drop any buffer ghosts. Whatever survived the 2-min wait is the
+      // truth. Fails open: if the user session is down, we process the raw
+      // buffer + the no-media / supersede guards still protect us.
+      try {
+        const liveIds = await userClient.getLiveMessageIds(row.chat_id, 80);
+        if (liveIds && liveIds.length) {
+          const { removed, kept } = pruneToLiveSet(chatIdStr, liveIds);
+          if (removed > 0) {
+            console.log(`[cron] 👻 reconciled ${chatIdStr}: dropped ${removed} ghost (deleted) msg(s), ${kept} live`);
+          }
+          // If the brief itself was deleted during the wait, don't forward.
+          if (!liveIds.map(Number).includes(Number(row.message_id))) {
+            console.log(`[cron] 🗑️  brief ${chatIdStr}/${row.message_id} no longer in chat (deleted) — skipping`);
+            await pendingBriefs.markProcessed(row.chat_id, row.message_id);
+            continue;
+          }
+        }
+      } catch (err) {
+        console.warn(`[cron] live-state reconcile skipped (user session?): ${err.message}`);
+      }
+
       // Re-fetch the latest text from in-memory buffer — captures any edits
       // that arrived during the debounce window via bot.on("edited_message")
       const buf = getMessages(chatIdStr);

@@ -87,6 +87,27 @@ async function getRecentMessages(chatIdOrUsername, limit = 50) {
   }));
 }
 
+/**
+ * Return the set of message IDs CURRENTLY ALIVE in a chat — the user
+ * account's live view, so deleted messages are absent (bots never get
+ * deletion events; this is the only way to know what was removed).
+ *
+ * Used by the pending-brief worker to reconcile the bot's append-only
+ * buffer against reality before forwarding: any buffer entry whose ID is
+ * not in this set (within the fetched range) is a ghost (deleted) and gets
+ * pruned. That makes "what's in the chat after the 2-min wait" the source
+ * of truth, killing delete/edit/resend bugs at the root.
+ *
+ * Resolves the entity explicitly so negative supergroup IDs (-100…) work.
+ * Throws on session failure — caller falls back to the raw buffer.
+ */
+async function getLiveMessageIds(chatId, limit = 80) {
+  const client = await getClient();
+  const entity = await client.getEntity(Number(chatId));
+  const messages = await client.getMessages(entity, { limit });
+  return messages.map((m) => m.id).filter((id) => Number.isFinite(id));
+}
+
 // ── List all chats the account is in ─────────────────────────────────────────
 
 async function listChats() {
@@ -275,4 +296,4 @@ async function sendText(chatId, text) {
   }
 }
 
-module.exports = { getClient, sendMessage, sendRecap, getRecentMessages, listChats, getMessagesSince, onNewMessage, disconnect, forwardMessages, sendFile, sendText };
+module.exports = { getClient, sendMessage, sendRecap, getRecentMessages, getLiveMessageIds, listChats, getMessagesSince, onNewMessage, disconnect, forwardMessages, sendFile, sendText };

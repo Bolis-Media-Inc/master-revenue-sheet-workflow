@@ -830,6 +830,62 @@ function getStandardBundle(chatId, adMessageId) {
   };
 }
 
+/**
+ * Reconcile the in-memory buffer against the chat's TRUE current state.
+ *
+ * `liveIds` is the set of message IDs currently alive in the chat (fetched
+ * via the user account — bots never get deletion events, so this is the only
+ * source of truth). Any buffer entry whose ID falls WITHIN the fetched range
+ * [min(liveIds), max(liveIds)] but is NOT in liveIds is a ghost — a message
+ * the operator deleted that the bot never learned about. Drop it.
+ *
+ * Entries OUTSIDE the fetched range are left untouched: the live fetch only
+ * covers the last N messages, so an older buffer entry being absent doesn't
+ * mean it was deleted — we just didn't fetch that far back.
+ *
+ * This makes "what's in the chat after the 2-min wait" authoritative, which
+ * kills the whole delete/edit/resend class of bugs (Stake Day 19).
+ *
+ * Returns { removed, kept }.
+ */
+function pruneToLiveSet(chatId, liveIds) {
+  const key = String(chatId);
+  const buf = _buffers.get(key);
+  if (!buf || buf.length === 0) return { removed: 0, kept: 0 };
+
+  const live = new Set((liveIds || []).map(Number).filter(Number.isFinite));
+  // Empty fetch → don't nuke anything (treat as "couldn't verify").
+  if (live.size === 0) return { removed: 0, kept: buf.length };
+
+  let maxLive = -Infinity, minLive = Infinity;
+  for (const id of live) { if (id > maxLive) maxLive = id; if (id < minLive) minLive = id; }
+
+  const ghostIds = [];
+  const next = buf.filter((m) => {
+    const id = Number(m.message_id);
+    if (!Number.isFinite(id)) return true;
+    if (id < minLive || id > maxLive) return true; // outside fetched window — keep
+    if (live.has(id)) return true;                 // still alive — keep
+    ghostIds.push(id);                             // in range but gone — ghost
+    return false;
+  });
+
+  if (ghostIds.length > 0) {
+    _buffers.set(key, next);
+    // Mirror the prune to DB so a restart doesn't re-hydrate ghosts.
+    if (_supabase) {
+      _supabase.from("message_buffer")
+        .delete()
+        .eq("chat_id", Number(chatId))
+        .in("message_id", ghostIds)
+        .then(({ error }) => {
+          if (error) console.error("[messageBuffer] ghost prune DB error:", error.message);
+        });
+    }
+  }
+  return { removed: ghostIds.length, kept: next.length };
+}
+
 module.exports = {
   addMessage,
   updateMessage,
@@ -840,6 +896,7 @@ module.exports = {
   getStandardBundle,
   getMessages,
   clearBufferUpTo,
+  pruneToLiveSet,
   hydrateFromDb,
   MAX_BUFFER_PER_CHAT,
 };

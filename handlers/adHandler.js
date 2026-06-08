@@ -340,6 +340,64 @@ function extractMediaRef(msg) {
 }
 
 /**
+ * Delete the bot's PRIOR forwarded messages for a campaign in one page's
+ * chat, so a /replay can do a clean delete + resend instead of stacking a
+ * second copy on top of the first (the Stake Day 19 cleanup ask).
+ *
+ * "Campaign" = all ad_briefs rows with the same client name in the same
+ * source chat. This matters for the delete+resend workflow: the correct
+ * media lives on brief copy A, but the junk was forwarded by copy B — both
+ * are rows for the same campaign, so we sweep all of them.
+ *
+ * Deletes every id in each page row's forwarded_message_ids. For LEGACY
+ * rows that stored only the brief id (length === 1, caption not captured),
+ * also deletes id-1 — the bot always sends the caption immediately before
+ * the brief, so id-1 is that caption.
+ *
+ * Best-effort: deleteMessage failures (>48h window, already gone, not ours)
+ * are swallowed. Returns the count actually deleted.
+ */
+async function deletePriorCampaignForwards(telegram, sourceChatId, clientName, handle, destChatId) {
+  const sb = adBriefs._supabase;
+  if (!sb || !clientName) return 0;
+  try {
+    const { data: briefs } = await sb
+      .from("ad_briefs")
+      .select("id")
+      .eq("telegram_chat_id", Number(sourceChatId))
+      .ilike("client", clientName);
+    if (!briefs || briefs.length === 0) return 0;
+
+    const { data: pages } = await sb
+      .from("ad_brief_pages")
+      .select("forwarded_message_ids")
+      .in("brief_id", briefs.map((b) => b.id))
+      .eq("page_handle", handle.toLowerCase());
+    if (!pages || pages.length === 0) return 0;
+
+    const toDelete = new Set();
+    for (const p of pages) {
+      const ids = (p.forwarded_message_ids || []).map(Number).filter(Number.isFinite);
+      for (const id of ids) toDelete.add(id);
+      if (ids.length === 1) toDelete.add(ids[0] - 1); // legacy: caption sits at briefId-1
+    }
+
+    let deleted = 0;
+    for (const id of toDelete) {
+      try { await telegram.deleteMessage(destChatId, id); deleted++; }
+      catch (_) { /* >48h / already gone / not ours — ignore */ }
+    }
+    if (deleted > 0) {
+      console.log(`[adHandler] 🧹 /replay cleaned ${deleted} prior msg(s) in ${destChatId} for @${handle}`);
+    }
+    return deleted;
+  } catch (err) {
+    console.error(`[adHandler] deletePriorCampaignForwards (non-fatal): ${err.message}`);
+    return 0;
+  }
+}
+
+/**
  * Build a row for an individual page's "IG Revenue Tracker" tab.
  * Column structure (different from master sheet):
  *
@@ -835,6 +893,44 @@ async function handleReplayCommand(ctx) {
     }
   }
 
+  // ── Prefer the richest campaign copy for MEDIA ─────────────────────────
+  // Delete+resend can leave the real creative on an EARLIER brief copy while
+  // a later, media-less copy is the one still in the chat (Stake Day 19:
+  // copy A had 9 covers + 7 slides, copy C had none). If the resolved copy
+  // has no media in DB but a sibling copy of the same campaign (same client
+  // + chat) does, switch the media/page source to that sibling so /replay
+  // re-sends real content instead of an empty brief. Purely additive — only
+  // fires when the resolved copy is empty, so it can't degrade a good replay.
+  if (dbBriefForBackfill && adBriefs._supabase && dbBriefForBackfill.client) {
+    try {
+      let ownMedia = (dbBriefForBackfill.shared_media || []).length;
+      const ownPages = await adBriefs.getBriefPages(dbBriefForBackfill.id);
+      ownMedia += ownPages.reduce((s, p) => s + (p.page_media?.length || 0), 0);
+      if (ownMedia === 0) {
+        const { data: siblings } = await adBriefs._supabase
+          .from("ad_briefs").select("*")
+          .eq("telegram_chat_id", Number(sourceChatId))
+          .ilike("client", dbBriefForBackfill.client)
+          .neq("id", dbBriefForBackfill.id);
+        let best = null, bestScore = 0;
+        for (const s of (siblings || [])) {
+          let score = (s.shared_media || []).length;
+          try {
+            const sp = await adBriefs.getBriefPages(s.id);
+            score += sp.reduce((a, p) => a + (p.page_media?.length || 0), 0);
+          } catch (_) {}
+          if (score > bestScore) { bestScore = score; best = s; }
+        }
+        if (best && bestScore > 0) {
+          console.log(`[adHandler] 🔁 /replay: resolved copy had no media — switching to richer sibling copy (msg ${best.telegram_message_id}, ${bestScore} media items)`);
+          dbBriefForBackfill = best;
+        }
+      }
+    } catch (err) {
+      console.error(`[adHandler] /replay richest-copy fallback (non-fatal): ${err.message}`);
+    }
+  }
+
   if (dbBriefForBackfill) {
     const dbPages = await adBriefs.getBriefPages(dbBriefForBackfill.id);
     for (const p of dbPages) dbPagesByHandle.set(p.page_handle, p);
@@ -1038,6 +1134,16 @@ async function handleReplayCommand(ctx) {
     }
     forwardedDestinations.add(destChatId);
 
+    // Clean delete + resend: remove the bot's prior forwards for this
+    // campaign in this page's chat BEFORE re-sending, so the page ends up
+    // with exactly one correct copy (not the junk + the fix stacked).
+    const replayClient = (parsedList?.[0]?.client) || dbBriefForBackfill?.client || null;
+    await deletePriorCampaignForwards(ctx.telegram, sourceChatId, replayClient, handle, destChatId);
+
+    // Collect ids we send this pass so we can persist the fresh set (and so
+    // a future /replay or /update targets the right messages).
+    const replayIds = [];
+
     const perPageBundle = activeBundle
       ? (activeBundle.byHandle.get(handle.toLowerCase()) || { media: [], caption: null })
       : { media: fallbackMedia, caption: null };
@@ -1056,13 +1162,14 @@ async function handleReplayCommand(ctx) {
       // 1. Per-page media — buffer (forwardMessage) OR DB (sendByKind)
       for (const m of perPageBundle.media) {
         try {
-          await ctx.telegram.forwardMessage(destChatId, sourceChatId, m.message_id);
+          const sent = await ctx.telegram.forwardMessage(destChatId, sourceChatId, m.message_id);
+          if (sent?.message_id) replayIds.push(sent.message_id);
         } catch (err) {
           console.error(`[adHandler] ❌ /replay per-page msg ${m.message_id} → @${handle}: ${err.message}`);
         }
       }
       for (const ref of dbPerPageMedia) {
-        try { await sendByKind(ctx.telegram, destChatId, ref); }
+        try { const sent = await sendByKind(ctx.telegram, destChatId, ref); if (sent?.message_id) replayIds.push(sent.message_id); }
         catch (err) { console.error(`[adHandler] ❌ /replay per-page (DB) ${ref.kind} → @${handle}: ${err.message}`); }
       }
       const perPageTotal = perPageBundle.media.length + dbPerPageMedia.length;
@@ -1073,13 +1180,14 @@ async function handleReplayCommand(ctx) {
       // 2. Shared media — same two paths
       for (const m of sharedBundle.media) {
         try {
-          await ctx.telegram.forwardMessage(destChatId, sourceChatId, m.message_id);
+          const sent = await ctx.telegram.forwardMessage(destChatId, sourceChatId, m.message_id);
+          if (sent?.message_id) replayIds.push(sent.message_id);
         } catch (err) {
           console.error(`[adHandler] ❌ /replay shared msg ${m.message_id} → @${handle}: ${err.message}`);
         }
       }
       for (const ref of dbSharedMedia) {
-        try { await sendByKind(ctx.telegram, destChatId, ref); }
+        try { const sent = await sendByKind(ctx.telegram, destChatId, ref); if (sent?.message_id) replayIds.push(sent.message_id); }
         catch (err) { console.error(`[adHandler] ❌ /replay shared (DB) ${ref.kind} → @${handle}: ${err.message}`); }
       }
       const sharedTotal = sharedBundle.media.length + dbSharedMedia.length;
@@ -1091,15 +1199,17 @@ async function handleReplayCommand(ctx) {
       const captionToSend = perPageBundle.caption || sharedBundle.caption
                           || dbPerPageCaption || dbSharedCaption;
       if (captionToSend) {
-        await ctx.telegram.sendMessage(destChatId, captionToSend);
+        const sent = await ctx.telegram.sendMessage(destChatId, captionToSend);
+        if (sent?.message_id) replayIds.push(sent.message_id);
         console.log(`[adHandler] 💬 /replay caption sent → @${handle}`);
       }
 
       // 4. Per-page brief (rewritten to just this page's row)
       const parsedItem = parsedList.find((p) => p.pageHandle?.toLowerCase() === handle);
-      await forwardToPage(
+      const replayBriefMsgId = await forwardToPage(
         ctx.telegram, sourceChatId, briefMessageId, briefText, destChatId, handle, parsedItem,
       );
+      if (replayBriefMsgId) replayIds.push(replayBriefMsgId); // brief last → updateHandler reads [length-1]
 
       // ── Backfill missing sheet rows ─────────────────────────────────────
       // If the original processing missed a sheet write (quota error,
@@ -1145,10 +1255,13 @@ async function handleReplayCommand(ctx) {
           }
         }
         // Mark forwarded in DB (covers both first-time successful forwards
-        // and re-replays of previously-failed forwards)
+        // and re-replays of previously-failed forwards). Persist the FRESH
+        // message-id set from this replay so the next /replay cleans these
+        // (not the now-deleted old ones) and /update edits the right brief.
         adBriefs.markPageForwarded(dbPage.id, {
           masterSheetRow: dbPage.master_sheet_row ?? null,
           pageSheetRow:   dbPage.page_sheet_row   ?? null,
+          messageIds:     replayIds.length > 0 ? replayIds : null,
         }).catch(() => {});
       }
 
@@ -2369,6 +2482,11 @@ async function handleAdMessage(ctx) {
         }
         forwardedDestinations.add(destKey);
 
+        // Collect EVERY message id we send to this page (covers, shared
+        // slides, caption, brief) so a later /replay can delete the whole
+        // prior forward before re-sending — clean delete+resend, no dupes.
+        const forwardedIds = [];
+
         // ── Per-page attributed bundle (cover etc.) ──────────────────────
         // When attribution detected, look up this handle's specific bundle.
         // Pages NOT in the attribution map get an empty per-page bundle —
@@ -2394,7 +2512,8 @@ async function handleAdMessage(ctx) {
         } else {
           for (const mediaMsg of perPageMedia) {
             try {
-              await ctx.telegram.forwardMessage(String(destChatId), sourceChatId, mediaMsg.message_id);
+              const sent = await ctx.telegram.forwardMessage(String(destChatId), sourceChatId, mediaMsg.message_id);
+              if (sent?.message_id) forwardedIds.push(sent.message_id);
             } catch (err) {
               console.error(`[adHandler] ❌ Forward per-page msg ${mediaMsg.message_id} → @${handle}: ${err.message}`);
             }
@@ -2409,7 +2528,8 @@ async function handleAdMessage(ctx) {
         if (sharedBundle.media.length > 0) {
           for (const mediaMsg of sharedBundle.media) {
             try {
-              await ctx.telegram.forwardMessage(String(destChatId), sourceChatId, mediaMsg.message_id);
+              const sent = await ctx.telegram.forwardMessage(String(destChatId), sourceChatId, mediaMsg.message_id);
+              if (sent?.message_id) forwardedIds.push(sent.message_id);
             } catch (err) {
               console.error(`[adHandler] ❌ Forward shared msg ${mediaMsg.message_id} → @${handle}: ${err.message}`);
             }
@@ -2422,7 +2542,8 @@ async function handleAdMessage(ctx) {
         const captionToSend = perPageCaption || sharedBundle.caption;
         if (captionToSend) {
           try {
-            await ctx.telegram.sendMessage(String(destChatId), captionToSend);
+            const sent = await ctx.telegram.sendMessage(String(destChatId), captionToSend);
+            if (sent?.message_id) forwardedIds.push(sent.message_id);
             const source = perPageCaption ? "per-page" : "shared";
             console.log(`[adHandler] 💬 ${source} caption sent → @${handle} (${captionToSend.length} chars)`);
           } catch (err) {
@@ -2443,18 +2564,20 @@ async function handleAdMessage(ctx) {
             handle,
             parsedItem
           );
+          if (briefFwdMsgId) forwardedIds.push(briefFwdMsgId);
           forwardOk++;
 
           // ── Mark this page forwarded in the DB ──────────────────────────────
-          // forwardToPage now returns the brief's destination message_id —
-          // load-bearing for /update price chat edits (need a valid msg_id
-          // to call editMessageText with). Earlier this was nulled out so
-          // /update price's _editForwardedBriefs found nothing to edit.
+          // Store the FULL set of message ids sent to this page (covers,
+          // shared slides, caption, brief) — not just the brief. This lets a
+          // later /replay delete the entire prior forward before re-sending
+          // (clean delete+resend) AND keeps the brief id available for
+          // /update price chat edits. The brief id is last in the array.
           const pageRowId = pageRowIdByHandle.get(handle.toLowerCase());
           if (pageRowId) {
             adBriefs.markPageForwarded(pageRowId, {
               masterSheetRow: masterRowByHandle.get(handle) ?? null,
-              messageIds:     briefFwdMsgId ? [briefFwdMsgId] : null,
+              messageIds:     forwardedIds.length > 0 ? forwardedIds : null,
             }).catch(() => {});
           }
 
