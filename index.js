@@ -49,6 +49,13 @@ bot.command("update", handleUpdateCommand);
 const { handleEditBriefCommand, maybeConsumePendingEdit } = require("./handlers/editBriefHandler");
 bot.command("editbrief", handleEditBriefCommand);
 
+// ── Reply-with-creative shortcut ─────────────────────────────────────────────
+// Reply to a brief with a creative named `@page.jpg` (or caption `@page …`) and
+// the bot forwards just that creative to that page's chat — the clean way to
+// add a forgotten cover without deleting + re-sending the whole brief.
+// See handlers/creativeReplyHandler.js.
+const { handleCreativeReply } = require("./handlers/creativeReplyHandler");
+
 // ── Passive listener — fires on every message ─────────────────────────────────
 // 1. Feed every message into the rolling buffer (needed for content forwarding)
 // 2. Run the ad handler (ignores non-ads and non-target chats internally)
@@ -61,6 +68,13 @@ bot.on("message", async (ctx) => {
     const consumed = await maybeConsumePendingEdit(ctx);
     if (consumed) return;
   } catch (err) { console.error("[editbrief] consume error:", err.message); }
+  // Reply-with-creative: a media reply to a brief naming @page.jpg routes the
+  // creative straight to that page. Short-circuits when consumed so the media
+  // doesn't fall through to ad detection.
+  try {
+    const consumed = await handleCreativeReply(ctx);
+    if (consumed) return;
+  } catch (err) { console.error("[creativeReply] error:", err.message); }
   handleAuditCommand(ctx); // reply-based audit commands (price update / takedown / creative update)
   handleAdMessage(ctx);    // new ad detection + sheet logging + forwarding
 });

@@ -1727,6 +1727,39 @@ async function handleAdMessage(ctx) {
             } catch (_) { /* fail-open — debounce if lookup errors */ }
           }
           if (!isWizardHandoff) {
+            // ── Supersede guard ────────────────────────────────────────────
+            // Operators delete + re-send a brief to fix a typo, change pages,
+            // or add a forgotten creative. Telegram never tells the bot about
+            // the deletion, so without this every copy would process + forward
+            // independently (Stake Day 19: 3 copies, last one media-less).
+            //
+            // Before deferring THIS copy, cancel any older still-pending copies
+            // for the SAME campaign (same client name) in this chat. Only the
+            // newest copy survives the debounce window and forwards. Matched by
+            // parsed client name — robust to price/page edits between resends.
+            try {
+              const thisClient = (parsedList?.[0]?.client || parsed?.client || "")
+                .trim().toLowerCase();
+              if (thisClient) {
+                const open = await pendingBriefs.listOpenForChat(ctx.chat.id, ctx.message.message_id);
+                for (const row of open) {
+                  // Read the older copy's text from the buffer and parse its client
+                  const olderMsg = (getMessages(ctx.chat.id) || [])
+                    .find((m) => m.message_id === row.message_id);
+                  const olderText = olderMsg?.text || olderMsg?.caption || "";
+                  if (!olderText) continue;
+                  const olderParsed = parseAdMessage(olderText, new Date());
+                  const olderClient = (Array.isArray(olderParsed) ? olderParsed[0] : olderParsed)?.client;
+                  if (olderClient && olderClient.trim().toLowerCase() === thisClient) {
+                    await pendingBriefs.markSuperseded(row.chat_id, row.message_id, ctx.message.message_id);
+                    console.log(`[adHandler] ♻️  Superseded older pending copy msg ${row.message_id} ("${olderClient}") — newer copy ${ctx.message.message_id} replaces it`);
+                  }
+                }
+              }
+            } catch (err) {
+              console.error(`[adHandler] supersede guard error (non-fatal): ${err.message}`);
+            }
+
             const deferred = await pendingBriefs.defer(ctx.chat.id, ctx.message.message_id);
             if (deferred !== undefined) {
               const debounceSec = Math.round(pendingBriefs.DEBOUNCE_MS / 1000);
