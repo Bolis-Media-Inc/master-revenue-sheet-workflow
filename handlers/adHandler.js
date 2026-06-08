@@ -2060,12 +2060,27 @@ async function handleAdMessage(ctx) {
       const briefHandleCount = new Set(
         parsedList.map((p) => p.pageHandle?.toLowerCase()).filter(Boolean),
       ).size;
-      const ambiguousPartial = (
-        useFilenames
-        && briefHandleCount > 1
-        && attributedCount < briefHandleCount
-        && sharedBundle.media.length > 0
-      );
+      // NOTE (2026-06-07): `ambiguousPartial` is DISABLED for filename
+      // attribution. It used to fire whenever a filename-attributed brief
+      // had fewer @-covers than pages + any shared media — but that's the
+      // SHAPE OF DANIELSON'S STANDARD HYBRID BRIEF: some pages get a unique
+      // @<handle>.jpg cover, the rest just take the shared "slides for ALL".
+      // @-filenames are UNAMBIGUOUS by definition (the filename says exactly
+      // which page each cover belongs to), so partial coverage is not
+      // ambiguous — the uncovered pages simply receive shared media + brief.
+      //
+      // The old gate paused EVERY hybrid brief for a /resolve that operators
+      // never ran, and a later media-less re-post would then force-forward
+      // junk (Stake Day 19 disaster, msgs 66706/66731 paused → 66733 sent
+      // empty). Forwarding partial-coverage filename briefs directly is the
+      // correct behavior: covered pages get cover+shared, uncovered pages get
+      // shared-only. If an operator genuinely forgot to @-name a cover, it
+      // lands in every page's shared bundle — recoverable via /update, far
+      // less damaging than a silent pause.
+      //
+      // Genuine ambiguity (a pile of UNNAMED covers, one per page, no naming
+      // at all) is still caught by `ambiguousNoLabels` below.
+      const ambiguousPartial = false;
       const ambiguousNoLabels = (
         detectedFormat === "standard"
         && briefHandleCount >= 2
@@ -2242,6 +2257,47 @@ async function handleAdMessage(ctx) {
         // Keep sheet writes etc. that already happened above — those are
         // idempotent and operator can /syncsheets to confirm. We just don't
         // send the Telegram forwards yet.
+        clearBufferUpTo(chatId, ctx.message.message_id);
+        return;
+      }
+
+      // ── No-media guard (2026-06-07) ──────────────────────────────────────
+      // If a MULTI-PAGE brief reaches this point with ZERO media of any kind
+      // — no per-page covers, no shared media, no fallback media — something
+      // is wrong. The overwhelmingly common cause: the brief was posted (or
+      // re-posted) AFTER its creative had already been pruned from the buffer
+      // by an earlier processing of the same campaign. Force-forwarding a
+      // media-less "standard" brief to N pages spams every chat with a brief
+      // + caption and NO content — exactly the Stake Day 19 failure (msg
+      // 66733 sent 12 media-less forwards after 66706/66731 already ran).
+      //
+      // Rather than blast junk, skip the forward and alert the admin. The
+      // real creative-bearing copy already forwarded (or is paused); this
+      // empty re-post should not overwrite it. Operator can /replay if this
+      // was a genuine standalone text brief that legitimately had no media.
+      const noMediaAtAll =
+        (!activeBundle || activeBundle.byHandle.size === 0) &&
+        sharedBundle.media.length === 0 &&
+        fallbackMedia.length === 0;
+      if (noMediaAtAll && uniqueHandles.length >= 2) {
+        console.warn(
+          `[adHandler] 🚫 Skipping media-less multi-page brief (${uniqueHandles.length} pages, ` +
+          `format: ${detectedFormat}). Likely a re-post after the creative was pruned from the buffer. ` +
+          `Not force-forwarding empty content.`,
+        );
+        const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+        if (adminId) {
+          ctx.telegram.sendMessage(adminId,
+            "🚫 *Skipped a media-less brief*\n" +
+            "─────────────────────────\n" +
+            `*Brief:* \`${(ctx.message?.text || "").split("\n")[0].slice(0, 80)}\`\n` +
+            `*Pages:* ${uniqueHandles.length} · *Media found:* none\n\n` +
+            "This looks like a duplicate/re-post after the creative was already " +
+            "consumed by an earlier copy. I did *not* forward empty content to the pages.\n\n" +
+            "If this was a real standalone brief, reply `/replay` to it.",
+            { parse_mode: "Markdown" }
+          ).catch(() => {});
+        }
         clearBufferUpTo(chatId, ctx.message.message_id);
         return;
       }
