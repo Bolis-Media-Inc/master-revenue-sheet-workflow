@@ -482,8 +482,23 @@ function buildPerPageBriefText(originalText, pageHandle, pagePriceFromParser) {
   const pageInfoIdx = originalText.search(/PAGE INFO:/i);
   if (pageInfoIdx === -1) return null;
 
-  const headerPart = originalText.slice(0, pageInfoIdx);
+  let   headerPart = originalText.slice(0, pageInfoIdx);
   const infoPart   = originalText.slice(pageInfoIdx);
+
+  // Strip OTHER pages' per-page tracking links from the header/INSTRUCTIONS
+  // block. Affiliate briefs (FashionNova) list a unique UTM link per page up
+  // here, e.g. "@thefuck.tv - https://…utm_campaign=thefuck.tv" — one line
+  // per page. Without stripping, every page's brief copy carried all 4 pages'
+  // links. Keep ONLY this page's link line; leave all non-link lines (brand
+  // mentions like "Tag @FashionNova", bullets, etc.) untouched.
+  headerPart = headerPart
+    .split("\n")
+    .filter((ln) => {
+      const m = ln.match(/^\s*@([\w.]+)\s*-\s*https?:\/\//i);
+      if (!m) return true;                                       // not a per-page link
+      return m[1].toLowerCase() === pageHandle.toLowerCase();    // keep only this page's
+    })
+    .join("\n");
 
   // Find the original line for THIS handle inside PAGE INFO (verbatim).
   // Escape dots for regex (handles like "thefuck.tv", "secrets.jp").
@@ -2659,4 +2674,4 @@ async function handleAdMessage(ctx) {
   }
 }
 
-module.exports = { handleAdMessage, extractPostedOnDate };
+module.exports = { handleAdMessage, extractPostedOnDate, buildPerPageBriefText };

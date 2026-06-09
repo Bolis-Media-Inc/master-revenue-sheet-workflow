@@ -49,8 +49,22 @@ function parseAdMessage(text, date) {
   if (!headerMatch) return null;
 
   const client   = headerMatch[1].trim();
-  const category = headerMatch[2].trim();
+  let   category = headerMatch[2].trim();
   const adPrice  = parseFloat(headerMatch[3].replace(/,/g, ""));
+
+  // ── Normalize category to the master sheet's Ad Type dropdown value ─────
+  // Briefs type the category inconsistently — "E-com", "Ecom", "E-Commerce"
+  // — which trips the sheet's data-validation list ("Invalid: input must be
+  // an item on the specified list") and leaves the cell flagged. The only
+  // recurring offender is the E-Com family, so normalize just that (leaving
+  // every other category verbatim to avoid breaking valid values we're less
+  // sure about). Extend CATEGORY_CANON as more variants surface.
+  const CATEGORY_CANON = [
+    { pat: /^e[-\s]?com(?:m(?:erce)?)?$/i, out: "E-Com" },
+  ];
+  for (const c of CATEGORY_CANON) {
+    if (c.pat.test(category)) { category = c.out; break; }
+  }
 
   // ── PAGE INFO section ────────────────────────────────────────────────────────
   let timeMST  = "";
@@ -65,12 +79,25 @@ function parseAdMessage(text, date) {
       const line = lines[i];
 
       // Extract time: "NOW / 4:45 PM AZ" or "1-1:30pm AZ / 3pm EST" or "4:45 PM AZ"
+      // or affiliate-style "7-8pm PST / 10-11pm EST".
       if (!timeMST) {
         if (/^now\b/i.test(line)) {
           timeMST = "NOW";
         } else {
-          const timeMatch = line.match(/([\d]{1,2}(?:[-–][\d:]+)?(?::\d{2})?\s*(?:am|pm)?)\s*(?:AZ|MST)/i);
-          if (timeMatch) timeMST = timeMatch[1].trim().toUpperCase();
+          // Shared time-core: "7", "4:45", "7-8", "1-1:30", optional am/pm.
+          const TIME_CORE = "([\\d]{1,2}(?:[-–][\\d:apm]+)?(?::\\d{2})?\\s*(?:am|pm)?)";
+          // Prefer an explicit AZ/MST time.
+          const azMatch = line.match(new RegExp(`${TIME_CORE}\\s*(?:AZ|MST|MDT)`, "i"));
+          if (azMatch) {
+            timeMST = azMatch[1].trim().toUpperCase();
+          } else {
+            // Fall back to a Pacific time (PST/PDT/PT). For the summer ad
+            // calendar Pacific shares Mountain's offset (both UTC-7), so e.g.
+            // "7-8pm PST / 10-11pm EST" → "7-8PM". Without this, Pacific/
+            // Eastern-only time lines left the Time (MST) column blank.
+            const ptMatch = line.match(new RegExp(`${TIME_CORE}\\s*(?:PST|PDT|PT)\\b`, "i"));
+            if (ptMatch) timeMST = ptMatch[1].trim().toUpperCase();
+          }
         }
       }
 
