@@ -622,8 +622,69 @@ async function runPhase3Forward(ctx, session) {
   }
 }
 
+/**
+ * Re-ping the team about cover-assignment sessions still stuck in "awaiting".
+ * Called on a cron (index.js). Sends a gentle nudge to each session's
+ * prompt_chat_id (or the fallback alert chat) — spaced ~GAP_MIN apart, capped
+ * at MAX_REMINDERS so it's not spammy — until the session is resolved or
+ * expires. This is the safety net so a paused ad never rots unseen.
+ *
+ * @param {object} telegram        bot.telegram
+ * @param {string|number} fallbackChatId  where to ping if a session has no
+ *                                        prompt_chat_id (the monetization chat)
+ */
+async function remindAwaitingSessions(telegram, fallbackChatId) {
+  if (!supabase) return;
+  const MAX_REMINDERS = 4;          // stop nagging after this many
+  const GAP_MIN       = 30;         // minimum minutes between nudges
+  const nowIso  = new Date().toISOString();
+  const cutoff  = new Date(Date.now() - GAP_MIN * 60_000).toISOString();
+
+  let sessions = [];
+  try {
+    const { data, error } = await supabase
+      .from("pending_brief_assignments")
+      .select("id, prompt_chat_id, pages, unattributed, reminder_count, brief_text")
+      .eq("status", "awaiting")
+      .gt("expires_at", nowIso)
+      .lt("reminder_count", MAX_REMINDERS)
+      .or(`last_reminded_at.is.null,last_reminded_at.lt.${cutoff}`);
+    if (error) { console.error(`[resolve] remind query: ${error.message}`); return; }
+    sessions = data || [];
+  } catch (err) {
+    console.error(`[resolve] remind query threw: ${err.message}`);
+    return;
+  }
+
+  for (const s of sessions) {
+    const target = s.prompt_chat_id || fallbackChatId;
+    if (!target) continue;
+    const short    = s.id.slice(0, 8);
+    const pagesCt  = Array.isArray(s.pages) ? s.pages.length : 0;
+    const coversCt = Array.isArray(s.unattributed) ? s.unattributed.length : 0;
+    const firstLine = (s.brief_text || "").split("\n")[0].slice(0, 60);
+    const nth = (s.reminder_count || 0) + 1;
+    try {
+      await telegram.sendMessage(target,
+        `⏰ *Reminder ${nth}/${MAX_REMINDERS} — ad still needs cover assignment*\n` +
+        `\`${firstLine.replace(/[`*_\[]/g, (c) => "\\" + c)}\`\n` +
+        `${pagesCt} pages · ${coversCt} unnamed cover(s) waiting — not sent yet.\n` +
+        `Run \`/resolve ${short}\` to assign covers → pages and send it out.`,
+        { parse_mode: "Markdown" }
+      );
+      await supabase.from("pending_brief_assignments")
+        .update({ reminder_count: nth, last_reminded_at: new Date().toISOString() })
+        .eq("id", s.id);
+      console.log(`[resolve] ⏰ reminder ${nth}/${MAX_REMINDERS} sent for session ${short} → ${target}`);
+    } catch (err) {
+      console.error(`[resolve] reminder send failed for ${short}: ${err.message}`);
+    }
+  }
+}
+
 module.exports = {
   handleResolveCommand,
   handleAssignmentCallback,
   postAssignmentUI,
+  remindAwaitingSessions,
 };

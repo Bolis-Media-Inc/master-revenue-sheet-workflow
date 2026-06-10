@@ -28,6 +28,12 @@ const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
 const TAB_NAME        = process.env.SHEET_TAB_NAME      || "2026 Ad Overview";
 const PAGE_TAB_NAME   = process.env.PAGE_SHEET_TAB_NAME || "IG Revenue Tracker";
 
+// Where paused-ad / "needs /resolve" alerts go. The Monetization Team + AI
+// chat (SALES_TEAM_CHAT_ID) by default; RESOLVE_ALERT_CHAT_ID overrides.
+// Exported so the reminder cron (index.js) targets the same chat.
+const RESOLVE_ALERT_CHAT_ID =
+  (process.env.RESOLVE_ALERT_CHAT_ID || process.env.SALES_TEAM_CHAT_ID || "").trim() || null;
+
 // Set FORWARDING_ENABLED=true in env to turn on forwarding
 const FORWARDING_ENABLED = (process.env.FORWARDING_ENABLED || "").toLowerCase() === "true";
 
@@ -2626,14 +2632,15 @@ async function handleAdMessage(ctx) {
           const briefShort   = briefRowId.slice(0, 8);
           const briefSnippet = (ctx.message?.text || "").split("\n").slice(0, 2).join("\n");
           const ambKind = ambiguousNoLabels ? "no labels" : ambiguousLabelMiss ? "label-format misattribution" : "partial labels";
-          // Where to post the assignment prompt. Prefer the admin's DM
-          // (clean, private) when WIZARD_ADMIN_USER_ID is set; otherwise fall
-          // back to the SOURCE CHAT so a paused brief is NEVER silent. The
-          // old code only DM'd the admin — with WIZARD_ADMIN_USER_ID unset on
-          // the Tracker, the brief paused but nobody was ever asked (the SESH
-          // brief: session created, prompt_chat_id null, 0 prompts sent).
-          const promptTarget = adminId || ctx.chat?.id;
-          console.warn(`[adHandler] ⏸️ PAUSED BRIEF ${briefShort} — ${ambKind}, session ${sessionShort}, prompting ${adminId ? "admin DM" : "source chat"} ${promptTarget}`);
+          // Where to post the assignment prompt. Prefer the Monetization
+          // Team + AI chat (RESOLVE_ALERT_CHAT_ID / SALES_TEAM_CHAT_ID) so the
+          // team sees it + the reminder cron can re-ping there; then admin DM;
+          // then the source chat as a last resort so a paused brief is NEVER
+          // silent (the SESH brief paused with WIZARD_ADMIN_USER_ID unset →
+          // session created, prompt_chat_id null, 0 prompts sent).
+          const promptTarget = RESOLVE_ALERT_CHAT_ID || adminId || ctx.chat?.id;
+          const promptWhere = RESOLVE_ALERT_CHAT_ID ? "monetization chat" : adminId ? "admin DM" : "source chat";
+          console.warn(`[adHandler] ⏸️ PAUSED BRIEF ${briefShort} — ${ambKind}, session ${sessionShort}, prompting ${promptWhere} ${promptTarget}`);
 
           if (promptTarget) {
             // Heads-up first, then the interactive UI (per-cover prompts with

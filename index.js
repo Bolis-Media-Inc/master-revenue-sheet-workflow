@@ -31,7 +31,10 @@ const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 // cover with inline page-buttons. Each tap saves to pending_brief_assignments.
 // Phase 3 (queued #36) wires the "all assigned" terminal state into actual
 // re-forwarding. For now it just produces the mapping for manual /replay.
-const { handleResolveCommand, handleAssignmentCallback } = require("./handlers/resolveHandler");
+const { handleResolveCommand, handleAssignmentCallback, remindAwaitingSessions } = require("./handlers/resolveHandler");
+// Where paused-ad reminders go when a session has no prompt_chat_id — the
+// Monetization Team + AI chat.
+const RESOLVE_ALERT_CHAT_ID = (process.env.RESOLVE_ALERT_CHAT_ID || process.env.SALES_TEAM_CHAT_ID || "").trim() || null;
 bot.command("resolve", handleResolveCommand);
 bot.action(/^ca:[0-9a-f-]+:[^:]+:.+$/, handleAssignmentCallback);
 
@@ -174,6 +177,16 @@ bot.on("my_chat_member", async (ctx) => {
 cron.schedule("*/15 * * * *", () => {
   checkAndFireReminders(bot.telegram).catch((err) =>
     console.error("[cron] reminders error:", err.message)
+  );
+});
+
+// ── Paused-ad reminder — poll every 15 minutes ───────────────────────────────
+// Re-pings the Monetization Team + AI chat about any cover-assignment session
+// still stuck in "awaiting" (gentle, capped at a few nudges, ~30 min apart)
+// so a paused ad never rots unseen. See resolveHandler.remindAwaitingSessions.
+cron.schedule("*/15 * * * *", () => {
+  remindAwaitingSessions(bot.telegram, RESOLVE_ALERT_CHAT_ID).catch((err) =>
+    console.error("[cron] resolve-reminder error:", err.message)
   );
 });
 
