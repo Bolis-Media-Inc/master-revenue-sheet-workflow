@@ -1649,7 +1649,11 @@ async function handleSortSheetsCommand(ctx) {
   const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
   if (adminId && ctx.from?.id !== adminId) return;
 
-  const cmdText = (ctx.message?.text || "").trim();
+  // Strip the command token + any "@botname" mention BEFORE parsing page
+  // handles — otherwise "/sortsheets@bm_tracking_bot" (how you'd address the
+  // bot in a multi-bot group like Monetization Team) gets misread as a page
+  // filter for "@bm_tracking_bot" and matches nothing.
+  const cmdText = (ctx.message?.text || "").trim().replace(/^\/sortsheets(?:@\w+)?\s*/i, "");
   const requested = (cmdText.match(/@([\w.]+)/g) || []).map((h) => h.slice(1).toLowerCase());
 
   const allPages = pagesRegistry.listAllSync ? pagesRegistry.listAllSync() : [];
