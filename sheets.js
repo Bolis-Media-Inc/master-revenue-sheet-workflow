@@ -470,10 +470,16 @@ async function maybeInsertDayDivider(spreadsheetId, tabName, briefDateStr, opts 
  * ascending by date.
  *
  * Approach: dates are stored as TEXT ("Mon 3/9/26") so a plain column sort is
- * lexically wrong. Instead we (1) write a numeric YYYYMMDD key into a scratch
- * column, (2) use a native sortRange request — which moves ENTIRE rows incl.
- * their formatting/validation, so nothing misaligns — keyed on the scratch
- * column, then (3) clear the scratch column.
+ * lexically wrong. Instead we (1) APPEND a temporary scratch column at the end
+ * of the grid and write a numeric YYYYMMDD key into it, (2) use a native
+ * sortRange request — which moves ENTIRE rows incl. their formatting, so
+ * nothing misaligns — keyed on that scratch column, then (3) DELETE the
+ * scratch column entirely.
+ *
+ * The append+delete (vs a fixed scratch column like "T") is load-bearing:
+ * per-page rev sheets ship with a FIXED 11-column grid (A–K), so writing to a
+ * far column fails with "exceeds grid limits". Appending guarantees a real,
+ * empty, in-bounds column regardless of the sheet's width.
  *
  * Header rows are auto-detected: the first row whose Date cell parses as a
  * date is the first data row; everything above it is left in place. Rows with
@@ -485,13 +491,15 @@ async function maybeInsertDayDivider(spreadsheetId, tabName, briefDateStr, opts 
  *
  * @returns {Promise<{sorted: boolean, rows?: number, reason?: string}>}
  */
+function _colLetter(idx0) {
+  let n = idx0 + 1, s = "";
+  while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); }
+  return s;
+}
+
 async function sortSheetByDate(spreadsheetId, tabName, opts = {}) {
   const dateColLetter = opts.dateColumn || "D";
-  // Scratch key column — chosen well past the A:H data schema but within the
-  // default 26-col grid. Per-page sheets don't use columns this far right.
-  const keyColLetter  = opts.keyColumn  || "T";
   const dateColIdx0   = dateColLetter.toUpperCase().charCodeAt(0) - 65; // 0-indexed
-  const keyColIdx0    = keyColLetter.toUpperCase().charCodeAt(0) - 65;
 
   const auth   = getAuth();
   const client = await auth.getClient();
@@ -529,51 +537,74 @@ async function sortSheetByDate(spreadsheetId, tabName, opts = {}) {
   const dataCount = lastDataRow - firstDataRow + 1;
   if (dataCount < 2) return { sorted: false, reason: "fewer than 2 data rows" };
 
-  // Resolve numeric sheetId for the tab.
+  // Resolve numeric sheetId + current column count for the tab.
   const meta  = await sheets.spreadsheets.get({ spreadsheetId });
   const sheet = meta.data.sheets?.find((s) => s.properties.title === tabName);
   if (!sheet) return { sorted: false, reason: `tab "${tabName}" not found` };
-  const sheetId = sheet.properties.sheetId;
+  const sheetId  = sheet.properties.sheetId;
+  const colCount = sheet.properties.gridProperties?.columnCount || 11;
+  const scratchIdx0 = colCount;                 // new column appended at the end
+  const scratchLetter = _colLetter(scratchIdx0);
 
-  // 1. Write YYYYMMDD keys into the scratch column for each data row.
-  //    Undated rows get "" (Sheets sorts blanks last on ascending).
-  const keyValues = [];
-  for (let r = firstDataRow; r <= lastDataRow; r++) {
-    const k = dateKey(rows[r - 1]?.[dateColIdx0]);
-    keyValues.push([k != null ? k : ""]);
-  }
-  await sheets.spreadsheets.values.update({
-    spreadsheetId,
-    range: `${tabName}!${keyColLetter}${firstDataRow}:${keyColLetter}${lastDataRow}`,
-    valueInputOption: "RAW",
-    requestBody: { values: keyValues },
-  });
-
-  // 2. Native sortRange over A..scratch, keyed on the scratch column ASC.
-  //    Moves entire rows (with formatting) — no value-rewrite misalignment.
+  // 1. Append a temporary scratch column at the end of the grid (guaranteed
+  //    empty + in-bounds, unlike a fixed far column on a narrow grid).
   await sheets.spreadsheets.batchUpdate({
     spreadsheetId,
     requestBody: {
       requests: [{
-        sortRange: {
-          range: {
-            sheetId,
-            startRowIndex:    firstDataRow - 1,
-            endRowIndex:      lastDataRow,
-            startColumnIndex: 0,
-            endColumnIndex:   keyColIdx0 + 1,
-          },
-          sortSpecs: [{ dimensionIndex: keyColIdx0, sortOrder: "ASCENDING" }],
-        },
+        appendDimension: { sheetId, dimension: "COLUMNS", length: 1 },
       }],
     },
   });
 
-  // 3. Clear the scratch column.
-  await sheets.spreadsheets.values.clear({
-    spreadsheetId,
-    range: `${tabName}!${keyColLetter}${firstDataRow}:${keyColLetter}${lastDataRow}`,
-  });
+  try {
+    // 2. Write YYYYMMDD keys into the scratch column for each data row.
+    //    Undated rows get "" (Sheets sorts blanks last on ascending).
+    const keyValues = [];
+    for (let r = firstDataRow; r <= lastDataRow; r++) {
+      const k = dateKey(rows[r - 1]?.[dateColIdx0]);
+      keyValues.push([k != null ? k : ""]);
+    }
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `${tabName}!${scratchLetter}${firstDataRow}:${scratchLetter}${lastDataRow}`,
+      valueInputOption: "RAW",
+      requestBody: { values: keyValues },
+    });
+
+    // 3. Native sortRange over A..scratch, keyed on the scratch column ASC.
+    //    Moves entire rows (with formatting) — no value-rewrite misalignment.
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests: [{
+          sortRange: {
+            range: {
+              sheetId,
+              startRowIndex:    firstDataRow - 1,
+              endRowIndex:      lastDataRow,
+              startColumnIndex: 0,
+              endColumnIndex:   scratchIdx0 + 1,
+            },
+            sortSpecs: [{ dimensionIndex: scratchIdx0, sortOrder: "ASCENDING" }],
+          },
+        }],
+      },
+    });
+  } finally {
+    // 4. Always delete the scratch column, even if the sort step threw —
+    //    never leave a stray column behind.
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests: [{
+          deleteDimension: {
+            range: { sheetId, dimension: "COLUMNS", startIndex: scratchIdx0, endIndex: scratchIdx0 + 1 },
+          },
+        }],
+      },
+    }).catch((err) => console.error(`[sheets] sortSheetByDate scratch-column cleanup: ${err.message}`));
+  }
 
   return { sorted: true, rows: dataCount };
 }
