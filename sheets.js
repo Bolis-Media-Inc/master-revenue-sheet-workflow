@@ -632,6 +632,63 @@ async function findRowsInColumn(spreadsheetId, tabName, colLetter, regex) {
 }
 
 /**
+ * Find DUPLICATE ad entries in a per-page sheet — rows that share the same
+ * (client + date + price) within the given months. Read-only.
+ *
+ * Per-page schema: A=Client, B=Ad Type, C=Bulk#, D=Date, E=Post Type,
+ * F=Post Duration, G=Ad Price, H=Notes.
+ *
+ * @param opts.months  array of 1-indexed months to include (e.g. [4,5])
+ * @param opts.year     filter to this 2-digit-equiv year (default 2026)
+ * @param opts.minPrice only count rows with price > this (default 0)
+ * @returns [{ client, date, price, count, rows:[rowNums] }] for groups ≥2
+ */
+async function findDuplicateRows(spreadsheetId, tabName, opts = {}) {
+  const months   = opts.months   || [4, 5];
+  const year      = opts.year     || 2026;
+  const minPrice  = opts.minPrice != null ? opts.minPrice : 0;
+
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = getThrottledSheets(client);
+
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId, range: `${tabName}!A:G`,
+  });
+  const rows = resp.data.values || [];
+
+  const parseDate = (s) => {
+    const m = String(s || "").match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+    if (!m) return null;
+    let y = +m[3]; if (y < 100) y += 2000;
+    return { mo: +m[1], d: +m[2], y, key: `${+m[1]}/${+m[2]}/${String(y).slice(-2)}` };
+  };
+  const parsePrice = (s) => {
+    const n = parseFloat(String(s || "").replace(/[$,]/g, ""));
+    return Number.isFinite(n) ? n : null;
+  };
+
+  const groups = new Map(); // key → { client, date, price, rows:[] }
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const clientCell = (r?.[0] || "").trim();
+    const dt = parseDate(r?.[3]);
+    const price = parsePrice(r?.[6]);
+    if (!clientCell || !dt) continue;
+    if (!months.includes(dt.mo) || dt.y !== year) continue;
+    if (price == null || price <= minPrice) continue;
+
+    const key = `${clientCell.toLowerCase()}|${dt.key}|${price}`;
+    if (!groups.has(key)) groups.set(key, { client: clientCell, date: dt.key, price, rows: [] });
+    groups.get(key).rows.push(i + 1);
+  }
+
+  return [...groups.values()]
+    .filter((g) => g.rows.length >= 2)
+    .map((g) => ({ ...g, count: g.rows.length }));
+}
+
+/**
  * Get the date value from the last populated row in column D (Date column).
  * Returns a normalised date string like "Fri 3/6/26", or null if not found.
  */
@@ -1229,7 +1286,7 @@ async function applyColumnCenterAlignment(spreadsheetId, tabName, endColumn = "K
 module.exports = {
   appendRow, markForwarded, markForwardedBatch,
   applyCenterAlignmentBatch, applyColumnCenterAlignment,
-  getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn,
+  getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows,
   updateStatusToLive, updateAdPrice, updateAdClient, updateAdDate, deleteAdRows,
   appendReminder, appendRemindersBatch, getPendingReminders, markReminderSent,
 };

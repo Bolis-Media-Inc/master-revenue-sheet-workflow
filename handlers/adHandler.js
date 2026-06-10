@@ -12,7 +12,7 @@
  */
 
 const { parseAdMessage }       = require("../parser");
-const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn } = require("../sheets");
+const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows } = require("../sheets");
 const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages, getStandardBundle } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
@@ -1782,6 +1782,80 @@ async function handleAuditNifCommand(ctx) {
   else await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
 }
 
+/**
+ * /auditdupes [month …] — read-only audit. Scans every enabled per-page
+ * sheet for DUPLICATE ad entries: rows sharing the same client + date +
+ * price (price > $0) within the target months. Defaults to April + May
+ * (this year). Reports per-page; makes NO edits.
+ */
+async function handleAuditDupesCommand(ctx) {
+  const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+  if (adminId && ctx.from?.id !== adminId) return;
+
+  const cmdText = (ctx.message?.text || "").trim();
+  const monthArgs = (cmdText.match(/\b(1[0-2]|[1-9])\b/g) || []).map(Number);
+  const months = monthArgs.length > 0 ? monthArgs : [4, 5]; // default Apr+May
+  const monthNames = months.map((m) => ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][m]).join(" + ");
+
+  const allPages = pagesRegistry.listAllSync ? pagesRegistry.listAllSync() : [];
+  const targets = allPages.filter((p) => p.sheet_id && !PLACEHOLDER_PATTERN.test(p.sheet_id));
+  if (targets.length === 0) { await ctx.reply("⚠️ No per-page sheets to audit.").catch(() => {}); return; }
+
+  const statusMsg = await ctx.reply(`⏳ Scanning ${targets.length} sheet(s) for duplicate >$0 entries in ${monthNames}…`).catch(() => null);
+  const editStatus = async (t) => {
+    if (!statusMsg) return;
+    try { await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, t, { parse_mode: "Markdown" }); }
+    catch (err) { if (!/not modified/i.test(err.message || "")) console.error(`[adHandler] /auditdupes editStatus: ${err.message}`); }
+  };
+
+  const pagesWithDupes = []; // { handle, dupes:[{client,date,price,count,rows}] }
+  let processed = 0, scanned = 0, failed = 0, totalDupeGroups = 0, lastEdit = Date.now();
+
+  for (const page of targets) {
+    try {
+      const dupes = await findDuplicateRows(page.sheet_id, PAGE_TAB_NAME, { months, year: 2026, minPrice: 0 });
+      scanned++;
+      if (dupes.length > 0) {
+        pagesWithDupes.push({ handle: page.handle, dupes });
+        totalDupeGroups += dupes.length;
+      }
+    } catch (err) {
+      failed++;
+      console.error(`[adHandler] /auditdupes @${page.handle}: ${err.message}`);
+    }
+    processed++;
+    if (Date.now() - lastEdit > 5000) {
+      editStatus(`🔎 *Duplicate audit (${monthNames})*\n${processed}/${targets.length} scanned · ${totalDupeGroups} dup group(s) on ${pagesWithDupes.length} page(s)${failed ? ` · ${failed} failed` : ""}`).catch(() => {});
+      lastEdit = Date.now();
+    }
+  }
+
+  const lines = [
+    `🔎 *Duplicate-entry audit done* (${monthNames}, >$0)`,
+    "",
+    `Scanned: ${scanned}/${targets.length} sheets${failed ? ` · ${failed} failed` : ""}`,
+    `Found: *${totalDupeGroups}* duplicate group(s) across *${pagesWithDupes.length}* page(s)`,
+  ];
+  if (pagesWithDupes.length > 0) {
+    lines.push("");
+    let shown = 0;
+    for (const pg of pagesWithDupes) {
+      if (shown >= 25) { lines.push(`…and more (full list in logs)`); break; }
+      lines.push(`*@${pg.handle}*`);
+      for (const d of pg.dupes) {
+        if (shown >= 25) break;
+        lines.push(`• ${d.client} · ${d.date} · $${d.price} ×${d.count} (rows ${d.rows.join(", ")})`);
+        shown++;
+      }
+    }
+    console.log(`[adHandler] /auditdupes full result:`, JSON.stringify(pagesWithDupes));
+  } else {
+    lines.push("", "✅ No duplicate >$0 entries found.");
+  }
+  if (statusMsg) await editStatus(lines.join("\n"));
+  else await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
+}
+
 async function handleAdMessage(ctx) {
   try {
     const text = ctx.message?.text || ctx.message?.caption;
@@ -1825,6 +1899,13 @@ async function handleAdMessage(ctx) {
     // only; makes no edits.
     if (text && /^\/auditnif\b/i.test(text.trim())) {
       return await handleAuditNifCommand(ctx);
+    }
+
+    // /auditdupes [months] — read-only scan for duplicate ad entries (same
+    // client + date + price, price > $0) in every per-page sheet. Defaults to
+    // April + May; pass numbers to override (e.g. "/auditdupes 3 4 5").
+    if (text && /^\/auditdupes\b/i.test(text.trim())) {
+      return await handleAuditDupesCommand(ctx);
     }
 
     const chatId = String(ctx.chat?.id);
