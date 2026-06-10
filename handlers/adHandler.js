@@ -12,7 +12,7 @@
  */
 
 const { parseAdMessage }       = require("../parser");
-const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate } = require("../sheets");
+const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn } = require("../sheets");
 const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages, getStandardBundle } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
@@ -1722,6 +1722,66 @@ async function handleSortSheetsCommand(ctx) {
   else await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
 }
 
+/**
+ * /auditnif — read-only audit. Scans every enabled per-page sheet's Post
+ * Duration column (F) for cells containing "NIF" (legacy rows where the old
+ * parser dumped a NIF into the duration column). Reports counts + the
+ * offending page/row/value. Makes NO edits.
+ */
+async function handleAuditNifCommand(ctx) {
+  const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+  if (adminId && ctx.from?.id !== adminId) return;
+
+  const allPages = pagesRegistry.listAllSync ? pagesRegistry.listAllSync() : [];
+  const targets = allPages.filter((p) => p.sheet_id && !PLACEHOLDER_PATTERN.test(p.sheet_id));
+  if (targets.length === 0) { await ctx.reply("⚠️ No per-page sheets to audit.").catch(() => {}); return; }
+
+  const statusMsg = await ctx.reply(`⏳ Scanning ${targets.length} per-page sheet(s) for NIF-in-Duration…`).catch(() => null);
+  const editStatus = async (t) => {
+    if (!statusMsg) return;
+    try { await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, t, { parse_mode: "Markdown" }); }
+    catch (err) { if (!/not modified/i.test(err.message || "")) console.error(`[adHandler] /auditnif editStatus: ${err.message}`); }
+  };
+
+  const NIF_RE = /\bnif\b/i;
+  const found = []; // { handle, row, value }
+  let processed = 0, scanned = 0, failed = 0, lastEdit = Date.now();
+
+  for (const page of targets) {
+    try {
+      const hits = await findRowsInColumn(page.sheet_id, PAGE_TAB_NAME, "F", NIF_RE);
+      scanned++;
+      for (const h of hits) found.push({ handle: page.handle, row: h.row, value: h.value });
+    } catch (err) {
+      failed++;
+      console.error(`[adHandler] /auditnif @${page.handle}: ${err.message}`);
+    }
+    processed++;
+    if (Date.now() - lastEdit > 5000) {
+      editStatus(`🔎 *NIF audit*\n${processed}/${targets.length} scanned · ${found.length} hit(s)${failed ? ` · ${failed} failed` : ""}`).catch(() => {});
+      lastEdit = Date.now();
+    }
+  }
+
+  const lines = [
+    `🔎 *NIF-in-Duration audit done*`,
+    "",
+    `Scanned: ${scanned}/${targets.length} per-page sheets${failed ? ` · ${failed} failed` : ""}`,
+    `Found: *${found.length}* row(s) with NIF in Post Duration`,
+  ];
+  if (found.length > 0) {
+    lines.push("", "*Offending rows:*");
+    found.slice(0, 25).forEach((f) => lines.push(`• @${f.handle} row ${f.row}: \`${f.value.slice(0, 40)}\``));
+    if (found.length > 25) lines.push(`…and ${found.length - 25} more (see logs)`);
+    console.log(`[adHandler] /auditnif full list:`, JSON.stringify(found));
+    lines.push("", "_Reply `/fixnif` to blank these (not built yet — tell me to add it)._");
+  } else {
+    lines.push("", "✅ Clean — no NIF values in any Post Duration column.");
+  }
+  if (statusMsg) await editStatus(lines.join("\n"));
+  else await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
+}
+
 async function handleAdMessage(ctx) {
   try {
     const text = ctx.message?.text || ctx.message?.caption;
@@ -1758,6 +1818,13 @@ async function handleAdMessage(ctx) {
     // first). Master sheet excluded (its colored rows + day-bars need care).
     if (text && /^\/sortsheets\b/i.test(text.trim())) {
       return await handleSortSheetsCommand(ctx);
+    }
+
+    // /auditnif — read-only scan of every per-page sheet's Post Duration
+    // column (F) for stray "… NIF" values (legacy pre-fix rows). Reports
+    // only; makes no edits.
+    if (text && /^\/auditnif\b/i.test(text.trim())) {
+      return await handleAuditNifCommand(ctx);
     }
 
     const chatId = String(ctx.chat?.id);

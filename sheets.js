@@ -610,6 +610,28 @@ async function sortSheetByDate(spreadsheetId, tabName, opts = {}) {
 }
 
 /**
+ * Scan a single column for cells whose value matches a regex. Read-only.
+ * Returns [{ row, value }] (1-indexed rows). Used by the NIF-in-Duration
+ * audit to surface legacy rows where the old parser dumped a NIF into the
+ * Post Duration column.
+ */
+async function findRowsInColumn(spreadsheetId, tabName, colLetter, regex) {
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = getThrottledSheets(client);
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId, range: `${tabName}!${colLetter}:${colLetter}`, majorDimension: "COLUMNS",
+  });
+  const col = (resp.data.values && resp.data.values[0]) || [];
+  const hits = [];
+  for (let i = 0; i < col.length; i++) {
+    const v = col[i];
+    if (v != null && regex.test(String(v))) hits.push({ row: i + 1, value: String(v) });
+  }
+  return hits;
+}
+
+/**
  * Get the date value from the last populated row in column D (Date column).
  * Returns a normalised date string like "Fri 3/6/26", or null if not found.
  */
@@ -1207,7 +1229,7 @@ async function applyColumnCenterAlignment(spreadsheetId, tabName, endColumn = "K
 module.exports = {
   appendRow, markForwarded, markForwardedBatch,
   applyCenterAlignmentBatch, applyColumnCenterAlignment,
-  getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate,
+  getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn,
   updateStatusToLive, updateAdPrice, updateAdClient, updateAdDate, deleteAdRows,
   appendReminder, appendRemindersBatch, getPendingReminders, markReminderSent,
 };
