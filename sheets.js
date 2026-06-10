@@ -463,6 +463,122 @@ async function maybeInsertDayDivider(spreadsheetId, tabName, briefDateStr, opts 
 }
 
 /**
+ * Sort a sheet's data rows chronologically by the Date column.
+ *
+ * Per-page rev sheets accumulate entries in append order, which drifts out of
+ * date order (backdated briefs, /replay, manual edits). This re-sorts them
+ * ascending by date.
+ *
+ * Approach: dates are stored as TEXT ("Mon 3/9/26") so a plain column sort is
+ * lexically wrong. Instead we (1) write a numeric YYYYMMDD key into a scratch
+ * column, (2) use a native sortRange request — which moves ENTIRE rows incl.
+ * their formatting/validation, so nothing misaligns — keyed on the scratch
+ * column, then (3) clear the scratch column.
+ *
+ * Header rows are auto-detected: the first row whose Date cell parses as a
+ * date is the first data row; everything above it is left in place. Rows with
+ * no parseable date sort to the bottom.
+ *
+ * Safe for per-page sheets because per-page updates (price/date/status) locate
+ * rows by CONTENT (client name), not stored row number — so re-ordering can't
+ * misdirect a later /update.
+ *
+ * @returns {Promise<{sorted: boolean, rows?: number, reason?: string}>}
+ */
+async function sortSheetByDate(spreadsheetId, tabName, opts = {}) {
+  const dateColLetter = opts.dateColumn || "D";
+  // Scratch key column — chosen well past the A:H data schema but within the
+  // default 26-col grid. Per-page sheets don't use columns this far right.
+  const keyColLetter  = opts.keyColumn  || "T";
+  const dateColIdx0   = dateColLetter.toUpperCase().charCodeAt(0) - 65; // 0-indexed
+  const keyColIdx0    = keyColLetter.toUpperCase().charCodeAt(0) - 65;
+
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = getThrottledSheets(client);
+
+  const dateKey = (s) => {
+    const m = String(s || "").match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+    if (!m) return null;
+    const mo = +m[1], d = +m[2];
+    let y = +m[3]; if (y < 100) y += 2000;
+    return y * 10000 + mo * 100 + d;
+  };
+
+  // Read A..date column to find the data extent + parse date keys.
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId, range: `${tabName}!A:${dateColLetter}`,
+  });
+  const rows = resp.data.values || [];
+  if (rows.length === 0) return { sorted: false, reason: "empty sheet" };
+
+  // First data row = first row whose Date cell parses (1-indexed).
+  let firstDataRow = -1;
+  for (let i = 0; i < rows.length; i++) {
+    if (dateKey(rows[i]?.[dateColIdx0])) { firstDataRow = i + 1; break; }
+  }
+  if (firstDataRow === -1) return { sorted: false, reason: "no dated rows" };
+
+  // Last data row = last row with ANY content in A..date column.
+  let lastDataRow = firstDataRow;
+  for (let i = rows.length - 1; i >= firstDataRow - 1; i--) {
+    if ((rows[i] || []).some((c) => c != null && String(c).trim() !== "")) {
+      lastDataRow = i + 1; break;
+    }
+  }
+  const dataCount = lastDataRow - firstDataRow + 1;
+  if (dataCount < 2) return { sorted: false, reason: "fewer than 2 data rows" };
+
+  // Resolve numeric sheetId for the tab.
+  const meta  = await sheets.spreadsheets.get({ spreadsheetId });
+  const sheet = meta.data.sheets?.find((s) => s.properties.title === tabName);
+  if (!sheet) return { sorted: false, reason: `tab "${tabName}" not found` };
+  const sheetId = sheet.properties.sheetId;
+
+  // 1. Write YYYYMMDD keys into the scratch column for each data row.
+  //    Undated rows get "" (Sheets sorts blanks last on ascending).
+  const keyValues = [];
+  for (let r = firstDataRow; r <= lastDataRow; r++) {
+    const k = dateKey(rows[r - 1]?.[dateColIdx0]);
+    keyValues.push([k != null ? k : ""]);
+  }
+  await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range: `${tabName}!${keyColLetter}${firstDataRow}:${keyColLetter}${lastDataRow}`,
+    valueInputOption: "RAW",
+    requestBody: { values: keyValues },
+  });
+
+  // 2. Native sortRange over A..scratch, keyed on the scratch column ASC.
+  //    Moves entire rows (with formatting) — no value-rewrite misalignment.
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: [{
+        sortRange: {
+          range: {
+            sheetId,
+            startRowIndex:    firstDataRow - 1,
+            endRowIndex:      lastDataRow,
+            startColumnIndex: 0,
+            endColumnIndex:   keyColIdx0 + 1,
+          },
+          sortSpecs: [{ dimensionIndex: keyColIdx0, sortOrder: "ASCENDING" }],
+        },
+      }],
+    },
+  });
+
+  // 3. Clear the scratch column.
+  await sheets.spreadsheets.values.clear({
+    spreadsheetId,
+    range: `${tabName}!${keyColLetter}${firstDataRow}:${keyColLetter}${lastDataRow}`,
+  });
+
+  return { sorted: true, rows: dataCount };
+}
+
+/**
  * Get the date value from the last populated row in column D (Date column).
  * Returns a normalised date string like "Fri 3/6/26", or null if not found.
  */
@@ -1060,7 +1176,7 @@ async function applyColumnCenterAlignment(spreadsheetId, tabName, endColumn = "K
 module.exports = {
   appendRow, markForwarded, markForwardedBatch,
   applyCenterAlignmentBatch, applyColumnCenterAlignment,
-  getLastDate, appendSeparatorRow, maybeInsertDayDivider,
+  getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate,
   updateStatusToLive, updateAdPrice, updateAdClient, updateAdDate, deleteAdRows,
   appendReminder, appendRemindersBatch, getPendingReminders, markReminderSent,
 };

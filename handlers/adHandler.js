@@ -12,7 +12,7 @@
  */
 
 const { parseAdMessage }       = require("../parser");
-const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider } = require("../sheets");
+const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate } = require("../sheets");
 const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages, getStandardBundle } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
@@ -1637,6 +1637,87 @@ async function handleCenterSheetsCommand(ctx) {
   }
 }
 
+/**
+ * /sortsheets [@handle …] — re-sort per-page rev sheets chronologically by
+ * date. With @handles, sorts only those (good for eyeballing one first).
+ * Without, sorts every enabled per-page sheet. Master sheet is excluded.
+ *
+ * Safe: per-page price/date/status updates locate rows by client name, not
+ * stored row number, so re-ordering never misdirects a later /update.
+ */
+async function handleSortSheetsCommand(ctx) {
+  const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+  if (adminId && ctx.from?.id !== adminId) return;
+
+  const cmdText = (ctx.message?.text || "").trim();
+  const requested = (cmdText.match(/@([\w.]+)/g) || []).map((h) => h.slice(1).toLowerCase());
+
+  const allPages = pagesRegistry.listAllSync ? pagesRegistry.listAllSync() : [];
+  let targets = allPages.filter((p) => p.sheet_id && !PLACEHOLDER_PATTERN.test(p.sheet_id));
+  if (requested.length > 0) {
+    const want = new Set(requested.map((h) => pagesRegistry.resolveHandle(h) || h));
+    targets = targets.filter((p) => want.has((p.handle || "").toLowerCase()));
+  }
+
+  if (targets.length === 0) {
+    await ctx.reply("⚠️ No matching per-page sheets to sort.").catch(() => {});
+    return;
+  }
+
+  const statusMsg = await ctx.reply(
+    `⏳ Sorting ${targets.length} per-page sheet(s) chronologically by date…`
+  ).catch(() => null);
+  const editStatus = async (t) => {
+    if (!statusMsg) return;
+    try {
+      await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, t, { parse_mode: "Markdown" });
+    } catch (err) {
+      if (!/not modified/i.test(err.message || "")) console.error(`[adHandler] /sortsheets editStatus: ${err.message}`);
+    }
+  };
+
+  let sorted = 0, skipped = 0, failed = 0, processed = 0;
+  const errors = [];
+  let lastEdit = Date.now();
+
+  for (const page of targets) {
+    try {
+      const res = await sortSheetByDate(page.sheet_id, PAGE_TAB_NAME);
+      if (res.sorted) {
+        sorted++;
+        console.log(`[adHandler] 🔢 /sortsheets @${page.handle}: sorted ${res.rows} rows`);
+      } else {
+        skipped++;
+        console.log(`[adHandler] ⏭️ /sortsheets @${page.handle}: skipped (${res.reason})`);
+      }
+    } catch (err) {
+      failed++;
+      errors.push(`@${page.handle}: ${err.message}`);
+      console.error(`[adHandler] ❌ /sortsheets @${page.handle}: ${err.message}`);
+    }
+    processed++;
+    if (Date.now() - lastEdit > 5000) {
+      editStatus(`🔢 *Sorting sheets*\n${processed}/${targets.length} done · ${sorted} sorted${skipped ? ` · ${skipped} skipped` : ""}${failed ? ` · ${failed} failed` : ""}`).catch(() => {});
+      lastEdit = Date.now();
+    }
+  }
+
+  const lines = [
+    `🔢 *SortSheets done*`,
+    "",
+    `✅ sorted: ${sorted}`,
+    skipped > 0 ? `⏭️ skipped: ${skipped} (no dated rows / <2 rows)` : null,
+    failed > 0 ? `❌ failed: ${failed}` : null,
+  ].filter(Boolean);
+  if (errors.length > 0) {
+    lines.push("", "*Errors*:");
+    errors.slice(0, 10).forEach((e) => lines.push(`• \`${e.slice(0, 150)}\``));
+    if (errors.length > 10) lines.push(`…and ${errors.length - 10} more (see logs)`);
+  }
+  if (statusMsg) await editStatus(lines.join("\n"));
+  else await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
+}
+
 async function handleAdMessage(ctx) {
   try {
     const text = ctx.message?.text || ctx.message?.caption;
@@ -1666,6 +1747,13 @@ async function handleAdMessage(ctx) {
     // column formatting, so no per-write API cost.
     if (text && /^\/centersheets\b/i.test(text.trim())) {
       return await handleCenterSheetsCommand(ctx);
+    }
+
+    // /sortsheets [@handle …] — re-sort per-page rev sheet(s) chronologically
+    // by date. No args = all enabled pages; @handles = just those (test one
+    // first). Master sheet excluded (its colored rows + day-bars need care).
+    if (text && /^\/sortsheets\b/i.test(text.trim())) {
+      return await handleSortSheetsCommand(ctx);
     }
 
     const chatId = String(ctx.chat?.id);
