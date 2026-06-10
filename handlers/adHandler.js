@@ -2626,32 +2626,41 @@ async function handleAdMessage(ctx) {
           const briefShort   = briefRowId.slice(0, 8);
           const briefSnippet = (ctx.message?.text || "").split("\n").slice(0, 2).join("\n");
           const ambKind = ambiguousNoLabels ? "no labels" : ambiguousLabelMiss ? "label-format misattribution" : "partial labels";
-          console.warn(`[adHandler] ⏸️ PAUSED BRIEF ${briefShort} — ${ambKind}, session ${sessionShort}, auto-triggering assignment UI`);
+          // Where to post the assignment prompt. Prefer the admin's DM
+          // (clean, private) when WIZARD_ADMIN_USER_ID is set; otherwise fall
+          // back to the SOURCE CHAT so a paused brief is NEVER silent. The
+          // old code only DM'd the admin — with WIZARD_ADMIN_USER_ID unset on
+          // the Tracker, the brief paused but nobody was ever asked (the SESH
+          // brief: session created, prompt_chat_id null, 0 prompts sent).
+          const promptTarget = adminId || ctx.chat?.id;
+          console.warn(`[adHandler] ⏸️ PAUSED BRIEF ${briefShort} — ${ambKind}, session ${sessionShort}, prompting ${adminId ? "admin DM" : "source chat"} ${promptTarget}`);
 
-          if (adminId) {
-            // Send heads-up first, then the interactive UI (header + per-cover
-            // prompts with buttons). Operator never needs to type /resolve
-            // manually — the bot proactively asks the questions.
+          if (promptTarget) {
+            // Heads-up first, then the interactive UI (per-cover prompts with
+            // page buttons). Operator never needs to type /resolve manually.
             try {
-              await ctx.telegram.sendMessage(adminId,
-                "⏸️ *Brief paused — assigning covers below*\n" +
+              await ctx.telegram.sendMessage(promptTarget,
+                "⏸️ *Brief paused — needs cover assignment*\n" +
                 "─────────────────────────\n" +
                 `*Brief:* \`${briefSnippet.replace(/[_*`\[]/g, (c) => "\\" + c).slice(0, 160)}…\`\n` +
                 `*Pages:* ${briefHandleCount} · *Unlabeled covers:* ${unattributedRefs.length} · *Type:* ${ambiguousNoLabels ? "no labels at all" : "partial labels"}\n\n` +
                 "Per-page forwarding *did not run* — would have misattributed covers.\n" +
-                "Tap a page button under each cover below to assign. Phase 3 auto-forwards when all are done.",
+                `Tap a page button under each cover below to assign (or run \`/resolve ${sessionShort}\`). Auto-forwards when all are assigned.`,
                 { parse_mode: "Markdown" }
               );
               const { postAssignmentUI } = require("./resolveHandler");
-              await postAssignmentUI(ctx.telegram, adminId, pba.id);
+              await postAssignmentUI(ctx.telegram, promptTarget, pba.id);
             } catch (err) {
               console.error(`[adHandler] auto-trigger /resolve UI failed: ${err.message}`);
-              // Fallback to plain instructional message if UI post fails
-              ctx.telegram.sendMessage(adminId,
-                `⚠️ Couldn't auto-post assignment UI (${err.message}). Run \`/resolve ${sessionShort}\` manually.`,
+              // Last-ditch: a plain instructional message to the source chat
+              // so the pause still surfaces even if the rich UI post failed.
+              ctx.telegram.sendMessage(promptTarget,
+                `⏸️ Brief paused — ${unattributedRefs.length} unnamed cover(s) for ${briefHandleCount} pages need assignment. Run \`/resolve ${sessionShort}\` to map them.`,
                 { parse_mode: "Markdown" }
               ).catch(() => {});
             }
+          } else {
+            console.error(`[adHandler] ⚠️ Brief paused but no prompt target (no admin + no chat id) — session ${sessionShort} awaiting manual /resolve`);
           }
         } catch (err) {
           console.error(`[adHandler] ambiguous-brief pause failed (forwarding will proceed): ${err.message}`);
