@@ -12,7 +12,7 @@
  */
 
 const { parseAdMessage }       = require("../parser");
-const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows } = require("../sheets");
+const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow } = require("../sheets");
 const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages, getStandardBundle } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
@@ -1856,6 +1856,88 @@ async function handleAuditDupesCommand(ctx) {
   else await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
 }
 
+/**
+ * /auditcols — read-only audit. Checks every enabled per-page sheet's header
+ * row against the standard layout the bot writes to:
+ *   A Client · B Ad Type · C Bulk# · D Date · E Post Type · F Post Duration ·
+ *   G Ad Price · H Notes
+ * Flags any sheet where the key headers (esp. Ad Price + Post Type) aren't in
+ * their expected columns — i.e. shifted by an extra column, which makes the
+ * bot's positional writes land in the wrong column (@bestofhumors case).
+ */
+async function handleAuditColsCommand(ctx) {
+  const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+  if (adminId && ctx.from?.id !== adminId) return;
+
+  const allPages = pagesRegistry.listAllSync ? pagesRegistry.listAllSync() : [];
+  const targets = allPages.filter((p) => p.sheet_id && !PLACEHOLDER_PATTERN.test(p.sheet_id));
+  if (targets.length === 0) { await ctx.reply("⚠️ No per-page sheets to audit.").catch(() => {}); return; }
+
+  const statusMsg = await ctx.reply(`⏳ Checking column layout on ${targets.length} per-page sheet(s)…`).catch(() => null);
+  const editStatus = async (t) => {
+    if (!statusMsg) return;
+    try { await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, t, { parse_mode: "Markdown" }); }
+    catch (err) { if (!/not modified/i.test(err.message || "")) console.error(`[adHandler] /auditcols editStatus: ${err.message}`); }
+  };
+
+  // Expected header → 0-indexed column. We anchor on the columns whose
+  // misplacement actually corrupts data (Price, Post Type, Duration).
+  const colLetter = (i) => String.fromCharCode(65 + i);
+  const ANCHORS = [
+    { name: "Ad Price",      idx: 6, re: /\bad\s*price\b|^price$/i },
+    { name: "Post Type",     idx: 4, re: /\bpost\s*type\b/i },
+    { name: "Post Duration", idx: 5, re: /\bpost\s*duration\b|\bduration\b/i },
+  ];
+
+  const misaligned = []; // { handle, problems:[...], header:[...] }
+  let processed = 0, checked = 0, failed = 0, lastEdit = Date.now();
+
+  for (const page of targets) {
+    try {
+      const header = await getHeaderRow(page.sheet_id, PAGE_TAB_NAME);
+      checked++;
+      const problems = [];
+      for (const a of ANCHORS) {
+        const atExpected = a.re.test((header[a.idx] || "").trim());
+        if (!atExpected) {
+          // find where it actually is
+          const actualIdx = header.findIndex((h) => a.re.test((h || "").trim()));
+          problems.push(`${a.name} expected ${colLetter(a.idx)}, ` +
+            (actualIdx >= 0 ? `found in ${colLetter(actualIdx)}` : "not found"));
+        }
+      }
+      if (problems.length > 0) misaligned.push({ handle: page.handle, problems, header });
+    } catch (err) {
+      failed++;
+      console.error(`[adHandler] /auditcols @${page.handle}: ${err.message}`);
+    }
+    processed++;
+    if (Date.now() - lastEdit > 5000) {
+      editStatus(`🧮 *Column-layout audit*\n${processed}/${targets.length} checked · ${misaligned.length} misaligned${failed ? ` · ${failed} failed` : ""}`).catch(() => {});
+      lastEdit = Date.now();
+    }
+  }
+
+  const lines = [
+    `🧮 *Column-layout audit done*`,
+    "",
+    `Checked: ${checked}/${targets.length} sheets${failed ? ` · ${failed} failed` : ""}`,
+    `Misaligned: *${misaligned.length}*`,
+  ];
+  if (misaligned.length > 0) {
+    lines.push("", "*Sheets needing a column fix:*");
+    misaligned.slice(0, 30).forEach((m) => {
+      lines.push(`• *@${m.handle}* — ${m.problems.join("; ")}`);
+    });
+    if (misaligned.length > 30) lines.push(`…and ${misaligned.length - 30} more (see logs)`);
+    console.log(`[adHandler] /auditcols full result:`, JSON.stringify(misaligned.map((m) => ({ handle: m.handle, problems: m.problems, header: m.header }))));
+  } else {
+    lines.push("", "✅ All per-page sheets match the standard layout.");
+  }
+  if (statusMsg) await editStatus(lines.join("\n"));
+  else await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
+}
+
 async function handleAdMessage(ctx) {
   try {
     const text = ctx.message?.text || ctx.message?.caption;
@@ -1906,6 +1988,13 @@ async function handleAdMessage(ctx) {
     // April + May; pass numbers to override (e.g. "/auditdupes 3 4 5").
     if (text && /^\/auditdupes\b/i.test(text.trim())) {
       return await handleAuditDupesCommand(ctx);
+    }
+
+    // /auditcols — read-only check that every per-page sheet's header row
+    // matches the standard layout (Post Type=E, Post Duration=F, Ad Price=G,
+    // Notes=H). Flags sheets shifted by an extra column (@bestofhumors case).
+    if (text && /^\/auditcols\b/i.test(text.trim())) {
+      return await handleAuditColsCommand(ctx);
     }
 
     const chatId = String(ctx.chat?.id);

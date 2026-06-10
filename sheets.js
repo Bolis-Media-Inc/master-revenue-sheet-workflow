@@ -610,6 +610,21 @@ async function sortSheetByDate(spreadsheetId, tabName, opts = {}) {
 }
 
 /**
+ * Read the header row (row 1) of a tab. Read-only. Returns an array of the
+ * column header strings (A, B, C, …). Used by /auditcols to detect per-page
+ * sheets whose layout drifted from the standard template.
+ */
+async function getHeaderRow(spreadsheetId, tabName) {
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = getThrottledSheets(client);
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId, range: `${tabName}!1:1`,
+  });
+  return (resp.data.values && resp.data.values[0]) || [];
+}
+
+/**
  * Scan a single column for cells whose value matches a regex. Read-only.
  * Returns [{ row, value }] (1-indexed rows). Used by the NIF-in-Duration
  * audit to surface legacy rows where the old parser dumped a NIF into the
@@ -1286,7 +1301,7 @@ async function applyColumnCenterAlignment(spreadsheetId, tabName, endColumn = "K
 module.exports = {
   appendRow, markForwarded, markForwardedBatch,
   applyCenterAlignmentBatch, applyColumnCenterAlignment,
-  getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows,
+  getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow,
   updateStatusToLive, updateAdPrice, updateAdClient, updateAdDate, deleteAdRows,
   appendReminder, appendRemindersBatch, getPendingReminders, markReminderSent,
 };
