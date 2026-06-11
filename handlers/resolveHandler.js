@@ -446,21 +446,24 @@ async function postGroupPrompt(telegram, chatId, session, briefId) {
   const briefShort = (briefId || session.brief_id).slice(0, 8);
   const groups = session.blocks || [];
   const pages  = session.pages  || [];
+  // PLAIN TEXT (no parse_mode): page handles contain underscores
+  // (@i_have_no_memes96_v2) and captions contain arbitrary chars, which break
+  // Telegram's Markdown entity parser ("can't parse entities").
   const lines = [
-    `⏸️ *Multi-group brief — needs page→group mapping*`,
+    `⏸️ Multi-group brief — needs page→group mapping`,
     `─────────────────────────`,
     `${groups.length} creative groups across ${pages.length} pages. Each group has its own covers/slides/caption — map your pages, then I'll forward.`,
     ``,
   ];
   groups.forEach((g, i) => {
-    const cap = (g.caption || "").split("\n")[0].slice(0, 60);
+    const cap = (g.caption || "").split("\n")[0].slice(0, 70);
     const named = g.namedPages ? ` · already named: ${g.namedPages.map((h) => "@" + h).join(" ")}` : "";
-    lines.push(`*G${i + 1}* — ${(g.coverRefs || []).length} covers · ${(g.slideRefs || []).length} slides${named}`);
-    if (cap) lines.push(`   _"${cap.replace(/[_*`\[]/g, (c) => "\\" + c)}…"_`);
+    lines.push(`G${i + 1} — ${(g.coverRefs || []).length} covers · ${(g.slideRefs || []).length} slides${named}`);
+    if (cap) lines.push(`   "${cap}…"`);
   });
-  lines.push(``, `*Pages:* ${pages.map((h) => "@" + h).join(" ")}`, ``,
-    `Reply:\n\`/resolve ${briefShort} G1: @page @page | G2: @page @page\``);
-  const sent = await telegram.sendMessage(chatId, lines.join("\n"), { parse_mode: "Markdown" })
+  lines.push(``, `Pages: ${pages.map((h) => "@" + h).join(" ")}`, ``,
+    `Reply:\n/resolve ${briefShort} G1: @page @page | G2: @page @page`);
+  const sent = await telegram.sendMessage(chatId, lines.join("\n"))
     .catch((e) => { console.error(`[resolve] postGroupPrompt: ${e.message}`); return null; });
   if (sent?.message_id) {
     await supabase.from("pending_brief_assignments")
