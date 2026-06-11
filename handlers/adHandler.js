@@ -12,7 +12,7 @@
  */
 
 const { parseAdMessage }       = require("../parser");
-const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow } = require("../sheets");
+const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates } = require("../sheets");
 const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages, getStandardBundle } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
@@ -1944,6 +1944,71 @@ async function handleAuditColsCommand(ctx) {
   else await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
 }
 
+/**
+ * /auditdates — read-only audit. Scans every enabled per-page sheet's Date
+ * Posted column for out-of-range values: future year, >45 days ahead, or
+ * before 2025 — i.e. typo'd dates like "Fri 2/26/27" sitting among 2026 rows.
+ * Reports page/row/client/date. Makes NO edits.
+ */
+async function handleAuditDatesCommand(ctx) {
+  const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+  if (adminId && ctx.from?.id !== adminId) return;
+
+  const allPages = pagesRegistry.listAllSync ? pagesRegistry.listAllSync() : [];
+  const targets = allPages.filter((p) => p.sheet_id && !PLACEHOLDER_PATTERN.test(p.sheet_id));
+  if (targets.length === 0) { await ctx.reply("⚠️ No per-page sheets to audit.").catch(() => {}); return; }
+
+  const statusMsg = await ctx.reply(`⏳ Scanning ${targets.length} sheet(s) for out-of-range dates…`).catch(() => null);
+  const editStatus = async (t) => {
+    if (!statusMsg) return;
+    try { await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, t, { parse_mode: "Markdown" }); }
+    catch (err) { if (!/not modified/i.test(err.message || "")) console.error(`[adHandler] /auditdates editStatus: ${err.message}`); }
+  };
+
+  const pagesWithBad = []; // { handle, bad:[{row,client,date}] }
+  let processed = 0, scanned = 0, failed = 0, totalBad = 0, lastEdit = Date.now();
+
+  for (const page of targets) {
+    try {
+      const bad = await findOutlierDates(page.sheet_id, PAGE_TAB_NAME, { futureDays: 45, floorYear: 2025 });
+      scanned++;
+      if (bad.length > 0) { pagesWithBad.push({ handle: page.handle, bad }); totalBad += bad.length; }
+    } catch (err) {
+      failed++;
+      console.error(`[adHandler] /auditdates @${page.handle}: ${err.message}`);
+    }
+    processed++;
+    if (Date.now() - lastEdit > 5000) {
+      editStatus(`📅 *Date audit*\n${processed}/${targets.length} scanned · ${totalBad} bad date(s) on ${pagesWithBad.length} page(s)${failed ? ` · ${failed} failed` : ""}`).catch(() => {});
+      lastEdit = Date.now();
+    }
+  }
+
+  const lines = [
+    `📅 *Out-of-range date audit done*`,
+    "",
+    `Scanned: ${scanned}/${targets.length} sheets${failed ? ` · ${failed} failed` : ""}`,
+    `Found: *${totalBad}* suspicious date(s) on *${pagesWithBad.length}* page(s)`,
+  ];
+  if (pagesWithBad.length > 0) {
+    lines.push("", "*Bad dates (likely typos):*");
+    let shown = 0;
+    for (const pg of pagesWithBad) {
+      if (shown >= 30) { lines.push("…more in logs"); break; }
+      for (const b of pg.bad) {
+        if (shown >= 30) break;
+        lines.push(`• *@${pg.handle}* row ${b.row}: ${b.client} → \`${b.date}\``);
+        shown++;
+      }
+    }
+    console.log(`[adHandler] /auditdates full result:`, JSON.stringify(pagesWithBad));
+  } else {
+    lines.push("", "✅ No out-of-range dates — all within the operating window.");
+  }
+  if (statusMsg) await editStatus(lines.join("\n"));
+  else await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
+}
+
 async function handleAdMessage(ctx) {
   try {
     const text = ctx.message?.text || ctx.message?.caption;
@@ -2001,6 +2066,12 @@ async function handleAdMessage(ctx) {
     // Notes=H). Flags sheets shifted by an extra column (@bestofhumors case).
     if (text && /^\/auditcols\b/i.test(text.trim())) {
       return await handleAuditColsCommand(ctx);
+    }
+
+    // /auditdates — read-only scan for out-of-range Date Posted values across
+    // every per-page sheet (future-year typos like "2/26/27", ancient dates).
+    if (text && /^\/auditdates\b/i.test(text.trim())) {
+      return await handleAuditDatesCommand(ctx);
     }
 
     const chatId = String(ctx.chat?.id);

@@ -610,6 +610,44 @@ async function sortSheetByDate(spreadsheetId, tabName, opts = {}) {
 }
 
 /**
+ * Find OUT-OF-RANGE / suspicious dates in a sheet's Date column (D). Read-only.
+ * Flags rows whose parsed date is in a future year, more than `futureDays`
+ * ahead of today, or before `floorYear` — i.e. typo'd dates like "2/26/27"
+ * (Feb 2027) sitting among 2026 entries. Returns [{ row, client, date }].
+ */
+async function findOutlierDates(spreadsheetId, tabName, opts = {}) {
+  const futureDays = opts.futureDays != null ? opts.futureDays : 45;
+  const floorYear  = opts.floorYear  != null ? opts.floorYear  : 2025;
+  const now = new Date();
+  const curYear = now.getFullYear();
+  const maxOk = new Date(now.getTime() + futureDays * 86400000);
+
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = getThrottledSheets(client);
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId, range: `${tabName}!A:D`,
+  });
+  const rows = resp.data.values || [];
+
+  const hits = [];
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const clientCell = (r?.[0] || "").trim();
+    const dateStr = r?.[3];
+    const m = String(dateStr || "").match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+    if (!clientCell || !m) continue;
+    const mo = +m[1], d = +m[2];
+    let y = +m[3]; if (y < 100) y += 2000;
+    const dt = new Date(y, mo - 1, d);
+    if (y > curYear || y < floorYear || dt > maxOk) {
+      hits.push({ row: i + 1, client: clientCell, date: String(dateStr).trim() });
+    }
+  }
+  return hits;
+}
+
+/**
  * Read the header row (row 1) of a tab. Read-only. Returns an array of the
  * column header strings (A, B, C, …). Used by /auditcols to detect per-page
  * sheets whose layout drifted from the standard template.
@@ -1301,7 +1339,7 @@ async function applyColumnCenterAlignment(spreadsheetId, tabName, endColumn = "K
 module.exports = {
   appendRow, markForwarded, markForwardedBatch,
   applyCenterAlignmentBatch, applyColumnCenterAlignment,
-  getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow,
+  getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates,
   updateStatusToLive, updateAdPrice, updateAdClient, updateAdDate, deleteAdRows,
   appendReminder, appendRemindersBatch, getPendingReminders, markReminderSent,
 };
