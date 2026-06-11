@@ -34,9 +34,27 @@ Connor's framing of the real gaps:
 2. There's no way to do **shared slides for SOME pages but not all**.
 3. It didn't preserve the brief's **group structure**.
 
-The fix is NOT a stricter posting format. It's: **detect the complexity,
-preserve the structure, and ASK the operator to map it** — extending the
-existing `/resolve` cover-assignment model to captions and slide-groups.
+The fix is NOT a stricter posting format, and NOT re-posting. It's: **the
+team posts once in whatever shape, the bot reconstructs the groups from the
+chat, and asks the operator for a quick mapping** — extending the existing
+`/resolve` cover-assignment model to captions and slide-groups.
+
+## Non-negotiable principles (from Connor)
+
+1. **Never make the team re-send / re-post.** They post once, any combo. The
+   bot adapts. Re-posting is banned — see #2.
+2. **Sheet-safe.** Master + per-page rev rows are written ONCE at brief
+   processing. `/resolve` + Phase-3 forward are PURE Telegram re-forwarding
+   and must NEVER write sheets — so re-running resolve can't duplicate rows.
+   (This is already true today; keep it true.)
+3. **Works on the EXISTING brief.** Even when the original capture flattened
+   the structure, the source messages are still in the chat. The resolver
+   re-reads them (buffer, else live via sales_bolismedia) to rebuild groups —
+   so an already-posted brief (like SESH) is resolvable in place, no repost.
+4. **Minimize operator effort.** Pre-group as much as the labels allow ("these
+   7 pages" → one group with 7 covers + its slides + its caption); only ask
+   for the bits the bot genuinely can't infer (which specific pages → which
+   group). Fast mapping, not data entry.
 
 ---
 
@@ -45,10 +63,18 @@ existing `/resolve` cover-assignment model to captions and slide-groups.
 Four parts: **capture blocks → detect multi-group → interactive mapping →
 per-group forward.**
 
-### 1. Block-capture model (`messageBuffer.js`)
+### 1. Block-capture model (`messageBuffer.js`) — used at processing AND on /resolve
 
 Stop flattening. Treat each `"… ^"` annotation as a **delimiter** that closes
-a block. Walking backward from the brief, emit an ordered list of blocks:
+a block. This same `getBlockStructure()` runs in two places:
+- at brief processing, to detect multi-group + persist the structure; and
+- **on `/resolve`, to RE-READ the source chat and rebuild groups** even if the
+  original capture flattened them or the brief predates this feature. If the
+  brief's messages have aged out of the in-memory buffer, fetch them live via
+  `sales_bolismedia` (`userClient.getRecentMessages` around the brief) — the
+  raw covers/captions/labels are still in Internal Network Ads.
+
+Walking backward from the brief, emit an ordered list of blocks:
 
 ```js
 // New scanner output for complex briefs:
@@ -162,12 +188,25 @@ and clean-delete logic.
 
 ---
 
+## Recovering the SESH brief (and any already-posted multi-group brief)
+
+NO repost (sheets already written). Once the smarter resolver ships, run
+`/resolve 4a77e6a3` on the existing brief:
+1. It re-reads the source messages (buffer or live) → rebuilds the 2 caption
+   blocks, 2 slide blocks, 2 cover sets.
+2. Asks you to map the 12–13 pages to Group A / Group B (paste-mapping).
+3. Re-forwards each page's correct cover + group slides + group caption +
+   per-page brief — Telegram only, NO sheet writes.
+
+The manual chat-cleanup of the bad earlier forward (covers + flattened brief)
+still applies once — after that, the in-place resolve produces the right
+content. Going forward `/resolve` records its sends (commit 99030f0) so even
+that cleanup becomes a clean `/replay`.
+
 ## Out of scope (for v1)
 
 - Auto-guessing group membership from PAGE INFO order — too fragile; always ask.
 - Per-page *unique* captions (only per-group). Rare; revisit if needed.
-- Backfilling the already-posted SESH brief — its group structure was lost on
-  capture; fix that one manually (post as 2 briefs).
 
 ---
 
