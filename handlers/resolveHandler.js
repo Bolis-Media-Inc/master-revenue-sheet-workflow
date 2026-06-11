@@ -644,7 +644,7 @@ async function remindAwaitingSessions(telegram, fallbackChatId) {
   try {
     const { data, error } = await supabase
       .from("pending_brief_assignments")
-      .select("id, prompt_chat_id, pages, unattributed, reminder_count, brief_text")
+      .select("id, brief_id, prompt_chat_id, pages, unattributed, reminder_count, brief_text")
       .eq("status", "awaiting")
       .gt("expires_at", nowIso)
       .lt("reminder_count", MAX_REMINDERS)
@@ -659,7 +659,8 @@ async function remindAwaitingSessions(telegram, fallbackChatId) {
   for (const s of sessions) {
     const target = s.prompt_chat_id || fallbackChatId;
     if (!target) continue;
-    const short    = s.id.slice(0, 8);
+    // /resolve matches on the BRIEF id prefix (not the session id).
+    const briefShort = (s.brief_id || "").slice(0, 8);
     const pagesCt  = Array.isArray(s.pages) ? s.pages.length : 0;
     const coversCt = Array.isArray(s.unattributed) ? s.unattributed.length : 0;
     const firstLine = (s.brief_text || "").split("\n")[0].slice(0, 60);
@@ -669,7 +670,7 @@ async function remindAwaitingSessions(telegram, fallbackChatId) {
         `⏰ *Reminder ${nth}/${MAX_REMINDERS} — ad still needs cover assignment*\n` +
         `\`${firstLine.replace(/[`*_\[]/g, (c) => "\\" + c)}\`\n` +
         `${pagesCt} pages · ${coversCt} unnamed cover(s) waiting — not sent yet.\n` +
-        `Run \`/resolve ${short}\` to assign covers → pages and send it out.`,
+        `Run \`/resolve ${briefShort}\` to assign covers → pages and send it out.`,
         { parse_mode: "Markdown" }
       );
       await supabase.from("pending_brief_assignments")

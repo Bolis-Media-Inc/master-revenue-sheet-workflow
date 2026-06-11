@@ -2652,7 +2652,7 @@ async function handleAdMessage(ctx) {
                 `*Brief:* \`${briefSnippet.replace(/[_*`\[]/g, (c) => "\\" + c).slice(0, 160)}…\`\n` +
                 `*Pages:* ${briefHandleCount} · *Unlabeled covers:* ${unattributedRefs.length} · *Type:* ${ambiguousNoLabels ? "no labels at all" : "partial labels"}\n\n` +
                 "Per-page forwarding *did not run* — would have misattributed covers.\n" +
-                `Tap a page button under each cover below to assign (or run \`/resolve ${sessionShort}\`). Auto-forwards when all are assigned.`,
+                `Tap a page button under each cover below to assign (or run \`/resolve ${briefShort}\`). Auto-forwards when all are assigned.`,
                 { parse_mode: "Markdown" }
               );
               const { postAssignmentUI } = require("./resolveHandler");
@@ -2662,7 +2662,7 @@ async function handleAdMessage(ctx) {
               // Last-ditch: a plain instructional message to the source chat
               // so the pause still surfaces even if the rich UI post failed.
               ctx.telegram.sendMessage(promptTarget,
-                `⏸️ Brief paused — ${unattributedRefs.length} unnamed cover(s) for ${briefHandleCount} pages need assignment. Run \`/resolve ${sessionShort}\` to map them.`,
+                `⏸️ Brief paused — ${unattributedRefs.length} unnamed cover(s) for ${briefHandleCount} pages need assignment. Run \`/resolve ${briefShort}\` to map them.`,
                 { parse_mode: "Markdown" }
               ).catch(() => {});
             }
