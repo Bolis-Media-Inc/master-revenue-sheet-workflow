@@ -903,6 +903,120 @@ function pruneToLiveSet(chatId, liveIds) {
   return { removed: ghostIds.length, kept: next.length };
 }
 
+/**
+ * Reconstruct the GROUP structure of a multi-group brief from the chat.
+ *
+ * Some briefs split pages into creative groups, each with its own covers,
+ * slides, and caption, separated by trailing-^ delimiter labels:
+ *
+ *   [7 covers]   "Covers for these 7 pages ^"
+ *   [slides]     "Slides 2-6 for these 7 pages ^"
+ *   [caption A]  "Caption for these 7 pages ^"
+ *   [6 covers]   "Covers for these 6 pages ^"
+ *   [slide]      "Slide 2 for these 6 pages ^"
+ *   [caption B]  "Caption for these 6 pages ^"
+ *   <BRIEF>
+ *
+ * The team types the LABEL right AFTER the content it describes, so walking
+ * backward from the brief: each caption/slide/cover label opens a block, and
+ * the messages before it (until the next label) are its content. Blocks are
+ * clustered into GROUPS by the page-descriptor in the label (the text after
+ * "for" — e.g. "these 7 pages", "all", or an explicit "@a @b" list).
+ *
+ * Pass `messagesOverride` to scan a live snapshot (e.g. fetched via the user
+ * account on /resolve) instead of the in-memory buffer.
+ *
+ * @returns {{ groups: Array<{key, coverCount, slideCount, caption, covers, slides, namedPages}>,
+ *             isMultiGroup: boolean } | null}
+ */
+function getBlockStructure(chatId, adMessageId, messagesOverride) {
+  const buf = messagesOverride || _buffers.get(String(chatId)) || [];
+  const adIdx = buf.findIndex((m) => m.message_id === adMessageId);
+  if (adIdx <= 0) return null;
+  const preceding = buf.slice(0, adIdx);
+
+  const LABEL_RE = /\^\s*$/;
+  const kindOf = (t) => {
+    if (/caption/i.test(t)) return "caption";
+    if (/slide/i.test(t))   return "slides";
+    if (/cover/i.test(t))   return "covers";
+    return null;
+  };
+  // Group key = the page descriptor after "for" ("these 7 pages", "all",
+  // "@a @b"). No "for" → "all" (applies to everyone).
+  const keyOf = (t) => {
+    const noCaret = t.replace(/\^\s*$/, "").trim();
+    const m = noCaret.match(/\bfor\s+(.+)$/i);
+    return ((m ? m[1] : "all").trim().toLowerCase()) || "all";
+  };
+  // Explicit handles named in a descriptor → known pages for that group.
+  const namedPagesOf = (key) => {
+    const hs = (key.match(/@([\w.]+)/g) || []).map((h) => h.slice(1).toLowerCase());
+    return hs.length ? hs : null;
+  };
+
+  const blocksRev = [];
+  let current = null;
+  for (let i = preceding.length - 1; i >= 0; i--) {
+    const msg = preceding[i];
+    const text = (msg.text || msg.caption || "").trim();
+    const hasMedia = !!(msg.photo || msg.video || msg.document ||
+                        msg.animation || msg.audio || msg.sticker);
+
+    if (!hasMedia && text && LABEL_RE.test(text)) {
+      const kind = kindOf(text);
+      if (kind) {
+        if (current) blocksRev.push(current);
+        current = { kind, key: keyOf(text), media: [], text: null };
+        continue;
+      }
+      continue; // label-like but not caption/slide/cover (e.g. "@goal ^") — skip
+    }
+    if (text && _looksLikePreviousBrief(text)) break; // crossed into a prior brief
+
+    if (!current) continue; // content above the topmost label — ungrouped, ignore
+    if (current.kind === "caption") {
+      if (text && current.text == null) current.text = text;
+    } else if (hasMedia) {
+      current.media.unshift(msg); // keep chronological within the block
+    }
+  }
+  if (current) blocksRev.push(current);
+
+  // Cluster blocks → groups by key (chronological group order).
+  const order = [];
+  const byKey = new Map();
+  for (const b of blocksRev.reverse()) {
+    if (!byKey.has(b.key)) {
+      const g = { key: b.key, covers: [], slides: [], caption: null, namedPages: namedPagesOf(b.key) };
+      byKey.set(b.key, g);
+      order.push(g);
+    }
+    const g = byKey.get(b.key);
+    if (b.kind === "covers") g.covers.push(...b.media);
+    else if (b.kind === "slides") g.slides.push(...b.media);
+    else if (b.kind === "caption" && b.text) g.caption = b.text;
+  }
+
+  const groups = order.map((g) => ({
+    key: g.key,
+    coverCount: g.covers.length,
+    slideCount: g.slides.length,
+    caption: g.caption,
+    covers: g.covers,
+    slides: g.slides,
+    namedPages: g.namedPages,
+  }));
+
+  // Multi-group when ≥2 distinct group keys carry a caption or slides — i.e.
+  // genuinely different creative per group (not just a single "covers ^"
+  // annotation, which the existing single-group scanners already handle).
+  const meaningful = groups.filter((g) => g.caption || g.slideCount > 0);
+  const isMultiGroup = new Set(meaningful.map((g) => g.key)).size >= 2;
+
+  return { groups, isMultiGroup };
+}
+
 module.exports = {
   addMessage,
   updateMessage,
@@ -911,6 +1025,7 @@ module.exports = {
   getCollabBundlesByPage,
   getFilenameBundlesByPage,
   getStandardBundle,
+  getBlockStructure,
   getMessages,
   clearBufferUpTo,
   pruneToLiveSet,
