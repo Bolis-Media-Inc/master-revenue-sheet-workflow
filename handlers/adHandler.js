@@ -13,7 +13,7 @@
 
 const { parseAdMessage }       = require("../parser");
 const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates } = require("../sheets");
-const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages, getStandardBundle } = require("../messageBuffer");
+const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages, getStandardBundle, getBlockStructure } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
 const pagesRegistry            = require("../lib/pages");
@@ -2627,6 +2627,44 @@ async function handleAdMessage(ctx) {
         `fallback media: ${fallbackMedia.length})`,
       );
 
+      // ── Multi-group detection (covers/slides/caption split by page group) ──
+      // Briefs that split pages into creative GROUPS — each with its own
+      // covers + slides + caption, separated by "… for these N pages ^"
+      // labels — can't be flattened into one bundle. Detect the group
+      // structure, capture each group's content, and pause for an interactive
+      // /resolve page→group mapping. NO sheet writes (already done above).
+      // Takes precedence over the cover-only ambiguity pause below.
+      let multiGroupHandled = false;
+      try {
+        const blockStruct = getBlockStructure(sourceChatId, adMessageId);
+        if (blockStruct && blockStruct.isMultiGroup && briefRowId && adBriefs._supabase) {
+          const serGroups = blockStruct.groups.map((g) => ({
+            key:        g.key,
+            caption:    g.caption || null,
+            namedPages: g.namedPages || null,
+            coverRefs:  (g.covers || []).map(extractMediaRef).filter(Boolean),
+            slideRefs:  (g.slides || []).map(extractMediaRef).filter(Boolean),
+          }));
+          const briefPages = [...new Set(parsedList.map((p) => p.pageHandle?.toLowerCase()).filter(Boolean))];
+          const { createGroupSessionAndPrompt } = require("./resolveHandler");
+          const created = await createGroupSessionAndPrompt(ctx.telegram, {
+            briefId:        briefRowId,
+            sourceChatId,
+            briefMessageId: ctx.message.message_id,
+            briefText:      text,
+            pages:          briefPages,
+            groups:         serGroups,
+            alertChatId:    RESOLVE_ALERT_CHAT_ID,
+          });
+          if (created) {
+            multiGroupHandled = true;
+            console.warn(`[adHandler] 🧩 Multi-group brief ${briefRowId.slice(0, 8)} — ${serGroups.length} groups, paused for /resolve mapping`);
+          }
+        }
+      } catch (err) {
+        console.error(`[adHandler] multi-group detection error (non-fatal): ${err.message}`);
+      }
+
       // ── Ambiguous-brief detection + PAUSE ────────────────────────────────
       // Two ambiguity shapes we catch here:
       //
@@ -2683,7 +2721,10 @@ async function handleAdMessage(ctx) {
       );
       const isAmbiguousBrief = ambiguousPartial || ambiguousNoLabels || ambiguousLabelMiss;
       let isPaused = false;
-      if (isAmbiguousBrief && briefRowId && adBriefs._supabase) {
+      // Multi-group already paused + created its own (richer) session above —
+      // don't ALSO run the cover-only ambiguity pause for the same brief.
+      if (multiGroupHandled) isPaused = true;
+      if (!multiGroupHandled && isAmbiguousBrief && briefRowId && adBriefs._supabase) {
         try {
           const unattributedRefs = sharedBundle.media.map((m, i) => extractMediaRef(m)
             ? { ...extractMediaRef(m), idx: i, msg_id: m.message_id || `synth-${i}`, file_name: m.document?.file_name || m.video?.file_name || null }
