@@ -267,10 +267,11 @@ async function handleResolveCommand(ctx) {
       groupSession = await tryBuildGroupSessionFromLive(ctx.telegram, brief, ctx.chat.id);
     }
     if (groupSession) {
-      // Everything after "/resolve <prefix>" is the mapping (may be empty).
-      const fullText = (ctx.message?.text || "").trim();
-      const mappingText = fullText.replace(/^\/resolve(?:@\w+)?\s+\S+\s*/i, "");
-      return await resolveGroupSession(ctx, groupSession, brief, mappingText);
+      // Cover-button picking: post each cover with page buttons (group-aware
+      // forward fires when all are assigned). The operator picks cover→page,
+      // and each page inherits that cover's group's slides + caption.
+      await postAssignmentUI(ctx.telegram, ctx.chat.id, groupSession.id, { brief });
+      return;
     }
 
     const pageRows = await fetchBriefPages(brief.id);
@@ -348,13 +349,25 @@ async function tryBuildGroupSessionFromLive(telegram, brief, promptChatId) {
     const bs = getBlockStructure(brief.telegram_chat_id, Number(brief.telegram_message_id), norm);
     if (!bs || !bs.isMultiGroup) return null;
 
-    const groups = bs.groups.map((g) => ({
+    // blocks = per-group slides + caption (NO covers — covers go into the
+    // cover-button assignment list so the operator picks cover→page).
+    const blocks = bs.groups.map((g) => ({
       key:        g.key,
       caption:    g.caption || null,
       namedPages: g.namedPages || null,
-      coverRefs:  (g.covers || []).map((m) => ({ msg_id: m.message_id })),
       slideRefs:  (g.slides || []).map((m) => ({ msg_id: m.message_id })),
     }));
+    // unattributed = ALL covers across groups, each tagged with its group so
+    // the forward attaches that group's slides + caption. Operator taps each
+    // cover → page (the cover-button UI). Live covers carry msg_id (forwarded
+    // by id), not a Bot-API file_id.
+    let idx = 0;
+    const unattributed = [];
+    bs.groups.forEach((g, gi) => {
+      for (const m of (g.covers || [])) {
+        unattributed.push({ idx: idx++, msg_id: m.message_id, group: gi, kind: "photo", file_name: null });
+      }
+    });
 
     const pageRows = await fetchBriefPages(brief.id);
     const pages = pageRows.map((p) => p.page_handle.toLowerCase());
@@ -368,7 +381,8 @@ async function tryBuildGroupSessionFromLive(telegram, brief, promptChatId) {
         brief_text:       (brief.raw_text || "").slice(0, 1000),
         pages,
         kind:             "groups",
-        blocks:           groups,
+        blocks,
+        unattributed,
         assignments:      {},
         status:           "awaiting",
         prompt_chat_id:   Number(promptChatId),
@@ -378,13 +392,7 @@ async function tryBuildGroupSessionFromLive(telegram, brief, promptChatId) {
       .single();
     if (error || !session) { console.error(`[resolve] live-build session: ${error?.message}`); return null; }
 
-    const auto = {};
-    groups.forEach((g, gi) => { if (Array.isArray(g.namedPages)) for (const h of g.namedPages) auto[h] = gi; });
-    if (Object.keys(auto).length) {
-      await supabase.from("pending_brief_assignments").update({ group_assignments: auto }).eq("id", session.id);
-      session.group_assignments = auto;
-    }
-    console.log(`[resolve] 🧩 live-rebuilt group session ${session.id.slice(0, 8)} for brief ${brief.id.slice(0, 8)} (${groups.length} groups from ${live.length} live msgs)`);
+    console.log(`[resolve] 🧩 live-rebuilt group session ${session.id.slice(0, 8)} for brief ${brief.id.slice(0, 8)} (${blocks.length} groups, ${unattributed.length} covers from ${live.length} live msgs)`);
     return session;
   } catch (e) {
     console.error(`[resolve] tryBuildGroupSessionFromLive: ${e.message}`);
@@ -403,7 +411,8 @@ async function tryBuildGroupSessionFromLive(telegram, brief, promptChatId) {
   }
 }
 
-/** Latest open group session for a brief (awaiting or resolved). */
+/** Latest AWAITING group session for a brief. Resolved ones are ignored so a
+ *  re-/resolve triggers a fresh live-rebuild rather than reusing stale data. */
 async function findGroupSession(briefId) {
   if (!supabase) return null;
   const { data } = await supabase
@@ -411,7 +420,7 @@ async function findGroupSession(briefId) {
     .select("*")
     .eq("brief_id", briefId)
     .eq("kind", "groups")
-    .in("status", ["awaiting", "resolved"])
+    .eq("status", "awaiting")
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -473,15 +482,30 @@ async function postGroupPrompt(telegram, chatId, session, briefId) {
 }
 
 /**
- * Create a 'groups' session + post the mapping prompt. Called from adHandler
- * when getBlockStructure flags a multi-group brief. `groups` is the serialized
- * structure: [{ key, caption, namedPages, coverRefs:[{file_id,kind}], slideRefs }].
+ * Create a 'groups' session + post the cover-button assignment UI. Called from
+ * adHandler at intake when getBlockStructure flags a multi-group brief.
+ * `opts.groups` = [{ key, caption, namedPages, coverRefs:[{file_id,kind}],
+ * slideRefs }]. Covers go into `unattributed` (each tagged with its group) so
+ * the operator picks cover→page; slides+caption stay in `blocks` per group.
  * Returns true if a session was created (caller pauses forwarding).
  */
 async function createGroupSessionAndPrompt(telegram, opts) {
   if (!supabase) return false;
   try {
     const promptTarget = opts.alertChatId || opts.sourceChatId;
+    // blocks = per-group slides + caption; covers move to unattributed.
+    const blocks = (opts.groups || []).map((g) => ({
+      key: g.key, caption: g.caption || null, namedPages: g.namedPages || null,
+      slideRefs: g.slideRefs || [],
+    }));
+    let idx = 0;
+    const unattributed = [];
+    (opts.groups || []).forEach((g, gi) => {
+      for (const ref of (g.coverRefs || [])) {
+        unattributed.push({ idx: idx++, msg_id: ref.msg_id ?? `synth-${idx}`, file_id: ref.file_id, kind: ref.kind || "photo", file_name: ref.file_name || null, group: gi });
+      }
+    });
+
     const { data: session, error } = await supabase
       .from("pending_brief_assignments")
       .insert({
@@ -491,7 +515,8 @@ async function createGroupSessionAndPrompt(telegram, opts) {
         brief_text:       (opts.briefText || "").slice(0, 1000),
         pages:            opts.pages,
         kind:             "groups",
-        blocks:           opts.groups,
+        blocks,
+        unattributed,
         assignments:      {},
         status:           "awaiting",
         prompt_chat_id:   promptTarget ? Number(promptTarget) : null,
@@ -501,20 +526,8 @@ async function createGroupSessionAndPrompt(telegram, opts) {
       .single();
     if (error) { console.error(`[resolve] createGroupSession: ${error.message}`); return false; }
 
-    // Auto-assign any groups that already named their pages (no mapping needed
-    // for those). The operator only maps the "these N pages" groups.
-    const autoAssign = {};
-    (opts.groups || []).forEach((g, gi) => {
-      if (Array.isArray(g.namedPages)) for (const h of g.namedPages) autoAssign[h] = gi;
-    });
-    if (Object.keys(autoAssign).length) {
-      await supabase.from("pending_brief_assignments")
-        .update({ group_assignments: autoAssign }).eq("id", session.id);
-      session.group_assignments = autoAssign;
-    }
-
-    if (promptTarget) await postGroupPrompt(telegram, promptTarget, session, opts.briefId);
-    console.log(`[resolve] 🧩 group session ${session.id.slice(0, 8)} created (${(opts.groups || []).length} groups), prompt → ${promptTarget}`);
+    if (promptTarget) await postAssignmentUI(telegram, promptTarget, session.id);
+    console.log(`[resolve] 🧩 group session ${session.id.slice(0, 8)} created (${blocks.length} groups, ${unattributed.length} covers), prompt → ${promptTarget}`);
     return true;
   } catch (e) {
     console.error(`[resolve] createGroupSessionAndPrompt: ${e.message}`);
@@ -678,17 +691,27 @@ async function postAssignmentUI(telegram, chatId, sessionId, opts = {}) {
   // Post each cover with button grid
   for (const cover of unattributed) {
     const existing = existingAssignments[String(cover.msg_id)];
-    const caption  = `Cover \`${md(cover.file_name || cover.msg_id)}\``;
+    const grpTag   = cover.group != null ? ` · G${cover.group + 1}` : "";
+    const caption  = `Cover \`${md(cover.file_name || cover.msg_id)}\`${grpTag}`;
+    const keyboard = existing ? undefined : buildCoverKeyboard(session.id, cover.msg_id, pages);
     let sent;
     try {
-      const sendFn = cover.kind === "video" ? telegram.sendVideo.bind(telegram)
-                   : cover.kind === "document" || cover.kind === "animation" ? telegram.sendDocument.bind(telegram)
-                   : telegram.sendPhoto.bind(telegram);
-      sent = await sendFn(chatId, cover.file_id, {
-        caption,
-        parse_mode: "Markdown",
-        reply_markup: existing ? undefined : buildCoverKeyboard(session.id, cover.msg_id, pages),
-      });
+      if (!cover.file_id && cover.msg_id != null && session.source_chat_id) {
+        // Live-rebuilt session: no Bot-API file_id. Copy the original cover
+        // message from the source chat (preserves the image) WITH the buttons.
+        sent = await telegram.copyMessage(chatId, String(session.source_chat_id), Number(cover.msg_id), {
+          caption, parse_mode: "Markdown", reply_markup: keyboard,
+        });
+      } else {
+        const sendFn = cover.kind === "video" ? telegram.sendVideo.bind(telegram)
+                     : cover.kind === "document" || cover.kind === "animation" ? telegram.sendDocument.bind(telegram)
+                     : telegram.sendPhoto.bind(telegram);
+        sent = await sendFn(chatId, cover.file_id, {
+          caption,
+          parse_mode: "Markdown",
+          reply_markup: keyboard,
+        });
+      }
       if (existing) {
         await telegram.editMessageCaption(chatId, sent.message_id, undefined,
           `${caption}\n\n${renderAssignmentBadge(existing, pages)}`,
@@ -851,6 +874,99 @@ async function sendByKind(telegram, chatId, kind, fileId) {
 }
 
 /**
+ * Group-aware forward for multi-group briefs. Each assigned cover→page send
+ * gives that page: the cover + its GROUP's slides + the group's caption + the
+ * per-page brief. Group is read from cover.group (set at session build) →
+ * session.blocks[group] holds that group's slideRefs + caption. Media is sent
+ * by Bot-API file_id when present, else forwarded by source message id.
+ * NO sheet writes. Records forwarded_message_ids per page.
+ */
+async function runGroupCoverForward(ctx, session, brief) {
+  const pages = session.pages || [];
+  const pageChats = await fetchPageChats(pages);
+  const blocks = session.blocks || [];
+  const assignments = session.assignments || {};
+  const unattributed = session.unattributed || [];
+
+  const { buildPerPageBriefText } = require("./adHandler");
+  const { parseAdMessage } = require("../parser");
+  const parsed = parseAdMessage(brief.raw_text || "", new Date());
+  const plist = Array.isArray(parsed) ? parsed : (parsed ? [parsed] : []);
+  const priceBy = new Map();
+  for (const p of plist) if (p.pageHandle) priceBy.set(p.pageHandle.toLowerCase(), p.adPrice);
+
+  const sendRef = async (chatId, ref) => {
+    if (!ref) return null;
+    if (ref.file_id) return sendByKind(ctx.telegram, chatId, ref.kind || "photo", ref.file_id);
+    if (ref.msg_id != null) return ctx.telegram.forwardMessage(chatId, String(brief.telegram_chat_id), Number(ref.msg_id));
+    return null;
+  };
+
+  let sent = 0, errCount = 0;
+  const errors = [];
+  for (const cover of unattributed) {
+    const a = assignments[String(cover.msg_id)];
+    if (a === undefined || a === "skip" || a === "shared") continue; // need a specific page
+    const pageIdx = parseInt(a, 10);
+    const handle = pages[pageIdx];
+    const destChatId = handle && pageChats.get(handle);
+    if (!destChatId) { errCount++; errors.push(`cover→${handle || a}: no chat`); continue; }
+    const g = blocks[cover.group] || {};
+    const ids = [];
+    try {
+      // 1. the picked cover
+      const c = await sendRef(String(destChatId), cover);
+      if (c?.message_id) ids.push(c.message_id);
+      await sleep(80);
+      // 2. that group's slides
+      for (const sl of (g.slideRefs || [])) {
+        const s = await sendRef(String(destChatId), sl);
+        if (s?.message_id) ids.push(s.message_id);
+        await sleep(80);
+      }
+      // 3. that group's caption
+      if (g.caption && g.caption.trim()) {
+        const s = await ctx.telegram.sendMessage(String(destChatId), g.caption);
+        if (s?.message_id) ids.push(s.message_id);
+        await sleep(80);
+      }
+      // 4. per-page brief (rewritten), id last
+      const ppt = buildPerPageBriefText(brief.raw_text || "", handle, priceBy.get(handle));
+      const s = ppt
+        ? await ctx.telegram.sendMessage(String(destChatId), ppt)
+        : await ctx.telegram.forwardMessage(String(destChatId), String(brief.telegram_chat_id), Number(brief.telegram_message_id));
+      if (s?.message_id) ids.push(s.message_id);
+      sent++;
+
+      const pr = await supabase.from("ad_brief_pages")
+        .select("id").eq("brief_id", brief.id).eq("page_handle", handle).maybeSingle();
+      if (pr.data?.id) {
+        await supabase.from("ad_brief_pages")
+          .update({ forwarded_at: new Date().toISOString(), forwarded_message_ids: ids })
+          .eq("id", pr.data.id);
+      }
+    } catch (e) {
+      errCount++;
+      errors.push(`@${handle}: ${e.message}`);
+      console.error(`[resolve] group-cover forward @${handle}: ${e.message}`);
+    }
+  }
+
+  await supabase.from("pending_brief_assignments").update({ status: "resolved" }).eq("id", session.id);
+
+  const summary =
+    `✅ *Multi-group forward complete*\n─────────────────────────\n` +
+    `Pages forwarded: ${sent}\n` +
+    (errCount > 0
+      ? `Errors: ${errCount}\n${errors.slice(0, 5).map((e) => "  • " + md(e)).join("\n")}`
+      : `_Each page got its group's cover + slides + caption. Sheets untouched._`);
+  try {
+    const chatId = ctx.callbackQuery?.message?.chat?.id || ctx.chat?.id;
+    if (chatId) await ctx.telegram.sendMessage(chatId, summary, { parse_mode: "Markdown" });
+  } catch (_) {}
+}
+
+/**
  * Run the corrected per-page forward using the manual cover-to-page mapping
  * stored in pending_brief_assignments. Each assigned cover goes to exactly
  * one page (or all pages if "shared"). Skipped covers are dropped.
@@ -869,6 +985,11 @@ async function runPhase3Forward(ctx, session) {
       "❌ Phase 3: couldn't fetch brief from DB — re-run /replay manually."
     ).catch(() => {});
     return;
+  }
+  // Multi-group: each assigned cover's page gets that cover's GROUP's slides
+  // + caption (not one shared caption). Delegate to the group-aware forward.
+  if (Array.isArray(session.blocks) && session.blocks.length) {
+    return runGroupCoverForward(ctx, session, brief);
   }
   const pages = session.pages || [];
   const pageChats = await fetchPageChats(pages);
@@ -1077,9 +1198,9 @@ async function remindAwaitingSessions(telegram, fallbackChatId) {
       await supabase.from("pending_brief_assignments")
         .update({ reminder_count: nth, last_reminded_at: new Date().toISOString() })
         .eq("id", s.id);
-      console.log(`[resolve] ⏰ reminder ${nth}/${MAX_REMINDERS} sent for session ${short} → ${target}`);
+      console.log(`[resolve] ⏰ reminder ${nth}/${MAX_REMINDERS} sent for brief ${briefShort} → ${target}`);
     } catch (err) {
-      console.error(`[resolve] reminder send failed for ${short}: ${err.message}`);
+      console.error(`[resolve] reminder send failed for ${briefShort}: ${err.message}`);
     }
   }
 }
