@@ -553,6 +553,16 @@ async function runPhase3Forward(ctx, session) {
     }
   }
 
+  // Track every message id Phase 3 sends to each page so it can be cleanly
+  // deleted/re-run later (forwarded_message_ids was previously never recorded
+  // by /resolve → no undo). Map<handle, number[]>.
+  const sentIdsByHandle = new Map();
+  const pushId = (handle, id) => {
+    if (!id) return;
+    if (!sentIdsByHandle.has(handle)) sentIdsByHandle.set(handle, []);
+    sentIdsByHandle.get(handle).push(id);
+  };
+
   // Send each cover to its target(s), then the brief to every page.
   // Small sleep between sends to dodge Telegram's per-chat flood limits.
   let sentCount = 0;
@@ -563,7 +573,8 @@ async function runPhase3Forward(ctx, session) {
     for (const handle of targets) {
       const destChatId = pageChats.get(handle);
       try {
-        await sendByKind(ctx.telegram, destChatId, cover.kind || "photo", cover.file_id);
+        const sent = await sendByKind(ctx.telegram, destChatId, cover.kind || "photo", cover.file_id);
+        pushId(handle, sent?.message_id);
         sentCount++;
         await sleep(80);
       } catch (err) {
@@ -595,7 +606,8 @@ async function runPhase3Forward(ctx, session) {
     //    grabbed at processing time — nothing to send then.
     if (brief.shared_caption && brief.shared_caption.trim()) {
       try {
-        await ctx.telegram.sendMessage(destChatId, brief.shared_caption);
+        const sent = await ctx.telegram.sendMessage(destChatId, brief.shared_caption);
+        pushId(handle, sent?.message_id);
         await sleep(80);
       } catch (err) {
         console.error(`[resolve] Phase 3 caption send → @${handle}: ${err.message}`);
@@ -603,20 +615,42 @@ async function runPhase3Forward(ctx, session) {
     }
     // 2. Per-page brief — rewritten to just this page's row + price. Falls
     //    back to a native forward only if the rewrite can't isolate the page.
+    //    Sent LAST so its id is last in forwarded_message_ids (updateHandler
+    //    reads [length-1] as the brief id for /update edits).
     try {
       const perPageText = buildPerPageBriefText(
         brief.raw_text || "", handle, priceByHandle.get(handle.toLowerCase()),
       );
+      let sent;
       if (perPageText) {
-        await ctx.telegram.sendMessage(destChatId, perPageText);
+        sent = await ctx.telegram.sendMessage(destChatId, perPageText);
       } else {
-        await ctx.telegram.forwardMessage(
+        sent = await ctx.telegram.forwardMessage(
           destChatId, String(brief.telegram_chat_id), Number(brief.telegram_message_id),
         );
       }
+      pushId(handle, sent?.message_id);
       await sleep(80);
     } catch (err) {
       console.error(`[resolve] Phase 3 brief send → @${handle}: ${err.message}`);
+    }
+  }
+
+  // Persist the sent message ids per page so a later /replay (clean delete +
+  // resend) or an undo can find exactly what Phase 3 posted.
+  for (const [handle, ids] of sentIdsByHandle) {
+    if (!ids.length) continue;
+    const pageRow = await supabase
+      .from("ad_brief_pages")
+      .select("id")
+      .eq("brief_id", brief.id)
+      .eq("page_handle", handle)
+      .maybeSingle();
+    if (pageRow.data?.id) {
+      await supabase.from("ad_brief_pages")
+        .update({ forwarded_at: new Date().toISOString(), forwarded_message_ids: ids })
+        .eq("id", pageRow.data.id)
+        .then(({ error }) => { if (error) console.error(`[resolve] Phase 3 record ids @${handle}: ${error.message}`); });
     }
   }
 
