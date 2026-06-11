@@ -2027,6 +2027,18 @@ async function handleAdMessage(ctx) {
       return await handleReplayCommand(ctx);
     }
 
+    // /resolve — cover-to-page assignment for paused/ambiguous briefs.
+    // Routed HERE (text-regex on bot.on "message") rather than via
+    // bot.command("resolve") because in a multi-bot group (Monetization
+    // Team + AI has 3 bots) Telegram doesn't reliably deliver a bare
+    // "/resolve" to a specific bot through the command mechanism, so it
+    // silently did nothing. This path fires for every message the bot sees
+    // (privacy off), so bare /resolve works just like /sortsheets etc.
+    if (text && /^\/resolve\b/i.test(text.trim())) {
+      const { handleResolveCommand } = require("./resolveHandler");
+      return await handleResolveCommand(ctx);
+    }
+
     // /syncsheets — backfill missing sheet rows from DB. Idempotent, only
     // fills nulls. No Telegram re-forwarding — sheets only.
     if (text && /^\/syncsheets\b/i.test(text.trim())) {

@@ -31,11 +31,14 @@ const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 // cover with inline page-buttons. Each tap saves to pending_brief_assignments.
 // Phase 3 (queued #36) wires the "all assigned" terminal state into actual
 // re-forwarding. For now it just produces the mapping for manual /replay.
-const { handleResolveCommand, handleAssignmentCallback, remindAwaitingSessions } = require("./handlers/resolveHandler");
+const { handleAssignmentCallback, remindAwaitingSessions } = require("./handlers/resolveHandler");
 // Where paused-ad reminders go when a session has no prompt_chat_id — the
 // Monetization Team + AI chat.
 const RESOLVE_ALERT_CHAT_ID = (process.env.RESOLVE_ALERT_CHAT_ID || process.env.SALES_TEAM_CHAT_ID || "").trim() || null;
-bot.command("resolve", handleResolveCommand);
+// NOTE: /resolve is routed inside handleAdMessage (text-regex), NOT via
+// bot.command — bare "/resolve" wasn't reaching the bot in the 3-bot
+// Monetization chat through the command mechanism. The button taps still
+// come through bot.action below.
 bot.action(/^ca:[0-9a-f-]+:[^:]+:.+$/, handleAssignmentCallback);
 
 // ── /update — unified brief mutation (price, name; more subcommands TODO) ────
