@@ -108,6 +108,32 @@ async function getLiveMessageIds(chatId, limit = 80) {
   return messages.map((m) => m.id).filter((id) => Number.isFinite(id));
 }
 
+/**
+ * Fetch a window of messages ENDING AT (and including) `beforeId`, going back
+ * `limit` messages — used to re-read an older brief's covers/slides/captions
+ * for the multi-group resolver (the brief may be buried under newer posts).
+ *
+ * Returns chronological (oldest→newest) [{ message_id, text, hasMedia }].
+ * `hasMedia` lets the block scanner classify a message as media (its content
+ * is forwarded by message_id, so the exact media kind isn't needed here).
+ */
+async function getMessagesBefore(chatId, beforeId, limit = 90) {
+  const client = await getClient();
+  const entity = await client.getEntity(Number(chatId));
+  // offsetId returns messages with id < offsetId; +1 to include beforeId.
+  const messages = await client.getMessages(entity, {
+    offsetId: Number(beforeId) + 1,
+    limit,
+  });
+  return messages
+    .reverse() // gramJS returns newest-first → chronological
+    .map((m) => ({
+      message_id: m.id,
+      text:       m.message || "",
+      hasMedia:   !!(m.media || m.photo || m.video || m.document),
+    }));
+}
+
 // ── List all chats the account is in ─────────────────────────────────────────
 
 async function listChats() {
@@ -296,4 +322,4 @@ async function sendText(chatId, text) {
   }
 }
 
-module.exports = { getClient, sendMessage, sendRecap, getRecentMessages, getLiveMessageIds, listChats, getMessagesSince, onNewMessage, disconnect, forwardMessages, sendFile, sendText };
+module.exports = { getClient, sendMessage, sendRecap, getRecentMessages, getLiveMessageIds, getMessagesBefore, listChats, getMessagesSince, onNewMessage, disconnect, forwardMessages, sendFile, sendText };

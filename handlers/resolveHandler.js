@@ -259,8 +259,13 @@ async function handleResolveCommand(ctx) {
 
     // ── Multi-group flow ──────────────────────────────────────────────────
     // If this brief has a 'groups' session (covers/slides/caption split across
-    // page groups), handle the page→group mapping instead of cover assignment.
-    const groupSession = await findGroupSession(brief.id);
+    // page groups), handle the page→group mapping. If none exists yet (brief
+    // predates the feature / buffer cleared, e.g. SESH), RE-READ the source
+    // messages live and build the session on the fly.
+    let groupSession = await findGroupSession(brief.id);
+    if (!groupSession) {
+      groupSession = await tryBuildGroupSessionFromLive(ctx.telegram, brief, ctx.chat.id);
+    }
     if (groupSession) {
       // Everything after "/resolve <prefix>" is the mapping (may be empty).
       const fullText = (ctx.message?.text || "").trim();
@@ -312,6 +317,80 @@ async function handleResolveCommand(ctx) {
 // ═══════════════════════════════════════════════════════════════════════
 // Multi-group resolver (covers/slides/caption split across page groups)
 // ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Build a 'groups' session by RE-READING the brief's source messages live
+ * (via sales_bolismedia), for briefs that predate the capture feature or
+ * whose buffer was cleared (e.g. SESH). The covers/slides/captions are still
+ * in the source chat; we reconstruct the block structure and store each
+ * media item as a {msg_id} ref so the forward re-sends it by message id (no
+ * Bot-API file_id needed). Returns the session, or null if not multi-group.
+ */
+async function tryBuildGroupSessionFromLive(telegram, brief, promptChatId) {
+  if (!supabase || !brief?.telegram_chat_id || !brief?.telegram_message_id) return null;
+  try {
+    const userClient = require("../userClient");
+    const { getBlockStructure } = require("../messageBuffer");
+    const live = await userClient.getMessagesBefore(brief.telegram_chat_id, brief.telegram_message_id, 100);
+    if (!live || live.length === 0) return null;
+
+    // Normalize for getBlockStructure: message_id + text + a media flag.
+    const norm = live.map((m) => ({
+      message_id: m.message_id,
+      text:       m.text,
+      document:   m.hasMedia ? {} : undefined, // generic media marker (forward by id)
+    }));
+    // Ensure the brief itself is the anchor.
+    if (!norm.find((m) => m.message_id === Number(brief.telegram_message_id))) {
+      norm.push({ message_id: Number(brief.telegram_message_id), text: brief.raw_text || "" });
+    }
+
+    const bs = getBlockStructure(brief.telegram_chat_id, Number(brief.telegram_message_id), norm);
+    if (!bs || !bs.isMultiGroup) return null;
+
+    const groups = bs.groups.map((g) => ({
+      key:        g.key,
+      caption:    g.caption || null,
+      namedPages: g.namedPages || null,
+      coverRefs:  (g.covers || []).map((m) => ({ msg_id: m.message_id })),
+      slideRefs:  (g.slides || []).map((m) => ({ msg_id: m.message_id })),
+    }));
+
+    const pageRows = await fetchBriefPages(brief.id);
+    const pages = pageRows.map((p) => p.page_handle.toLowerCase());
+
+    const { data: session, error } = await supabase
+      .from("pending_brief_assignments")
+      .insert({
+        brief_id:         brief.id,
+        source_chat_id:   Number(brief.telegram_chat_id),
+        brief_message_id: Number(brief.telegram_message_id),
+        brief_text:       (brief.raw_text || "").slice(0, 1000),
+        pages,
+        kind:             "groups",
+        blocks:           groups,
+        assignments:      {},
+        status:           "awaiting",
+        prompt_chat_id:   Number(promptChatId),
+        expires_at:       new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+      })
+      .select()
+      .single();
+    if (error || !session) { console.error(`[resolve] live-build session: ${error?.message}`); return null; }
+
+    const auto = {};
+    groups.forEach((g, gi) => { if (Array.isArray(g.namedPages)) for (const h of g.namedPages) auto[h] = gi; });
+    if (Object.keys(auto).length) {
+      await supabase.from("pending_brief_assignments").update({ group_assignments: auto }).eq("id", session.id);
+      session.group_assignments = auto;
+    }
+    console.log(`[resolve] 🧩 live-rebuilt group session ${session.id.slice(0, 8)} for brief ${brief.id.slice(0, 8)} (${groups.length} groups from ${live.length} live msgs)`);
+    return session;
+  } catch (e) {
+    console.error(`[resolve] tryBuildGroupSessionFromLive: ${e.message}`);
+    return null;
+  }
+}
 
 /** Latest open group session for a brief (awaiting or resolved). */
 async function findGroupSession(briefId) {
@@ -482,6 +561,15 @@ async function runGroupForward(ctx, session, briefArg) {
     if (groupPages[gi]) groupPages[gi].push(h);
   }
 
+  // Send one media ref to a chat: by Bot-API file_id (captured-at-intake
+  // sessions) OR by forwarding the source message id (live-rebuilt sessions).
+  const sendRef = async (chatId, ref) => {
+    if (!ref) return null;
+    if (ref.file_id) return sendByKind(ctx.telegram, chatId, ref.kind || "photo", ref.file_id);
+    if (ref.msg_id != null) return ctx.telegram.forwardMessage(chatId, String(brief.telegram_chat_id), Number(ref.msg_id));
+    return null;
+  };
+
   let sent = 0;
   const errs = [];
   for (let gi = 0; gi < groups.length; gi++) {
@@ -496,13 +584,13 @@ async function runGroupForward(ctx, session, briefArg) {
         // 1. one cover (by position within the group, wrap if fewer covers)
         if ((g.coverRefs || []).length) {
           const cover = g.coverRefs[idx % g.coverRefs.length];
-          const s = await sendByKind(ctx.telegram, String(destChatId), cover.kind || "photo", cover.file_id);
+          const s = await sendRef(String(destChatId), cover);
           if (s?.message_id) ids.push(s.message_id);
           await sleep(80);
         }
         // 2. the group's slides (all, shared within group)
         for (const sl of (g.slideRefs || [])) {
-          const s = await sendByKind(ctx.telegram, String(destChatId), sl.kind || "video", sl.file_id);
+          const s = await sendRef(String(destChatId), sl);
           if (s?.message_id) ids.push(s.message_id);
           await sleep(80);
         }
