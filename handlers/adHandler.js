@@ -2577,12 +2577,16 @@ async function handleAdMessage(ctx) {
       // backwards-walk pulled in (Stake-after-Knicks bug, 2026-06-06).
       const briefHandles     = new Set(parsedList.map((p) => p.pageHandle?.toLowerCase()).filter(Boolean));
       const collabBundles    = canonicalizeBundleHandles(getCollabBundlesByPage(sourceChatId, adMessageId));
-      const filenameBundles  = filterBundleToBriefPages(
-        collabBundles ? null : canonicalizeBundleHandles(getFilenameBundlesByPage(sourceChatId, adMessageId)),
-        briefHandles,
-      );
+      // Capture the RAW (pre-filter) scanner output so we can tell the
+      // difference between "no per-page creative at all" and "per-page
+      // creative was found but none of it matched THIS brief's pages" — the
+      // latter is a classification misfire worth flagging (Stake-after-Knicks
+      // contamination shape), not a clean standard brief.
+      const rawFilenameBundles = collabBundles ? null : canonicalizeBundleHandles(getFilenameBundlesByPage(sourceChatId, adMessageId));
+      const rawLabelBundles    = (collabBundles || rawFilenameBundles?.byHandle.size) ? null : canonicalizeBundleHandles(getContentBundlesByPage(sourceChatId, adMessageId));
+      const filenameBundles  = filterBundleToBriefPages(rawFilenameBundles, briefHandles);
       const labelBundles     = filterBundleToBriefPages(
-        (collabBundles || filenameBundles) ? null : canonicalizeBundleHandles(getContentBundlesByPage(sourceChatId, adMessageId)),
+        (collabBundles || filenameBundles) ? null : rawLabelBundles,
         briefHandles,
       );
       const useCollab        = !!collabBundles    && collabBundles.byHandle.size    > 0;
@@ -2799,6 +2803,48 @@ async function handleAdMessage(ctx) {
           // to current behavior rather than blocking the forward entirely
           isPaused = false;
         }
+      }
+
+      // ── "Couldn't classify format" advisory (NON-BLOCKING) ──────────────
+      // The scanners found per-page creative (@-named files or "@handle ^"
+      // labels) but, after filtering to THIS brief's pages, none of it
+      // matched — so the brief fell through to the "standard / shared-to-all"
+      // path. That's a classification misfire: either the creative belongs to
+      // a different brief that the backwards-walk pulled in (Stake-after-Knicks
+      // contamination), or the @-handles are misspelled / not in the registry.
+      // We do NOT pause (forwarding proceeds as standard — pausing here caused
+      // the Day-19 empty-send disaster); we just post a heads-up so a human can
+      // /resolve it if the auto-guess was wrong. Never silent, never blocking.
+      try {
+        const rawAttribCount = (rawFilenameBundles?.byHandle.size || 0) + (rawLabelBundles?.byHandle.size || 0);
+        const unclassified = (
+          !multiGroupHandled && !isPaused
+          && detectedFormat === "standard"
+          && rawAttribCount > 0      // per-page creative WAS detected…
+          && attributedCount === 0   // …but none matched this brief's pages
+        );
+        if (unclassified && RESOLVE_ALERT_CHAT_ID) {
+          const seenHandles = [
+            ...Object.keys(rawFilenameBundles?.byHandle ? Object.fromEntries(rawFilenameBundles.byHandle) : {}),
+            ...Object.keys(rawLabelBundles?.byHandle ? Object.fromEntries(rawLabelBundles.byHandle) : {}),
+          ];
+          const seenStr = [...new Set(seenHandles)].slice(0, 12).map((h) => `@${h}`).join(", ") || "—";
+          const briefShort = briefRowId ? briefRowId.slice(0, 8) : "?";
+          const briefSnippet = (ctx.message?.text || "").split("\n").slice(0, 2).join(" / ").slice(0, 160);
+          console.warn(`[adHandler] ⚠️ UNCLASSIFIED brief ${briefShort} — detected per-page creative for [${seenStr}] but none match brief pages; forwarded as standard`);
+          await ctx.telegram.sendMessage(RESOLVE_ALERT_CHAT_ID,
+            "⚠️ *Couldn't confidently classify this brief*\n" +
+            "─────────────────────────\n" +
+            `*Brief:* \`${briefSnippet.replace(/[_*`\[]/g, (c) => "\\" + c)}…\`\n` +
+            `*Pages (${briefHandleCount}):* ${[...briefHandles].slice(0, 12).map((h) => `@${h}`).join(", ")}\n\n` +
+            `I found per-page creative labeled for ${seenStr}, but *none of those match this brief's pages* — likely a misspelled @handle or creative from a different brief.\n\n` +
+            `➡️ Forwarded as a *standard / shared-to-all* brief (every page got the same creative + brief). ` +
+            `If covers should map per-page instead, run \`/resolve ${briefShort}\`.`,
+            { parse_mode: "Markdown" }
+          ).catch((e) => console.error(`[adHandler] unclassified advisory send failed: ${e.message}`));
+        }
+      } catch (err) {
+        console.error(`[adHandler] unclassified-format advisory error (non-fatal): ${err.message}`);
       }
 
       // ── Persist bundle info to DB ────────────────────────────────────────

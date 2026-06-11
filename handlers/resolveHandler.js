@@ -208,8 +208,7 @@ function renderHeaderText(session, brief, assignedCount) {
   ];
   if (assignedCount >= totalCovers && totalCovers > 0) {
     lines.push("");
-    lines.push("✅ All covers assigned. Phase 3 will auto-resume forwarding here.");
-    lines.push("_For now: copy the mapping above and run `/replay` after renaming the source files._");
+    lines.push("✅ All covers assigned — forwarding now. Each page gets its picked cover, the shared slides, the caption, and its brief.");
   }
   return lines.join("\n");
 }
