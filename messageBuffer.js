@@ -799,9 +799,20 @@ function getStandardBundle(chatId, adMessageId) {
   const sharedMedia = [];
   const sharedSeen  = new Set(); // (file_name, file_size) keys — dedup
 
+  // Caption: the IG copy, typed once above the brief. Capture the FIRST
+  // qualifying text going backwards — NOT just the message immediately
+  // before the brief (the old _extractSharedCaption behavior). Multi-block
+  // briefs (e.g. SESH: covers → "Covers for these 6 pages ^" → slides →
+  // "Slides 2-7 for ALL ^" → caption → brief) often have an annotation or
+  // media sitting between the caption and the brief, so checking only the
+  // last message missed the caption (stored empty → /resolve sent no caption).
+  // A caption qualifies when it's non-empty, not a "^" annotation/label, not
+  // a pure @-handle list, and not a previous brief.
+  const HANDLE_LIST_ONLY = /^(@[\w.]+(?:\s+|$))+$/;
+  let sharedCaption = null;
+
   // Walk backwards from the message just before the brief. Collect media,
-  // skip non-brief text (admin chatter, captions, annotations like
-  // "8 covers ^"), stop hard if we encounter a previous ad brief.
+  // capture the caption, skip annotations, stop hard at a previous brief.
   // Dedup by (file_name, file_size) so the same upload posted twice
   // doesn't show up as two separate covers in /resolve.
   for (let i = preceding.length - 1; i >= 0; i--) {
@@ -818,14 +829,20 @@ function getStandardBundle(chatId, adMessageId) {
     }
     if (!text) continue;
     if (_looksLikePreviousBrief(text)) break;
-    // Random non-brief text (caption, annotation, chatter) — skip but keep scanning
+    // First qualifying caption going back wins (closest to the brief).
+    if (sharedCaption == null &&
+        !text.endsWith("^") &&
+        !HANDLE_LIST_ONLY.test(text)) {
+      sharedCaption = text;
+    }
+    // Otherwise: annotation ("…^"), handle list, or older chatter — skip.
   }
 
   return {
     byHandle: new Map(),
     shared: {
       media:   sharedMedia,
-      caption: _extractSharedCaption(preceding),
+      caption: sharedCaption,
     },
   };
 }

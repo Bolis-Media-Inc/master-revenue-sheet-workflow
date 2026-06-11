@@ -574,31 +574,49 @@ async function runPhase3Forward(ctx, session) {
     }
   }
 
-  // Send caption text + forward brief to every page that received covers.
-  // Caption is in ad_briefs.shared_caption (populated during initial brief
-  // processing OR /replay's bundle scan). Sent as a text message BEFORE
-  // the brief forward so the IG team can copy it as the post caption.
+  // Send caption text + per-page brief to every page that received covers.
+  // Parse the brief once for per-page prices so the brief can be rewritten to
+  // JUST this page's line (matching the normal forward path) instead of
+  // native-forwarding the full multi-page brief ("Forwarded from Danny G" +
+  // every page's PAGE INFO).
+  const { buildPerPageBriefText } = require("./adHandler");
+  const { parseAdMessage } = require("../parser");
+  const parsedForPrices = parseAdMessage(brief.raw_text || "", new Date());
+  const parsedList = Array.isArray(parsedForPrices) ? parsedForPrices : (parsedForPrices ? [parsedForPrices] : []);
+  const priceByHandle = new Map();
+  for (const p of parsedList) {
+    if (p.pageHandle) priceByHandle.set(p.pageHandle.toLowerCase(), p.adPrice);
+  }
+
   const destHandles = pages.filter((p) => pageChats.has(p));
   for (const handle of destHandles) {
-    // 1. Caption text (if present)
+    const destChatId = String(pageChats.get(handle));
+    // 1. Caption text (if captured). Empty for briefs whose caption wasn't
+    //    grabbed at processing time — nothing to send then.
     if (brief.shared_caption && brief.shared_caption.trim()) {
       try {
-        await ctx.telegram.sendMessage(String(pageChats.get(handle)), brief.shared_caption);
+        await ctx.telegram.sendMessage(destChatId, brief.shared_caption);
         await sleep(80);
       } catch (err) {
         console.error(`[resolve] Phase 3 caption send → @${handle}: ${err.message}`);
       }
     }
-    // 2. Brief itself
+    // 2. Per-page brief — rewritten to just this page's row + price. Falls
+    //    back to a native forward only if the rewrite can't isolate the page.
     try {
-      await ctx.telegram.forwardMessage(
-        String(pageChats.get(handle)),
-        String(brief.telegram_chat_id),
-        Number(brief.telegram_message_id)
+      const perPageText = buildPerPageBriefText(
+        brief.raw_text || "", handle, priceByHandle.get(handle.toLowerCase()),
       );
+      if (perPageText) {
+        await ctx.telegram.sendMessage(destChatId, perPageText);
+      } else {
+        await ctx.telegram.forwardMessage(
+          destChatId, String(brief.telegram_chat_id), Number(brief.telegram_message_id),
+        );
+      }
       await sleep(80);
     } catch (err) {
-      console.error(`[resolve] Phase 3 brief forward → @${handle}: ${err.message}`);
+      console.error(`[resolve] Phase 3 brief send → @${handle}: ${err.message}`);
     }
   }
 
