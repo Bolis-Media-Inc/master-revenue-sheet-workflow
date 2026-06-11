@@ -36,7 +36,13 @@ const { _supabase: supabase } = require("../lib/sessions");
 
 function isAdmin(telegramId) {
   const id = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
-  return id && Number(telegramId) === id;
+  // Fail-OPEN when WIZARD_ADMIN_USER_ID isn't set on this service — matches
+  // /editbrief, /replay, /syncsheets. Without this, /resolve silently
+  // no-ops for everyone (the "nothing happens" bug), because id=0 makes the
+  // gate always false. Better to allow + log in a trusted internal chat than
+  // to silently reject the operator.
+  if (!id) return true;
+  return Number(telegramId) === id;
 }
 
 // ── Markdown helpers ──────────────────────────────────────────────────────────
