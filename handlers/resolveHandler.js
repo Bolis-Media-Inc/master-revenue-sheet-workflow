@@ -388,6 +388,17 @@ async function tryBuildGroupSessionFromLive(telegram, brief, promptChatId) {
     return session;
   } catch (e) {
     console.error(`[resolve] tryBuildGroupSessionFromLive: ${e.message}`);
+    // Surface the common config gap instead of silently falling back to the
+    // cover-only flow: the live re-scan needs the sales_bolismedia user
+    // session, which must be set on THIS service.
+    if (/Missing TELEGRAM|TELEGRAM_SESSION|TELEGRAM_API/i.test(e.message || "")) {
+      await telegram.sendMessage(promptChatId,
+        "⚠️ Multi-group re-scan needs the *sales_bolismedia* user session on this service " +
+        "(`TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION`). Copy them from Greg's " +
+        "Railway service, redeploy, then `/resolve` again.\n\n_(Falling back to cover-only assignment for now — ignore it for a multi-group brief.)_",
+        { parse_mode: "Markdown" }
+      ).catch(() => {});
+    }
     return null;
   }
 }
