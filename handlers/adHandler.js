@@ -353,6 +353,13 @@ function extractMediaRef(msg) {
  * present, else copyMessage/forwardMessage by msg_id, so a ref with msg_id and
  * no file_id still forwards. Returns null only for non-media messages.
  */
+// A caption that's nothing but @handle(s) is a page-attribution line that
+// leaked into the caption slot (e.g. "@moist"), not real IG copy — never send
+// it as a caption.
+function isBareHandleCaption(t) {
+  return !!t && /^(@[\w.]+[\s,]*)+$/.test(String(t).trim());
+}
+
 function mediaRefWithId(msg) {
   if (!msg) return null;
   const ref = extractMediaRef(msg);
@@ -1250,8 +1257,9 @@ async function handleReplayCommand(ctx) {
       }
 
       // 3. Caption (per-page wins over shared) — buffer first, then DB
-      const captionToSend = perPageBundle.caption || sharedBundle.caption
+      const _rawReplayCaption = perPageBundle.caption || sharedBundle.caption
                           || dbPerPageCaption || dbSharedCaption;
+      const captionToSend = isBareHandleCaption(_rawReplayCaption) ? null : _rawReplayCaption;
       if (captionToSend) {
         const sent = await ctx.telegram.sendMessage(destChatId, captionToSend);
         if (sent?.message_id) replayIds.push(sent.message_id);
@@ -3164,7 +3172,8 @@ async function handleAdMessage(ctx) {
 
         // 3️⃣ Caption — per-page wins over shared. Either way, sent as a
         // separate text message after media so VA can copy/paste into IG.
-        const captionToSend = perPageCaption || sharedBundle.caption;
+        const _rawCaption = perPageCaption || sharedBundle.caption;
+        const captionToSend = isBareHandleCaption(_rawCaption) ? null : _rawCaption;
         if (captionToSend) {
           try {
             const sent = await ctx.telegram.sendMessage(String(destChatId), captionToSend);

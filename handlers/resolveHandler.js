@@ -879,6 +879,28 @@ async function fetchBriefById(briefId) {
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+/**
+ * Run a Telegram send, retrying on 429 (Too Many Requests) after the
+ * server-specified retry_after. Without this, a multi-page brief's burst of
+ * sends gets throttled partway and the remaining pages silently fail (Stake
+ * Day 23 only reaching 4 of 12). Up to 3 attempts; non-429 errors rethrow.
+ */
+async function sendWithFloodRetry(fn, label = "") {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const ra = err?.response?.parameters?.retry_after ?? err?.parameters?.retry_after;
+      if (ra != null && attempt < 3) {
+        console.warn(`[resolve] 429 on ${label} — waiting ${ra}s (attempt ${attempt + 1})`);
+        await sleep((Number(ra) + 1) * 1000);
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 async function sendByKind(telegram, chatId, kind, fileId) {
   if (kind === "video")     return telegram.sendVideo(chatId, fileId);
   if (kind === "audio")     return telegram.sendAudio(chatId, fileId);
@@ -1064,10 +1086,10 @@ async function runPhase3Forward(ctx, session) {
     for (const handle of targets) {
       const destChatId = pageChats.get(handle);
       try {
-        const sent = await sendCover(destChatId, cover);
+        const sent = await sendWithFloodRetry(() => sendCover(destChatId, cover), `cover→@${handle}`);
         pushId(handle, sent?.message_id);
         sentCount++;
-        await sleep(80);
+        await sleep(150);
       } catch (err) {
         errCount++;
         errors.push(`@${handle}: ${err.message}`);
@@ -1095,11 +1117,15 @@ async function runPhase3Forward(ctx, session) {
     const destChatId = String(pageChats.get(handle));
     // 1. Caption text (if captured). Empty for briefs whose caption wasn't
     //    grabbed at processing time — nothing to send then.
-    if (brief.shared_caption && brief.shared_caption.trim()) {
+    const _cap = (brief.shared_caption || "").trim();
+    // Never send a bare @handle (or handle list) as the IG caption — that's a
+    // page-attribution line that leaked into the caption slot, not real copy.
+    const _isBareHandles = _cap.length > 0 && /^(@[\w.]+[\s,]*)+$/.test(_cap);
+    if (_cap && !_isBareHandles) {
       try {
-        const sent = await ctx.telegram.sendMessage(destChatId, brief.shared_caption);
+        const sent = await sendWithFloodRetry(() => ctx.telegram.sendMessage(destChatId, brief.shared_caption), `caption→@${handle}`);
         pushId(handle, sent?.message_id);
-        await sleep(80);
+        await sleep(150);
       } catch (err) {
         console.error(`[resolve] Phase 3 caption send → @${handle}: ${err.message}`);
       }
@@ -1112,16 +1138,13 @@ async function runPhase3Forward(ctx, session) {
       const perPageText = buildPerPageBriefText(
         brief.raw_text || "", handle, priceByHandle.get(handle.toLowerCase()),
       );
-      let sent;
-      if (perPageText) {
-        sent = await ctx.telegram.sendMessage(destChatId, perPageText);
-      } else {
-        sent = await ctx.telegram.forwardMessage(
-          destChatId, String(brief.telegram_chat_id), Number(brief.telegram_message_id),
-        );
-      }
+      const sent = await sendWithFloodRetry(() => (
+        perPageText
+          ? ctx.telegram.sendMessage(destChatId, perPageText)
+          : ctx.telegram.forwardMessage(destChatId, String(brief.telegram_chat_id), Number(brief.telegram_message_id))
+      ), `brief→@${handle}`);
       pushId(handle, sent?.message_id);
-      await sleep(80);
+      await sleep(150);
     } catch (err) {
       console.error(`[resolve] Phase 3 brief send → @${handle}: ${err.message}`);
     }
