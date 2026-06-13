@@ -473,7 +473,19 @@ function getCollabBundlesByPage(chatId, adMessageId) {
 
   // If the ad wasn't found in the buffer, return null — never scan random buffer contents.
   if (adIdx <= 0) return null;
-  const preceding = buf.slice(0, adIdx);
+  let preceding = buf.slice(0, adIdx);
+  // Bound to THIS brief's block. Unlike the standard/filename/label scanners,
+  // collab used to scan ALL preceding messages — so a "Host: @x invite:" line
+  // from an UNRELATED earlier brief still in the buffer (multiple briefs in the
+  // buffer at once: /catchup re-injection, or hydration) misclassified this
+  // brief as collab and handed its pages an empty bundle, suppressing the
+  // standard scan (OneOff carousel → nothing forwarded). Trim to the messages
+  // AFTER the most recent previous-brief boundary, matching the other scanners.
+  let _boundary = -1;
+  for (let i = preceding.length - 1; i >= 0; i--) {
+    if (_looksLikePreviousBrief((preceding[i].text || preceding[i].caption || "").trim())) { _boundary = i; break; }
+  }
+  if (_boundary >= 0) preceding = preceding.slice(_boundary + 1);
 
   // "Host: @handle, invite: @a @b @c"
   // Handles may appear on separate lines within the same message text.
@@ -1035,5 +1047,6 @@ module.exports = {
   clearBufferUpTo,
   pruneToLiveSet,
   hydrateFromDb,
+  _looksLikePreviousBrief,
   MAX_BUFFER_PER_CHAT,
 };
