@@ -34,8 +34,11 @@ const WINDOW_BEFORE = 60;       // messages to re-read before+incl a brief on Fo
 // AI chat. Running /catchup IN the monetization chat (no explicit source) auto-
 // targets the ads chat, so cards + cover-pickers stay in monetization and the
 // sales team in the ads chat never sees the recovery traffic.
-const DEFAULT_SOURCE_CHAT = (process.env.TARGET_CHAT_ID || "").trim();
-const ALERT_CHAT = (process.env.RESOLVE_ALERT_CHAT_ID || process.env.SALES_TEAM_CHAT_ID || "").trim();
+// Primary ads source chat (Internal Network Ads). TARGET_CHAT_ID may be a
+// comma list — take the first. Running /catchup anywhere that ISN'T this chat
+// (e.g. the Monetization chat) auto-targets it, so the sales team in the ads
+// chat never sees recovery traffic.
+const DEFAULT_SOURCE_CHAT = (process.env.TARGET_CHAT_ID || "").split(",")[0].trim() || "-1001868750472";
 
 function isAdmin(ctx) {
   // Fail-open if no admin configured (matches the rest of the codebase's
@@ -97,11 +100,12 @@ async function handleCatchupCommand(ctx) {
   const hoursArg = hoursMatch ? parseFloat(hoursMatch[1]) : NaN;
   const hours = Number.isFinite(hoursArg) && hoursArg > 0 ? Math.min(hoursArg, 72) : 30;
 
-  // Source chat to SCAN + forward from. Explicit arg wins; otherwise, if this
-  // command was run in the monetization/alert chat (not an ads chat), default
-  // to the configured ads chat so the team there never sees the recovery.
-  const runInAlertChat = ALERT_CHAT && String(promptChatId) === String(ALERT_CHAT);
-  const sourceChatId = Number(explicitSource || ((runInAlertChat && DEFAULT_SOURCE_CHAT) ? DEFAULT_SOURCE_CHAT : promptChatId));
+  // Source chat to SCAN + forward from. Explicit arg wins. Otherwise: if run IN
+  // the ads chat, scan it; if run ANYWHERE ELSE (e.g. Monetization), default to
+  // the configured ads chat — so /catchup from Monetization points at Internal
+  // Network Ads with no args and the team there sees nothing.
+  const inAdsChat = DEFAULT_SOURCE_CHAT && String(promptChatId) === String(DEFAULT_SOURCE_CHAT);
+  const sourceChatId = Number(explicitSource || (inAdsChat ? promptChatId : (DEFAULT_SOURCE_CHAT || promptChatId)));
   const crossChat = String(sourceChatId) !== String(promptChatId);
 
   await ctx.reply(
