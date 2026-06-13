@@ -25,11 +25,11 @@
 const { parseAdMessage } = require("../parser");
 const adBriefs   = require("../lib/adBriefs");
 const userClient = require("../userClient");
-const { addMessage, getMessages } = require("../messageBuffer");
+const { addMessage, getMessages, clearChatBuffer, _looksLikePreviousBrief } = require("../messageBuffer");
 
 const ADMIN_ID = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
 const MAX_LISTED = 25;          // cap the review list so we don't flood the chat
-const WINDOW_BEFORE = 60;       // messages to re-read before+incl a brief on Forward
+const WINDOW_BEFORE = 90;       // messages to re-read before+incl a brief on Forward
 // The primary ads source chat (Internal Network Ads) + the Monetization Team +
 // AI chat. Running /catchup IN the monetization chat (no explicit source) auto-
 // targets the ads chat, so cards + cover-pickers stay in monetization and the
@@ -97,16 +97,31 @@ function applyNameOverride(text, newClient) {
  */
 async function reinjectBriefWindow(chatId, msgId) {
   const around = await userClient.getMessagesBefore(Number(chatId), Number(msgId), WINDOW_BEFORE);
-  const briefRich = around.find((x) => x.message_id === Number(msgId));
-  if (!briefRich) return null;
-  const present = new Set((getMessages(String(chatId)) || []).map((x) => x.message_id));
+  const briefIdx = around.findIndex((x) => x.message_id === Number(msgId));
+  if (briefIdx < 0) return null;
+
+  // Bound to THIS brief's OWN block: everything after the most recent previous-
+  // brief boundary (a PAGE INFO / INSTRUCTIONS line). Without this, the raw
+  // window spans several briefs and their creatives all land in this brief's
+  // cover-pick (the "covers from other briefs" bug).
+  let start = 0;
+  for (let i = briefIdx - 1; i >= 0; i--) {
+    if (_looksLikePreviousBrief(around[i].text || "")) { start = i + 1; break; }
+  }
+  const block = around.slice(start, briefIdx + 1);
+
+  // Replace the chat's buffer with JUST this block. Prior /catchup + /replay
+  // re-injections accumulate in the buffer without pruning, so a plain scan
+  // sweeps in leftover creatives from unrelated briefs — clearing first gives
+  // the bundle scan a clean, single-brief view.
+  clearChatBuffer(chatId);
   let briefMsg = null;
-  for (const rich of around) {
+  for (const rich of block) {
     const bufMsg = toBufferMsg(chatId, rich);
     if (rich.message_id === Number(msgId)) briefMsg = bufMsg;
-    if (!present.has(rich.message_id)) addMessage(bufMsg);
+    addMessage(bufMsg);
   }
-  return briefMsg || toBufferMsg(chatId, briefRich);
+  return briefMsg || toBufferMsg(chatId, around[briefIdx]);
 }
 
 const fmtTime = (unixSec) => {

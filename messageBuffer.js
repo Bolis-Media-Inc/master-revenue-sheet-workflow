@@ -1043,6 +1043,14 @@ function getBlockStructure(chatId, adMessageId, messagesOverride) {
   return { groups, isMultiGroup };
 }
 
+// Empty a chat's in-memory buffer entirely. Used by /replay + /catchup before
+// re-injecting a single brief's block, so the bundle scan can't pick up
+// leftovers from prior re-injections (which accumulate without pruning and
+// were mixing other briefs' creatives into the cover-pick).
+function clearChatBuffer(chatId) {
+  _buffers.set(String(chatId), []);
+}
+
 module.exports = {
   addMessage,
   updateMessage,
@@ -1054,6 +1062,7 @@ module.exports = {
   getBlockStructure,
   getMessages,
   clearBufferUpTo,
+  clearChatBuffer,
   pruneToLiveSet,
   hydrateFromDb,
   _looksLikePreviousBrief,
