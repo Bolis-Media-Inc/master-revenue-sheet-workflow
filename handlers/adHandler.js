@@ -2057,6 +2057,14 @@ async function handleAdMessage(ctx) {
       return await handleCatchupCommand(ctx);
     }
 
+    // /fixname <msgId> <name> — override a mislabeled brief's client name so
+    // /catchup forwards + sheets it under the correct name (when the source
+    // message can't be edited).
+    if (text && /^\/fixname\b/i.test(text.trim())) {
+      const { handleFixNameCommand } = require("./catchupHandler");
+      return await handleFixNameCommand(ctx);
+    }
+
     // /resolve — cover-to-page assignment for paused/ambiguous briefs.
     // Routed HERE (text-regex on bot.on "message") rather than via
     // bot.command("resolve") because in a multi-bot group (Monetization

@@ -73,6 +73,21 @@ function toBufferMsg(chatId, m) {
   return msg;
 }
 
+// Rewrite the client name in a brief's header line ("CLIENT - CATEGORY - …").
+// Used to apply a /fixname override to a mislabeled brief the operator can't
+// edit at the source. Replaces everything before the first " - " with newClient,
+// preserving category/bulk/price.
+function applyNameOverride(text, newClient) {
+  if (!text || !newClient) return text;
+  const lines = text.split("\n");
+  const idx = lines.findIndex((l) => l.trim());
+  if (idx === -1) return text;
+  const dash = lines[idx].indexOf(" - ");
+  if (dash === -1) return text;
+  lines[idx] = newClient + lines[idx].slice(dash);
+  return lines.join("\n");
+}
+
 const fmtTime = (unixSec) => {
   try {
     return new Date((unixSec || 0) * 1000).toLocaleString("en-US", {
@@ -235,6 +250,25 @@ async function handleCatchupCallback(ctx) {
   }
   if (!briefMsg) briefMsg = toBufferMsg(chatId, briefRich);
 
+  // Apply a name override if one was set via /fixname (for a mislabeled brief
+  // the operator can't edit at the source). Rewrites the client name in the
+  // brief text BEFORE processing, so forwarding + master/per-page sheets all
+  // use the corrected name.
+  try {
+    if (adBriefs._supabase) {
+      const { data: ov } = await adBriefs._supabase
+        .from("brief_name_overrides")
+        .select("client_name")
+        .eq("chat_id", chatId)
+        .eq("message_id", msgId)
+        .maybeSingle();
+      if (ov?.client_name && briefMsg.text) {
+        briefMsg.text = applyNameOverride(briefMsg.text, ov.client_name);
+        console.log(`[catchup] applied name override ${chatId}/${msgId} → "${ov.client_name}"`);
+      }
+    }
+  } catch (e) { console.error(`[catchup] name override lookup failed: ${e.message}`); }
+
   // Run the normal pipeline. _isDeferredProcessing skips the 2-min defer gate;
   // handleAdMessage then forwards by message_id, writes sheets, and routes
   // ambiguous covers to the picker — exactly like a freshly-received brief.
@@ -263,4 +297,31 @@ async function handleCatchupCallback(ctx) {
   }
 }
 
-module.exports = { handleCatchupCommand, handleCatchupCallback, toBufferMsg };
+// ── /fixname <msgId> <new client name> ─────────────────────────────────────────
+// Set a name override for a brief the operator can't edit at the source (wrong
+// name typed by the sender). The override is applied when /catchup forwards
+// that message id. Keyed to the ads source chat by default.
+async function handleFixNameCommand(ctx) {
+  if (!isAdmin(ctx)) return;
+  const txt = (ctx.message?.text || "").trim();
+  // /fixname <msgId> <name>   or   /fixname <chatId> <msgId> <name>
+  let m = txt.match(/^\/fixname\s+(-100\d{6,})\s+(\d+)\s+(.+)$/i);
+  let chatId, msgId, name;
+  if (m) { chatId = Number(m[1]); msgId = Number(m[2]); name = m[3].trim(); }
+  else {
+    m = txt.match(/^\/fixname\s+(\d+)\s+(.+)$/i);
+    if (!m) {
+      await ctx.reply("Usage: /fixname <messageId> <new client name>\n(or /fixname <chatId> <messageId> <name>)").catch(() => {});
+      return;
+    }
+    chatId = Number(DEFAULT_SOURCE_CHAT); msgId = Number(m[1]); name = m[2].trim();
+  }
+  if (!adBriefs._supabase) { await ctx.reply("❌ DB unavailable.").catch(() => {}); return; }
+  const { error } = await adBriefs._supabase
+    .from("brief_name_overrides")
+    .upsert({ chat_id: chatId, message_id: msgId, client_name: name }, { onConflict: "chat_id,message_id" });
+  if (error) { await ctx.reply(`❌ Couldn't save override: ${error.message}`).catch(() => {}); return; }
+  await ctx.reply(`✅ Name override set: msg ${msgId} → "${name}".\nRe-run /catchup and Forward it — the brief + sheets will use this name.`).catch(() => {});
+}
+
+module.exports = { handleCatchupCommand, handleCatchupCallback, handleFixNameCommand, toBufferMsg };
