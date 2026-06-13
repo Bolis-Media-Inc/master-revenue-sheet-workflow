@@ -111,12 +111,16 @@ async function checkAndFireReminders(telegram) {
       continue;
     }
 
+    // Plain text — NO parse_mode. Handles like @dailyhumor_4u contain
+    // underscores, which open an unterminated Markdown italic entity and made
+    // Telegram reject every reminder with "can't parse entities". Operational
+    // reminders don't need bold; reliability wins.
     const message = r.type === "timed"
-      ? `📸 *${r.client}* post is expiring on @${r.handle} — take analytics screenshots then delete the post.`
-      : `📊 *7-day analytics check-in* — ${r.client} on @${r.handle}.\nDo NOT delete this post — just log your analytics.`;
+      ? `📸 ${r.client} post is expiring on @${r.handle} — take analytics screenshots then delete the post.`
+      : `📊 7-day analytics check-in — ${r.client} on @${r.handle}.\nDo NOT delete this post — just log your analytics.`;
 
     try {
-      await telegram.sendMessage(r.destChatId, message, { parse_mode: "Markdown" });
+      await telegram.sendMessage(r.destChatId, message);
       await markReminderSent(MASTER_SHEET_ID, r.rowNumber);
       console.log(`[reminders] ✅ Sent ${r.type} reminder → @${r.handle} (${r.client})`);
     } catch (err) {
