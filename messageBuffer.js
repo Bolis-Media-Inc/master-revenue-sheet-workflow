@@ -133,6 +133,24 @@ function _looksLikePreviousBrief(text) {
 }
 
 /**
+ * Trim a brief's `preceding` slice to JUST its own block: everything AFTER the
+ * most recent previous-brief boundary (a PAGE INFO / INSTRUCTIONS line). In
+ * live operation the buffer is pruned per-brief, so this is a no-op. It matters
+ * when multiple briefs share the buffer at once — /catchup re-injection or DB
+ * hydration — where an unbounded backward walk would pull in (or wrongly DROP,
+ * e.g. shared slides) content belonging to an adjacent brief. Centralizes the
+ * boundary handling every scanner needs so they all behave like the pruned
+ * live buffer.
+ */
+function _currentBlock(preceding) {
+  for (let i = preceding.length - 1; i >= 0; i--) {
+    const t = (preceding[i].text || preceding[i].caption || "").trim();
+    if (_looksLikePreviousBrief(t)) return preceding.slice(i + 1);
+  }
+  return preceding;
+}
+
+/**
  * Store a message in the rolling buffer for its chat.
  * Call this on EVERY incoming message before any other handler fires.
  *
@@ -288,7 +306,7 @@ function getContentBundlesByPage(chatId, adMessageId) {
   // Messages before the ad (oldest … newest, not including the ad itself)
   // If the ad wasn't found in the buffer, return empty — never scan random buffer contents.
   if (adIdx <= 0) return { byHandle: new Map(), shared: { media: [], caption: null } };
-  const preceding = buf.slice(0, adIdx);
+  const preceding = _currentBlock(buf.slice(0, adIdx));
 
   const byHandle = new Map();
   const sharedMedia = []; // media not claimed by any label going backwards
@@ -473,19 +491,10 @@ function getCollabBundlesByPage(chatId, adMessageId) {
 
   // If the ad wasn't found in the buffer, return null — never scan random buffer contents.
   if (adIdx <= 0) return null;
-  let preceding = buf.slice(0, adIdx);
-  // Bound to THIS brief's block. Unlike the standard/filename/label scanners,
-  // collab used to scan ALL preceding messages — so a "Host: @x invite:" line
-  // from an UNRELATED earlier brief still in the buffer (multiple briefs in the
-  // buffer at once: /catchup re-injection, or hydration) misclassified this
-  // brief as collab and handed its pages an empty bundle, suppressing the
-  // standard scan (OneOff carousel → nothing forwarded). Trim to the messages
-  // AFTER the most recent previous-brief boundary, matching the other scanners.
-  let _boundary = -1;
-  for (let i = preceding.length - 1; i >= 0; i--) {
-    if (_looksLikePreviousBrief((preceding[i].text || preceding[i].caption || "").trim())) { _boundary = i; break; }
-  }
-  if (_boundary >= 0) preceding = preceding.slice(_boundary + 1);
+  // Bound to THIS brief's block (see _currentBlock) so a "Host: @x invite:"
+  // line from an unrelated earlier brief in the buffer can't misclassify this
+  // one as collab — matters when multiple briefs share the buffer (/catchup).
+  const preceding = _currentBlock(buf.slice(0, adIdx));
 
   // "Host: @handle, invite: @a @b @c"
   // Handles may appear on separate lines within the same message text.
@@ -607,7 +616,7 @@ function getFilenameBundlesByPage(chatId, adMessageId) {
   const buf = _buffers.get(String(chatId)) || [];
   const adIdx = buf.findIndex((m) => m.message_id === adMessageId);
   if (adIdx <= 0) return null;
-  const preceding = buf.slice(0, adIdx);
+  const preceding = _currentBlock(buf.slice(0, adIdx));
 
   const byHandle = new Map();
   const sharedMedia = []; // chronological — collected newest-first then reversed below
@@ -806,7 +815,7 @@ function getStandardBundle(chatId, adMessageId) {
   const buf = _buffers.get(String(chatId)) || [];
   const adIdx = buf.findIndex((m) => m.message_id === adMessageId);
   if (adIdx <= 0) return { byHandle: new Map(), shared: { media: [], caption: null } };
-  const preceding = buf.slice(0, adIdx);
+  const preceding = _currentBlock(buf.slice(0, adIdx));
 
   const sharedMedia = [];
   const sharedSeen  = new Set(); // (file_name, file_size) keys — dedup
@@ -945,7 +954,7 @@ function getBlockStructure(chatId, adMessageId, messagesOverride) {
   const buf = messagesOverride || _buffers.get(String(chatId)) || [];
   const adIdx = buf.findIndex((m) => m.message_id === adMessageId);
   if (adIdx <= 0) return null;
-  const preceding = buf.slice(0, adIdx);
+  const preceding = _currentBlock(buf.slice(0, adIdx));
 
   const LABEL_RE = /\^\s*$/;
   const kindOf = (t) => {
