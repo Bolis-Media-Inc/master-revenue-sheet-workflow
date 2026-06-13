@@ -30,6 +30,12 @@ const { addMessage, getMessages } = require("../messageBuffer");
 const ADMIN_ID = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
 const MAX_LISTED = 25;          // cap the review list so we don't flood the chat
 const WINDOW_BEFORE = 60;       // messages to re-read before+incl a brief on Forward
+// The primary ads source chat (Internal Network Ads) + the Monetization Team +
+// AI chat. Running /catchup IN the monetization chat (no explicit source) auto-
+// targets the ads chat, so cards + cover-pickers stay in monetization and the
+// sales team in the ads chat never sees the recovery traffic.
+const DEFAULT_SOURCE_CHAT = (process.env.TARGET_CHAT_ID || "").trim();
+const ALERT_CHAT = (process.env.RESOLVE_ALERT_CHAT_ID || process.env.SALES_TEAM_CHAT_ID || "").trim();
 
 function isAdmin(ctx) {
   // Fail-open if no admin configured (matches the rest of the codebase's
@@ -79,19 +85,34 @@ async function handleCatchupCommand(ctx) {
     console.log(`[catchup] denied — user ${ctx.from?.id} not admin`);
     return;
   }
-  const chatId = ctx.chat?.id;
-  if (!chatId) return;
+  const promptChatId = ctx.chat?.id;            // where cards/responses go (e.g. Monetization)
+  if (!promptChatId) return;
 
   const cmd = (ctx.message?.text || "").trim();
-  const hoursArg = parseFloat((cmd.match(/\/catchup\s+([\d.]+)/i) || [])[1]);
+  // Optional explicit source chat (a Telegram supergroup id, -100…). Strip it
+  // before parsing hours so the id's digits aren't read as the hour count.
+  const sourceMatch = cmd.match(/(-100\d{6,})/);
+  const explicitSource = sourceMatch ? sourceMatch[1] : null;
+  const hoursMatch = cmd.replace(/-100\d{6,}/, "").match(/\b(\d{1,3}(?:\.\d+)?)\b/);
+  const hoursArg = hoursMatch ? parseFloat(hoursMatch[1]) : NaN;
   const hours = Number.isFinite(hoursArg) && hoursArg > 0 ? Math.min(hoursArg, 72) : 30;
 
-  await ctx.reply(`🔎 Scanning the last ${hours}h of this chat for missed briefs…`).catch(() => {});
+  // Source chat to SCAN + forward from. Explicit arg wins; otherwise, if this
+  // command was run in the monetization/alert chat (not an ads chat), default
+  // to the configured ads chat so the team there never sees the recovery.
+  const runInAlertChat = ALERT_CHAT && String(promptChatId) === String(ALERT_CHAT);
+  const sourceChatId = Number(explicitSource || ((runInAlertChat && DEFAULT_SOURCE_CHAT) ? DEFAULT_SOURCE_CHAT : promptChatId));
+  const crossChat = String(sourceChatId) !== String(promptChatId);
+
+  await ctx.reply(
+    `🔎 Scanning the last ${hours}h of ${crossChat ? `chat \`${sourceChatId}\`` : "this chat"} for missed briefs…`,
+    { parse_mode: "Markdown" }
+  ).catch(() => {});
 
   // 1. Read history via the user account.
   let window;
   try {
-    window = await userClient.getHistoryWindow(chatId, Date.now() - hours * 3600 * 1000, 200);
+    window = await userClient.getHistoryWindow(sourceChatId, Date.now() - hours * 3600 * 1000, 1500);
   } catch (err) {
     await ctx.reply(
       `❌ Couldn't read chat history: ${err.message}\n\n` +
@@ -115,7 +136,7 @@ async function handleCatchupCommand(ctx) {
     if (!items.length || !items[0]?.client) continue;
 
     // Dedupe: already processed (forwarded + sheeted) → skip.
-    const existing = await adBriefs.findBriefByTelegramMessage(Number(chatId), m.message_id);
+    const existing = await adBriefs.findBriefByTelegramMessage(sourceChatId, m.message_id);
     if (existing) continue;
 
     const pages = [...new Set(items.map((p) => p.pageHandle?.toLowerCase()).filter(Boolean))];
@@ -139,7 +160,7 @@ async function handleCatchupCommand(ctx) {
   for (const b of shown) {
     const snippet = b.text.split("\n").slice(0, 2).join(" / ").slice(0, 120);
     const pagesStr = b.pages.length ? b.pages.map((h) => `@${h}`).join(", ") : "(no @handles in brief)";
-    await ctx.telegram.sendMessage(chatId,
+    await ctx.telegram.sendMessage(promptChatId,
       `🆕 *Missed brief*\n` +
       `*Campaign:* ${b.client}\n` +
       `*Pages (${b.pages.length}):* ${pagesStr}\n` +
@@ -148,8 +169,8 @@ async function handleCatchupCommand(ctx) {
       {
         parse_mode: "Markdown",
         reply_markup: { inline_keyboard: [[
-          { text: "✅ Forward", callback_data: `catchup:fwd:${chatId}:${b.message_id}` },
-          { text: "⏭️ Skip",    callback_data: `catchup:skip:${chatId}:${b.message_id}` },
+          { text: "✅ Forward", callback_data: `catchup:fwd:${sourceChatId}:${b.message_id}` },
+          { text: "⏭️ Skip",    callback_data: `catchup:skip:${sourceChatId}:${b.message_id}` },
         ]] },
       }
     ).catch((e) => console.error(`[catchup] card send failed: ${e.message}`));
@@ -211,6 +232,10 @@ async function handleCatchupCallback(ctx) {
   // Run the normal pipeline. _isDeferredProcessing skips the 2-min defer gate;
   // handleAdMessage then forwards by message_id, writes sheets, and routes
   // ambiguous covers to the picker — exactly like a freshly-received brief.
+  // chat.id = the SOURCE chat (forward-from + page lookups), but route any
+  // handler replies to the card's chat (where /catchup was run, e.g.
+  // Monetization) so recovery chatter stays out of the ads chat.
+  const replyChatId = ctx.chat?.id || chatId;
   const { handleAdMessage } = require("./adHandler");
   const fakeCtx = {
     message:               briefMsg,
@@ -218,7 +243,7 @@ async function handleCatchupCallback(ctx) {
     from:                  briefMsg.from,
     telegram:              ctx.telegram,
     _isDeferredProcessing: true,
-    reply: (text, extra) => ctx.telegram.sendMessage(chatId, text, extra),
+    reply: (text, extra) => ctx.telegram.sendMessage(replyChatId, text, extra),
   };
   try {
     await handleAdMessage(fakeCtx);
