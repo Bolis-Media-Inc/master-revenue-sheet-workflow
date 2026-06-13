@@ -208,11 +208,12 @@ function renderHeaderText(session, brief, assignedCount) {
   ];
   if (assignedCount >= totalCovers && totalCovers > 0) {
     lines.push("");
-    lines.push("✅ All covers assigned — forwarding now. Each page gets its picked cover, the shared slides, the caption, and its brief.");
+    lines.push("✅ *All covers assigned.* Review them, then tap *Forward all* below to send.");
+    lines.push("_Misclick? Just tap a different page under that cover to re-assign — nothing sends until you press Forward._");
   } else {
     lines.push("");
-    lines.push(`⏸️ *Forwarding paused* — I found ${totalCovers} cover${totalCovers === 1 ? "" : "s"} but no per-page @handle, so I can't tell which goes where.`);
-    lines.push("Tap a page under each cover below to assign it. Auto-forwards once all are mapped.");
+    lines.push(`⏸️ *Forwarding paused* — ${totalCovers} cover${totalCovers === 1 ? "" : "s"}, no per-page @handle, so I can't tell which goes where.`);
+    lines.push("Tap a page under each cover to assign it (re-tap to change). A *Forward all* button appears once every cover is mapped.");
   }
   return lines.join("\n");
 }
@@ -696,7 +697,9 @@ async function postAssignmentUI(telegram, chatId, sessionId, opts = {}) {
     const existing = existingAssignments[String(cover.msg_id)];
     const grpTag   = cover.group != null ? ` · G${cover.group + 1}` : "";
     const caption  = `Cover \`${md(cover.file_name || cover.msg_id)}\`${grpTag}`;
-    const keyboard = existing ? undefined : buildCoverKeyboard(session.id, cover.msg_id, pages);
+    // Always attach the keyboard — covers stay re-assignable (re-tap to change)
+    // until the operator presses "Forward all". Nothing auto-forwards.
+    const keyboard = buildCoverKeyboard(session.id, cover.msg_id, pages);
     let sent;
     try {
       if (!cover.file_id && cover.msg_id != null && session.source_chat_id) {
@@ -716,9 +719,11 @@ async function postAssignmentUI(telegram, chatId, sessionId, opts = {}) {
         });
       }
       if (existing) {
+        // Show the saved badge but KEEP the keyboard so it's still changeable.
+        // Plain text — the badge's @handle underscores break Markdown.
         await telegram.editMessageCaption(chatId, sent.message_id, undefined,
-          `${caption}\n\n${renderAssignmentBadge(existing, pages)}`,
-          { parse_mode: "Markdown" }
+          `Cover ${cover.file_name || cover.msg_id}${grpTag}\n\n${renderAssignmentBadge(existing, pages)}`,
+          { reply_markup: keyboard }
         );
       }
     } catch (err) {
@@ -728,7 +733,7 @@ async function postAssignmentUI(telegram, chatId, sessionId, opts = {}) {
         `*Cover ${cover.idx + 1}* — couldn't preview (${md(err.message)})\n\nFile: \`${md(cover.file_name || cover.msg_id)}\``,
         {
           parse_mode: "Markdown",
-          reply_markup: existing ? undefined : buildCoverKeyboard(session.id, cover.msg_id, pages),
+          reply_markup: keyboard,
         }
       );
     }
@@ -771,72 +776,69 @@ async function handleAssignmentCallback(ctx) {
       return ctx.answerCbQuery("Not authorized.", { show_alert: false });
     }
 
+    // ── "Forward all" button → THE only thing that forwards ─────────────────
+    // Assignment is never auto-forwarded anymore, so a misclick is always
+    // correctable (re-tap a cover) right up until this is pressed.
+    if (msgId === "__forward__") {
+      await ctx.answerCbQuery("Forwarding…").catch(() => {});
+      const { data: claimed } = await supabase
+        .from("pending_brief_assignments")
+        .update({ status: "forwarding" })
+        .eq("id", sessionId).eq("status", "awaiting").select("id");
+      if (claimed && claimed.length) {
+        const { data: sess } = await supabase
+          .from("pending_brief_assignments").select("*").eq("id", sessionId).single();
+        runPhase3Forward(ctx, sess).catch((err) => console.error("[resolve] Phase 3 forward failed:", err.message));
+      } else {
+        console.log(`[resolve] forward already running/done for ${sessionId.slice(0, 8)} — ignoring re-tap`);
+      }
+      return;
+    }
+
     const updated = await saveAssignment(sessionId, msgId, target);
 
-    // Edit THIS cover's caption to show the badge + remove the keyboard
     const pages = updated.pages || [];
     const badge = renderAssignmentBadge(target, pages);
     const chatId = ctx.callbackQuery.message.chat.id;
     const messageId = ctx.callbackQuery.message.message_id;
     const oldCaption = ctx.callbackQuery.message.caption || ctx.callbackQuery.message.text || "Cover";
+    // Strip any prior badge so re-assigning the same cover doesn't stack them.
+    const baseCaption = oldCaption.replace(/\n\n(?:→ |🔁|⏭️)[\s\S]*$/, "");
+    // KEEP the keyboard attached so a misclick is fixable: re-tap a different
+    // page and saveAssignment overwrites. Plain text (no parse_mode) — badges
+    // contain @handles whose underscores break Markdown.
+    const coverKb = buildCoverKeyboard(sessionId, msgId, pages);
     try {
-      // Plain text — NO parse_mode. The badge contains the target @handle, and
-      // underscores in handles like @dailyhumor_4u / @i_have_no_memes96_v2 open
-      // an unterminated Markdown entity → "can't parse entities" 400, leaving
-      // the cover card un-badged. No formatting needed here.
       if (ctx.callbackQuery.message.caption !== undefined) {
-        await ctx.telegram.editMessageCaption(chatId, messageId, undefined, `${oldCaption}\n\n${badge}`);
+        await ctx.telegram.editMessageCaption(chatId, messageId, undefined, `${baseCaption}\n\n${badge}`, { reply_markup: coverKb });
       } else {
-        await ctx.telegram.editMessageText(chatId, messageId, undefined, `${oldCaption}\n\n${badge}`);
+        await ctx.telegram.editMessageText(chatId, messageId, undefined, `${baseCaption}\n\n${badge}`, { reply_markup: coverKb });
       }
     } catch (err) {
-      // Editing can fail if message is too old or unchanged — ignore
       console.warn(`[resolve] edit caption failed: ${err.message}`);
     }
 
-    // Also refresh the header (first prompt message) with new progress count
     const totalCovers = (updated.unattributed || []).length;
     const assignedCount = Object.keys(updated.assignments || {}).length;
+    const done = assignedCount >= totalCovers;
     const promptIds = updated.prompt_message_ids || [];
     if (promptIds.length > 0) {
-      // Need the brief for the header context; lightweight re-fetch
       const { data: brief } = await supabase
         .from("ad_briefs").select("client").eq("id", updated.brief_id).single();
+      // "Forward all" appears only once every cover is assigned. Forwarding is
+      // explicit (no auto-fire), so misclicks stay correctable until pressed.
+      const headerKb = done
+        ? { inline_keyboard: [[{ text: `✅ Forward all ${totalCovers} → pages`, callback_data: `ca:${sessionId}:__forward__:go` }]] }
+        : undefined;
       try {
         await ctx.telegram.editMessageText(chatId, promptIds[0], undefined,
           renderHeaderText(updated, brief, assignedCount),
-          { parse_mode: "Markdown" }
+          { parse_mode: "Markdown", reply_markup: headerKb }
         );
       } catch (_) {}
     }
 
-    const done = assignedCount >= totalCovers;
-    await ctx.answerCbQuery(done ? `✅ All ${totalCovers} assigned` : `Saved (${assignedCount}/${totalCovers})`, { show_alert: false });
-
-    // ── Phase 3: auto-forward when all assignments are in ─────────────────
-    // Last tap just landed → resume forwarding using the manual mapping.
-    // For each assigned cover, send it to the target page's chat. "Shared"
-    // assignments fan out to every page. "Skip" drops the cover entirely.
-    // Then forward the brief text to each page so they have full context.
-    if (done) {
-      // Single-run guard. Without this, every tap AFTER the last assignment
-      // (re-taps, corrections) re-fired Phase 3 — and each run fans out to all
-      // pages, so the Stake-Day-21 brief flooded Telegram and hit 429s. Flip
-      // awaiting→forwarding atomically; only the tap that wins the flip runs.
-      const { data: claimed } = await supabase
-        .from("pending_brief_assignments")
-        .update({ status: "forwarding" })
-        .eq("id", sessionId)
-        .eq("status", "awaiting")
-        .select("id");
-      if (claimed && claimed.length) {
-        runPhase3Forward(ctx, updated).catch((err) => {
-          console.error("[resolve] Phase 3 forward failed:", err.message);
-        });
-      } else {
-        console.log(`[resolve] Phase 3 already running/done for ${sessionId.slice(0, 8)} — skipping re-fire`);
-      }
-    }
+    await ctx.answerCbQuery(done ? `✅ All ${totalCovers} assigned — tap Forward all` : `Saved (${assignedCount}/${totalCovers})`, { show_alert: false });
   } catch (err) {
     console.error("[resolve] callback error:", err.message);
     try { await ctx.answerCbQuery(`❌ ${err.message}`, { show_alert: true }); } catch (_) {}
