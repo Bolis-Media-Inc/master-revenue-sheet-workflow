@@ -1019,21 +1019,19 @@ async function handleReplayCommand(ctx) {
   // Scanner output is canonicalized against the registry so the
   // forwarder's parsedList-vs-byHandle lookup never misses on typo'd
   // raw handles in Host lines / filenames / labels.
-  const collabBundles    = canonicalizeBundleHandles(getCollabBundlesByPage(sourceChatId, briefMessageId));
-  // Filter scanner output to THIS brief's page list — drops orphan @-named
-  // covers / labels from a missing or earlier brief that the backwards-walk
-  // accidentally pulled in (Stake-after-Knicks bug, 2026-06-06).
-  const filenameBundles  = filterBundleToBriefPages(
-    collabBundles ? null : canonicalizeBundleHandles(getFilenameBundlesByPage(sourceChatId, briefMessageId)),
-    briefHandles,
-  );
-  const labelBundles     = filterBundleToBriefPages(
-    (collabBundles || filenameBundles) ? null : canonicalizeBundleHandles(getContentBundlesByPage(sourceChatId, briefMessageId)),
-    briefHandles,
-  );
-  const useCollab        = !!collabBundles    && collabBundles.byHandle.size    > 0;
-  const useFilenames     = !useCollab && !!filenameBundles && filenameBundles.byHandle.size > 0;
-  const useLabels        = !useCollab && !useFilenames && !!labelBundles && labelBundles.byHandle.size > 0;
+  // Run all three scanners, filter each to THIS brief's pages, and pick the one
+  // covering the MOST pages (drops orphan @-named covers / labels and prevents a
+  // stray collab "Host:" line from an adjacent brief hijacking the brief — see
+  // the live-handler block for the full rationale).
+  const collabBundles    = filterBundleToBriefPages(canonicalizeBundleHandles(getCollabBundlesByPage(sourceChatId, briefMessageId)), briefHandles);
+  const filenameBundles  = filterBundleToBriefPages(canonicalizeBundleHandles(getFilenameBundlesByPage(sourceChatId, briefMessageId)), briefHandles);
+  const labelBundles     = filterBundleToBriefPages(canonicalizeBundleHandles(getContentBundlesByPage(sourceChatId, briefMessageId)), briefHandles);
+  const collabCov   = collabBundles?.byHandle.size   || 0;
+  const filenameCov = filenameBundles?.byHandle.size || 0;
+  const labelCov    = labelBundles?.byHandle.size    || 0;
+  const useCollab        = collabCov   > 0 && collabCov   >= filenameCov && collabCov >= labelCov;
+  const useFilenames     = !useCollab && filenameCov > 0 && filenameCov >= labelCov;
+  const useLabels        = !useCollab && !useFilenames && labelCov > 0;
   const standardBundle   = (!useCollab && !useFilenames && !useLabels)
                          ? getStandardBundle(sourceChatId, briefMessageId)
                          : null;
@@ -2654,22 +2652,27 @@ async function handleAdMessage(ctx) {
       // @-named covers / labels from a missing or earlier brief that the
       // backwards-walk pulled in (Stake-after-Knicks bug, 2026-06-06).
       const briefHandles     = new Set(parsedList.map((p) => p.pageHandle?.toLowerCase()).filter(Boolean));
-      const collabBundles    = canonicalizeBundleHandles(getCollabBundlesByPage(sourceChatId, adMessageId));
-      // Capture the RAW (pre-filter) scanner output so we can tell the
-      // difference between "no per-page creative at all" and "per-page
-      // creative was found but none of it matched THIS brief's pages" — the
-      // latter is a classification misfire worth flagging (Stake-after-Knicks
-      // contamination shape), not a clean standard brief.
-      const rawFilenameBundles = collabBundles ? null : canonicalizeBundleHandles(getFilenameBundlesByPage(sourceChatId, adMessageId));
-      const rawLabelBundles    = (collabBundles || rawFilenameBundles?.byHandle.size) ? null : canonicalizeBundleHandles(getContentBundlesByPage(sourceChatId, adMessageId));
+      // Run all three structured scanners and filter EACH to this brief's pages.
+      // Collab used to win outright on any match — but a stray "Host: @x invite:"
+      // line from an adjacent brief in the buffer (whose PAGE INFO boundary got
+      // pruned, so _currentBlock couldn't bound it) matches collab on a single
+      // coincidental page and hijacks the whole brief, suppressing the label/
+      // filename scanners that would attribute every page (FashionNova → tagged
+      // collab, attributed 1, dropped creatives). So instead pick the scanner
+      // covering the MOST of the brief's actual pages — a real collab covers all
+      // of them, contamination covers ~0-1 and loses.
+      const rawCollabBundles   = canonicalizeBundleHandles(getCollabBundlesByPage(sourceChatId, adMessageId));
+      const rawFilenameBundles = canonicalizeBundleHandles(getFilenameBundlesByPage(sourceChatId, adMessageId));
+      const rawLabelBundles    = canonicalizeBundleHandles(getContentBundlesByPage(sourceChatId, adMessageId));
+      const collabBundles    = filterBundleToBriefPages(rawCollabBundles, briefHandles);
       const filenameBundles  = filterBundleToBriefPages(rawFilenameBundles, briefHandles);
-      const labelBundles     = filterBundleToBriefPages(
-        (collabBundles || filenameBundles) ? null : rawLabelBundles,
-        briefHandles,
-      );
-      const useCollab        = !!collabBundles    && collabBundles.byHandle.size    > 0;
-      const useFilenames     = !useCollab && !!filenameBundles && filenameBundles.byHandle.size > 0;
-      const useLabels        = !useCollab && !useFilenames && !!labelBundles && labelBundles.byHandle.size > 0;
+      const labelBundles     = filterBundleToBriefPages(rawLabelBundles, briefHandles);
+      const collabCov   = collabBundles?.byHandle.size   || 0;
+      const filenameCov = filenameBundles?.byHandle.size || 0;
+      const labelCov    = labelBundles?.byHandle.size    || 0;
+      const useCollab    = collabCov   > 0 && collabCov   >= filenameCov && collabCov >= labelCov;
+      const useFilenames = !useCollab && filenameCov > 0 && filenameCov >= labelCov;
+      const useLabels    = !useCollab && !useFilenames && labelCov > 0;
       // Pick the active bundle source. When no attribution is detected by
       // any of the three structured scanners, fall back to getStandardBundle:
       // walks backwards collecting ALL preceding media until hitting a
