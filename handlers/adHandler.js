@@ -998,6 +998,21 @@ async function handleReplayCommand(ctx) {
     if (await replayCoverForward(ctx, dbBriefForBackfill.id)) return;
   }
 
+  // If the brief's creatives aren't in the buffer (recovered via /catchup, or
+  // aged out), live-re-read them from chat history so the bundle scan + forward
+  // below have media to send. /replay stays forward-only (the brief already has
+  // a DB row, so no sheet writes). Best-effort: if the user session is down,
+  // fall through and forward whatever the buffer has.
+  if (!getMessages(String(sourceChatId)).some((m) => m.message_id === Number(briefMessageId))) {
+    try {
+      const { reinjectBriefWindow } = require("./catchupHandler");
+      await reinjectBriefWindow(sourceChatId, briefMessageId);
+      console.log(`[adHandler] /replay live-re-read brief ${briefMessageId} into buffer`);
+    } catch (e) {
+      console.warn(`[adHandler] /replay live re-read skipped: ${e.message}`);
+    }
+  }
+
   // Re-build bundles from the messageBuffer (same logic as initial processing).
   // Same getStandardBundle fallback as the main handler so /replay handles
   // 6+ slide carousels without dropping early slides.

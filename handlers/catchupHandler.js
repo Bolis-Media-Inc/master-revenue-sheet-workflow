@@ -88,6 +88,27 @@ function applyNameOverride(text, newClient) {
   return lines.join("\n");
 }
 
+/**
+ * Re-read the messages around a brief from live chat history and re-inject them
+ * into the buffer (so bundle scanners + forward-by-message_id work for a brief
+ * whose creatives aren't in the buffer — recovered via catchup, aged out, etc).
+ * Idempotent: only injects message_ids not already in the in-memory buffer.
+ * Returns the brief's buffer-shaped message, or null if it's gone from history.
+ */
+async function reinjectBriefWindow(chatId, msgId) {
+  const around = await userClient.getMessagesBefore(Number(chatId), Number(msgId), WINDOW_BEFORE);
+  const briefRich = around.find((x) => x.message_id === Number(msgId));
+  if (!briefRich) return null;
+  const present = new Set((getMessages(String(chatId)) || []).map((x) => x.message_id));
+  let briefMsg = null;
+  for (const rich of around) {
+    const bufMsg = toBufferMsg(chatId, rich);
+    if (rich.message_id === Number(msgId)) briefMsg = bufMsg;
+    if (!present.has(rich.message_id)) addMessage(bufMsg);
+  }
+  return briefMsg || toBufferMsg(chatId, briefRich);
+}
+
 const fmtTime = (unixSec) => {
   try {
     return new Date((unixSec || 0) * 1000).toLocaleString("en-US", {
@@ -225,30 +246,17 @@ async function handleCatchupCallback(ctx) {
   }
 
   // Re-read the brief + its preceding creatives, re-inject into the buffer.
-  let around;
+  let briefMsg;
   try {
-    around = await userClient.getMessagesBefore(chatId, msgId, WINDOW_BEFORE);
+    briefMsg = await reinjectBriefWindow(chatId, msgId);
   } catch (err) {
     await ctx.editMessageText(`❌ Couldn't re-read history: ${err.message}`).catch(() => {});
     return;
   }
-  const briefRich = around.find((x) => x.message_id === msgId);
-  if (!briefRich) {
+  if (!briefMsg) {
     await ctx.editMessageText("❌ Brief no longer found in chat history (deleted?).").catch(() => {});
     return;
   }
-
-  // Only inject message_ids not already in the in-memory buffer (addMessage
-  // pushes without in-memory dedupe — re-adding a present id would double-count
-  // media in the bundle scanners).
-  const present = new Set((getMessages(String(chatId)) || []).map((x) => x.message_id));
-  let briefMsg = null;
-  for (const rich of around) {
-    const bufMsg = toBufferMsg(chatId, rich);
-    if (rich.message_id === msgId) briefMsg = bufMsg;
-    if (!present.has(rich.message_id)) addMessage(bufMsg);
-  }
-  if (!briefMsg) briefMsg = toBufferMsg(chatId, briefRich);
 
   // Apply a name override if one was set via /fixname (for a mislabeled brief
   // the operator can't edit at the source). Rewrites the client name in the
@@ -324,4 +332,4 @@ async function handleFixNameCommand(ctx) {
   await ctx.reply(`✅ Name override set: msg ${msgId} → "${name}".\nRe-run /catchup and Forward it — the brief + sheets will use this name.`).catch(() => {});
 }
 
-module.exports = { handleCatchupCommand, handleCatchupCallback, handleFixNameCommand, toBufferMsg };
+module.exports = { handleCatchupCommand, handleCatchupCallback, handleFixNameCommand, reinjectBriefWindow, toBufferMsg };
