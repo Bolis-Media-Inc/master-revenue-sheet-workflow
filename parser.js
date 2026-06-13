@@ -66,6 +66,16 @@ function parseAdMessage(text, date) {
     if (c.pat.test(category)) { category = c.out; break; }
   }
 
+  // ── Header bulk/carousel index ─────────────────────────────────────────────
+  // A brief may carry a bulk index between category and price:
+  //   "OneOff - Affiliate - 1/4 - $500"  → category "Affiliate", bulk "1/4"
+  // The header regex above greedily folds the "- 1/4" into the category, which
+  // landed "Affiliate - 1/4" in the Ad Type column. Split it back out here and
+  // use it as the Bulk # for any page that doesn't specify its own.
+  let headerBulk = "";
+  const catBulkMatch = category.match(/^(.+?)\s*-\s*(\d+\/\d+)\s*$/);
+  if (catBulkMatch) { category = catBulkMatch[1].trim(); headerBulk = catBulkMatch[2]; }
+
   // ── PAGE INFO section ────────────────────────────────────────────────────────
   let timeMST  = "";
   const pageEntries = []; // { handle, price } — may be multiple for bulk ads
@@ -108,6 +118,19 @@ function parseAdMessage(text, date) {
           handle:  multiMatch[2].toLowerCase(),
           price:   parseFloat(multiMatch[3].replace(/,/g, "")),
           bulkNum: multiMatch[1], // e.g. "11/15"
+        });
+        continue;
+      }
+
+      // Handle + bulk index, no per-page price: "@goal - 1/4" → bulk "1/4",
+      // per-page price = header price. MUST run before the price form below so
+      // the "1/4" isn't misread as a $1 price.
+      const handleBulkMatch = line.match(/^@([\w.]+)\s*-\s*(\d+\/\d+)\s*$/);
+      if (handleBulkMatch) {
+        pageEntries.push({
+          handle:  handleBulkMatch[1].toLowerCase(),
+          price:   adPrice,
+          bulkNum: handleBulkMatch[2],
         });
         continue;
       }
@@ -285,11 +308,11 @@ function parseAdMessage(text, date) {
   const base = { client, category, postType, postDuration, nif, datePosted, timeMST };
 
   if (pageEntries.length === 0) {
-    return { ...base, adPrice, pageHandle: null, bulkNum: "" };
+    return { ...base, adPrice, pageHandle: null, bulkNum: headerBulk };
   } else if (pageEntries.length === 1) {
-    return { ...base, adPrice: pageEntries[0].price, pageHandle: pageEntries[0].handle, bulkNum: pageEntries[0].bulkNum || "" };
+    return { ...base, adPrice: pageEntries[0].price, pageHandle: pageEntries[0].handle, bulkNum: pageEntries[0].bulkNum || headerBulk };
   } else {
-    return pageEntries.map((p) => ({ ...base, adPrice: p.price, pageHandle: p.handle, bulkNum: p.bulkNum || "" }));
+    return pageEntries.map((p) => ({ ...base, adPrice: p.price, pageHandle: p.handle, bulkNum: p.bulkNum || headerBulk }));
   }
 }
 
