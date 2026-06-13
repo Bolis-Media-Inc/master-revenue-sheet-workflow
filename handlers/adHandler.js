@@ -687,6 +687,32 @@ async function handleReplayCommand(ctx) {
         return;
       }
     }
+  } else if (/^\/replay\s+\d{4,}\s*$/i.test(cmdText)) {
+    // Message-id mode — "/replay 67165": resolve the brief from the DB by its
+    // Telegram message id. Lets /replay run from ANY chat (e.g. Monetization)
+    // without replying to the source message — so the ads-chat team never sees
+    // the command, the forward summary, or the cover picker (which posts to
+    // wherever /replay was run). Unambiguous (no name matching).
+    const mid = Number(cmdText.replace(/^\/replay\s*/i, "").trim());
+    let b = null;
+    if (adBriefs._supabase) {
+      const { data } = await adBriefs._supabase
+        .from("ad_briefs")
+        .select("id, client, raw_text, received_at, telegram_chat_id, telegram_message_id, shared_media, shared_caption")
+        .eq("telegram_message_id", mid)
+        .order("received_at", { ascending: false })
+        .limit(1);
+      b = data?.[0] || null;
+    }
+    if (!b) {
+      await ctx.reply(`❌ No brief in the books with message id ${mid}.`).catch(() => {});
+      return;
+    }
+    briefText      = b.raw_text;
+    briefMessageId = mid;
+    sourceChatId   = String(b.telegram_chat_id);
+    briefDate      = new Date(b.received_at);
+    console.log(`[adHandler] 🔁 /replay msg-id mode — brief ${b.id.slice(0, 8)}… (msg ${mid}, chat ${sourceChatId})`);
   } else {
     // Search mode — strip "/replay" + handle mentions to get the campaign name
     const campaignName = cmdText
