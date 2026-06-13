@@ -1024,19 +1024,20 @@ async function handleReplayCommand(ctx) {
     if (await replayCoverForward(ctx, dbBriefForBackfill.id)) return;
   }
 
-  // If the brief's creatives aren't in the buffer (recovered via /catchup, or
-  // aged out), live-re-read them from chat history so the bundle scan + forward
-  // below have media to send. /replay stays forward-only (the brief already has
-  // a DB row, so no sheet writes). Best-effort: if the user session is down,
-  // fall through and forward whatever the buffer has.
-  if (!getMessages(String(sourceChatId)).some((m) => m.message_id === Number(briefMessageId))) {
-    try {
-      const { reinjectBriefWindow } = require("./catchupHandler");
-      await reinjectBriefWindow(sourceChatId, briefMessageId);
-      console.log(`[adHandler] /replay live-re-read brief ${briefMessageId} into buffer`);
-    } catch (e) {
-      console.warn(`[adHandler] /replay live re-read skipped: ${e.message}`);
-    }
+  // ALWAYS live-re-read the brief's own block from chat history (clears the
+  // chat buffer first, then injects only this brief's block). Critical: the
+  // shared buffer accumulates pollution from prior /catchup + /replay
+  // re-injections, so even when the brief IS in the buffer, scanning it sweeps
+  // in OTHER briefs' creatives (the "mixed covers in the picker" bug). Doing
+  // the clean re-read unconditionally guarantees the bundle scan sees exactly
+  // this brief. /replay stays forward-only (DB row exists → no sheet writes).
+  // Best-effort: if the user session is down, fall through to the raw buffer.
+  try {
+    const { reinjectBriefWindow } = require("./catchupHandler");
+    const got = await reinjectBriefWindow(sourceChatId, briefMessageId);
+    console.log(`[adHandler] /replay clean re-read brief ${briefMessageId} (${got ? "ok" : "not found in history"})`);
+  } catch (e) {
+    console.warn(`[adHandler] /replay live re-read skipped: ${e.message}`);
   }
 
   // Re-build bundles from the messageBuffer (same logic as initial processing).
