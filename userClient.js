@@ -173,12 +173,26 @@ async function getMessagesBefore(chatId, beforeId, limit = 90) {
  * restart, so missed briefs exist only in chat history). Returns chronological
  * (oldest→newest) rich messages. Caps at `limit` fetched regardless of window.
  */
-async function getHistoryWindow(chatId, sinceMs, limit = 200) {
+async function getHistoryWindow(chatId, sinceMs, maxTotal = 1500) {
   const client = await getClient();
   const entity = await client.getEntity(Number(chatId));
-  const messages = await client.getMessages(entity, { limit });
   const cutoffSec = Math.floor(sinceMs / 1000);
-  return messages
+  // Page backwards (newest→older) in chunks until we cross the cutoff or hit
+  // the hard cap. A single getMessages({limit:200}) would silently miss the
+  // OLDEST briefs in a busy chat's window (each brief drags 10-20 media msgs),
+  // so paginate to guarantee full coverage of the time window.
+  const collected = [];
+  let offsetId = 0; // 0 = from newest
+  while (collected.length < maxTotal) {
+    const batch = await client.getMessages(entity, { limit: 100, offsetId });
+    if (!batch || batch.length === 0) break;
+    collected.push(...batch);
+    const oldest = batch[batch.length - 1];
+    offsetId = oldest.id;
+    if ((oldest.date || 0) < cutoffSec) break; // went past the window
+    if (batch.length < 100) break;             // reached start of chat
+  }
+  return collected
     .reverse() // newest-first → chronological
     .map(_mapRichMessage)
     .filter((m) => (m.date || 0) >= cutoffSec);
