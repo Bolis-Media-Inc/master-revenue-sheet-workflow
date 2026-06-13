@@ -780,17 +780,14 @@ async function handleAssignmentCallback(ctx) {
     const messageId = ctx.callbackQuery.message.message_id;
     const oldCaption = ctx.callbackQuery.message.caption || ctx.callbackQuery.message.text || "Cover";
     try {
-      // Editing caption works for photo/video/doc; editMessageText works for text-only
+      // Plain text — NO parse_mode. The badge contains the target @handle, and
+      // underscores in handles like @dailyhumor_4u / @i_have_no_memes96_v2 open
+      // an unterminated Markdown entity → "can't parse entities" 400, leaving
+      // the cover card un-badged. No formatting needed here.
       if (ctx.callbackQuery.message.caption !== undefined) {
-        await ctx.telegram.editMessageCaption(chatId, messageId, undefined,
-          `${oldCaption}\n\n${badge}`,
-          { parse_mode: "Markdown" }
-        );
+        await ctx.telegram.editMessageCaption(chatId, messageId, undefined, `${oldCaption}\n\n${badge}`);
       } else {
-        await ctx.telegram.editMessageText(chatId, messageId, undefined,
-          `${oldCaption}\n\n${badge}`,
-          { parse_mode: "Markdown" }
-        );
+        await ctx.telegram.editMessageText(chatId, messageId, undefined, `${oldCaption}\n\n${badge}`);
       }
     } catch (err) {
       // Editing can fail if message is too old or unchanged — ignore
@@ -822,9 +819,23 @@ async function handleAssignmentCallback(ctx) {
     // assignments fan out to every page. "Skip" drops the cover entirely.
     // Then forward the brief text to each page so they have full context.
     if (done) {
-      runPhase3Forward(ctx, updated).catch((err) => {
-        console.error("[resolve] Phase 3 forward failed:", err.message);
-      });
+      // Single-run guard. Without this, every tap AFTER the last assignment
+      // (re-taps, corrections) re-fired Phase 3 — and each run fans out to all
+      // pages, so the Stake-Day-21 brief flooded Telegram and hit 429s. Flip
+      // awaiting→forwarding atomically; only the tap that wins the flip runs.
+      const { data: claimed } = await supabase
+        .from("pending_brief_assignments")
+        .update({ status: "forwarding" })
+        .eq("id", sessionId)
+        .eq("status", "awaiting")
+        .select("id");
+      if (claimed && claimed.length) {
+        runPhase3Forward(ctx, updated).catch((err) => {
+          console.error("[resolve] Phase 3 forward failed:", err.message);
+        });
+      } else {
+        console.log(`[resolve] Phase 3 already running/done for ${sessionId.slice(0, 8)} — skipping re-fire`);
+      }
     }
   } catch (err) {
     console.error("[resolve] callback error:", err.message);
@@ -1032,6 +1043,16 @@ async function runPhase3Forward(ctx, session) {
 
   // Send each cover to its target(s), then the brief to every page.
   // Small sleep between sends to dodge Telegram's per-chat flood limits.
+  // Send a cover by file_id when present, else forward by message_id from the
+  // source chat. Covers recovered via /catchup were re-injected from history
+  // and carry NO bot file_id (only msg_id) — sending them by an undefined
+  // file_id is what threw "there is no document in the request" for every page.
+  const sendCover = async (chatId, cover) => {
+    if (cover.file_id) return sendByKind(ctx.telegram, chatId, cover.kind || "photo", cover.file_id);
+    if (cover.msg_id != null) return ctx.telegram.forwardMessage(String(chatId), String(brief.telegram_chat_id), Number(cover.msg_id));
+    return null;
+  };
+
   let sentCount = 0;
   let errCount  = 0;
   const errors  = [];
@@ -1040,7 +1061,7 @@ async function runPhase3Forward(ctx, session) {
     for (const handle of targets) {
       const destChatId = pageChats.get(handle);
       try {
-        const sent = await sendByKind(ctx.telegram, destChatId, cover.kind || "photo", cover.file_id);
+        const sent = await sendCover(destChatId, cover);
         pushId(handle, sent?.message_id);
         sentCount++;
         await sleep(80);
