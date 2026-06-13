@@ -1036,6 +1036,7 @@ async function runPhase3Forward(ctx, session) {
   const pageChats = await fetchPageChats(pages);
   const assignments = session.assignments || {};
   const unattributed = session.unattributed || [];
+  console.log(`[resolve] Phase 3 START session ${session.id.slice(0, 8)} — pages ${pages.length}, pageChats resolved ${pageChats.size}/${pages.length}, covers ${unattributed.length}, assigned ${Object.keys(assignments).length}, brief chat ${brief.telegram_chat_id}`);
 
   // Build msg_id → target handles map ("shared" expands to all pages,
   // "skip" maps to [] which means don't forward this cover at all).
