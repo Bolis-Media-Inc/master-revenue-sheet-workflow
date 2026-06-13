@@ -1149,12 +1149,21 @@ async function handleReplayCommand(ctx) {
         .eq("brief_id", dbBriefForBackfill.id)
         .order("created_at", { ascending: false })
         .limit(1);
-      const existing = existingSessions?.[0];
+      let existing = existingSessions?.[0];
       const allAssigned = existing && (
         existing.status === "resolved"
         || (Array.isArray(existing.unattributed) && existing.unattributed.length > 0
             && Object.keys(existing.assignments || {}).length >= existing.unattributed.length)
       );
+      // An UNSTARTED session (0 covers assigned) from a prior /replay is stale —
+      // refresh it (delete + recreate a fresh picker below) instead of forcing
+      // "/resolve to continue", so re-running /replay always yields a clean
+      // picker built from the current (now de-polluted) buffer.
+      if (existing && !allAssigned && Object.keys(existing.assignments || {}).length === 0) {
+        await adBriefs._supabase.from("pending_brief_assignments").delete().eq("id", existing.id);
+        console.log(`[adHandler] /replay refreshed stale 0-assigned session ${existing.id.slice(0, 8)}`);
+        existing = null;
+      }
       if (existing && !allAssigned) {
         await ctx.reply(
           `⏸️ This brief has an open assignment session — \`/resolve ${existing.id.slice(0, 8)}\` to continue.\n` +
