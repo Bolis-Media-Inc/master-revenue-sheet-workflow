@@ -1170,27 +1170,29 @@ async function runPhase3Forward(ctx, session) {
     }
   }
 
-  // Mark session done — flips status from "resolved" to "resolved" (already
-  // there) but records prompt edits below. Future: add "completed_at"
-  // column to distinguish "all assigned" from "all forwarded".
+  // If NOTHING forwarded (every send errored), DON'T lock the session as
+  // resolved — leave it 'awaiting' so it's retryable, and report the errors
+  // loudly. Previously a fully-failed forward still flipped to resolved, so the
+  // header's Forward button just said "already running/done" forever.
+  const nothingSent = sentCount === 0 && errCount > 0;
   await supabase
     .from("pending_brief_assignments")
-    .update({ status: "resolved" })
+    .update({ status: nothingSent ? "awaiting" : "resolved" })
     .eq("id", session.id);
 
-  const summaryText =
-    `✅ *Phase 3 complete*\n` +
-    `─────────────────────────\n` +
-    `Covers sent: ${sentCount}\n` +
-    `Errors:      ${errCount}\n` +
-    `Brief forwarded to: ${destHandles.length}/${pages.length} pages\n\n` +
-    (errCount > 0
-      ? `*Errors:*\n${errors.slice(0, 5).map((e) => "  • " + md(e)).join("\n")}` +
-        (errors.length > 5 ? `\n  …and ${errors.length - 5} more (check logs)` : "")
-      : `_Run \`/syncsheets\` to backfill master + per-page sheet rows._`);
+  // Plain text — NEVER parse_mode. Error strings + @handles (underscores) break
+  // Markdown and would silently swallow the very report we need to see.
+  const errLines = errors.slice(0, 8).map((e) => "  • " + e).join("\n")
+    + (errors.length > 8 ? `\n  …and ${errors.length - 8} more` : "");
+  const summaryText = nothingSent
+    ? `❌ Forward FAILED — 0 covers sent (${errCount} errors). Session kept open — fix + tap Forward again.\n\nErrors:\n${errLines}`
+    : `✅ Phase 3 complete\n─────────────────────────\n` +
+      `Covers sent: ${sentCount}\nErrors: ${errCount}\n` +
+      `Brief forwarded to: ${destHandles.length}/${pages.length} pages` +
+      (errCount > 0 ? `\n\nErrors:\n${errLines}` : "");
 
   try {
-    await ctx.telegram.sendMessage(_summaryChat, summaryText, { parse_mode: "Markdown" });
+    await ctx.telegram.sendMessage(_summaryChat, summaryText);
   } catch (err) {
     console.error(`[resolve] Phase 3 summary post: ${err.message}`);
   }
