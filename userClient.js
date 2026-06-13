@@ -37,6 +37,17 @@ let _client = null;
 // ── Connect ───────────────────────────────────────────────────────────────────
 
 async function getClient() {
+  // Emergency kill-switch. If two services share the SAME TELEGRAM_SESSION
+  // string (e.g. the Tracker was given a copy of Greg's), both connect with
+  // the same auth key and Telegram lets only one live at a time — they kick
+  // each other in an endless reconnect war (~90s cycle) that can leak/crash
+  // the process. Setting DISABLE_USER_CLIENT=true on the duplicate service
+  // stops it from ever opening the connection. Callers already treat a thrown
+  // getClient() as "user session down" and fail open (the no-media / supersede
+  // guards still protect forwarding); only live-rescan features degrade.
+  if (process.env.DISABLE_USER_CLIENT === "true") {
+    throw new Error("userClient disabled (DISABLE_USER_CLIENT=true)");
+  }
   if (_client?.connected) return _client;
 
   if (!API_ID || !API_HASH || !SESSION_STR) {

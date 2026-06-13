@@ -367,3 +367,15 @@ process.once("SIGTERM", () => { try { server?.close(); } catch (e) {} process.ex
 process.on("unhandledRejection", (reason) => {
   console.error("[unhandledRejection]", reason);
 });
+
+// Last line of defence. A single async error MUST NOT take down the webhook
+// bot — the gramJS user-account recv loop (userClient) can throw "Not
+// connected" / reconnect errors from a background context that bypass the
+// rejection handler above; on Node those become uncaughtException and kill the
+// process, so Railway crash-loops it (the "down for 24h" failure mode). Log
+// and keep serving webhooks; the core brief pipeline does not depend on the
+// user session. Only a truly fatal boot error (missing env) should exit, and
+// that happens synchronously before this handler matters.
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException — kept alive]", err?.stack || err);
+});
