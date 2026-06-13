@@ -2284,7 +2284,12 @@ async function handleAdMessage(ctx) {
             // newest copy survives the debounce window and forwards. Matched by
             // parsed client name — robust to price/page edits between resends.
             try {
-              const thisClient = (parsedList?.[0]?.client || parsed?.client || "")
+              // NOTE: `parsedList` is declared later in this function (const →
+              // temporal dead zone), so derive the client from `parsed` here,
+              // which is already in scope. Referencing parsedList threw
+              // "Cannot access 'parsedList' before initialization" on every
+              // brief, silently disabling the whole supersede guard.
+              const thisClient = ((Array.isArray(parsed) ? parsed[0] : parsed)?.client || "")
                 .trim().toLowerCase();
               if (thisClient) {
                 const open = await pendingBriefs.listOpenForChat(ctx.chat.id, ctx.message.message_id);
@@ -2631,25 +2636,55 @@ async function handleAdMessage(ctx) {
         `fallback media: ${fallbackMedia.length})`,
       );
 
-      // ── Multi-group detection (covers/slides/caption split by page group) ──
-      // Briefs that split pages into creative GROUPS — each with its own
-      // covers + slides + caption, separated by "… for these N pages ^"
-      // labels — can't be flattened into one bundle. Detect the group
-      // structure, capture each group's content, and pause for an interactive
-      // /resolve page→group mapping. NO sheet writes (already done above).
-      // Takes precedence over the cover-only ambiguity pause below.
+      // ── Group / multi-cover detection → pause + cover→page picker ────────
+      // Two shapes get routed to the interactive picker (NO sheet writes —
+      // already done above):
+      //
+      //   A. MULTI-GROUP — pages split into creative GROUPS, each with its own
+      //      covers + slides + caption ("… for these N pages ^" labels). Can't
+      //      be flattened into one bundle.
+      //
+      //   B. MULTI-COVER "for all" — a SINGLE group carrying ≥2 visually
+      //      distinct COVER images with no per-page @handle (e.g. 5 different
+      //      "Cover slides for all ^" images + shared slides). The bot can't
+      //      tell if those are one-per-page covers or a shared carousel, so it
+      //      must ASK rather than blast every cover to every page. (One shared
+      //      cover/video → not ambiguous, stays on the silent standard path.)
+      //
+      // Both pause forwarding and auto-post the cover→page picker to the
+      // monetization chat — exactly what /resolve would show. Takes precedence
+      // over the cover-only ambiguity pause below.
       let multiGroupHandled = false;
       try {
         const blockStruct = getBlockStructure(sourceChatId, adMessageId);
-        if (blockStruct && blockStruct.isMultiGroup && briefRowId && adBriefs._supabase) {
+        const briefPages = [...new Set(parsedList.map((p) => p.pageHandle?.toLowerCase()).filter(Boolean))];
+        const hasAttribution = useCollab || useFilenames || useLabels;
+        // Count DISTINCT cover images across the detected group(s) — distinct so
+        // a single cover re-sent or duplicated doesn't read as "multiple".
+        const coverKey = (m) => { const r = extractMediaRef(m); return r ? r.file_id : (m.document?.file_name || m.message_id); };
+        const allCovers = blockStruct ? blockStruct.groups.flatMap((g) => g.covers || []) : [];
+        const distinctCovers = new Set(allCovers.map(coverKey)).size;
+        const multiCoverForAll = (
+          !!blockStruct
+          && !blockStruct.isMultiGroup
+          && !hasAttribution            // no @handle mapping to trust
+          && distinctCovers >= 2        // ≥2 distinct covers → genuinely ambiguous
+          && briefPages.length >= 2
+        );
+
+        if (blockStruct && (blockStruct.isMultiGroup || multiCoverForAll) && briefRowId && adBriefs._supabase) {
+          const singleGroup = blockStruct.groups.length === 1;
           const serGroups = blockStruct.groups.map((g) => ({
             key:        g.key,
-            caption:    g.caption || null,
+            // Block scanner only captures captions behind an explicit
+            // "Caption ^" label; a bare caption above the brief (the common
+            // "for all" shape) is captured by getStandardBundle instead — fall
+            // back to it so the single group still forwards its caption.
+            caption:    g.caption || (singleGroup ? (sharedBundle.caption || null) : null),
             namedPages: g.namedPages || null,
             coverRefs:  (g.covers || []).map(extractMediaRef).filter(Boolean),
             slideRefs:  (g.slides || []).map(extractMediaRef).filter(Boolean),
           }));
-          const briefPages = [...new Set(parsedList.map((p) => p.pageHandle?.toLowerCase()).filter(Boolean))];
           const { createGroupSessionAndPrompt } = require("./resolveHandler");
           const created = await createGroupSessionAndPrompt(ctx.telegram, {
             briefId:        briefRowId,
@@ -2662,11 +2697,12 @@ async function handleAdMessage(ctx) {
           });
           if (created) {
             multiGroupHandled = true;
-            console.warn(`[adHandler] 🧩 Multi-group brief ${briefRowId.slice(0, 8)} — ${serGroups.length} groups, paused for /resolve mapping`);
+            const shape = blockStruct.isMultiGroup ? `${serGroups.length} groups` : `${distinctCovers} distinct covers (single "for all" group)`;
+            console.warn(`[adHandler] 🧩 Brief ${briefRowId.slice(0, 8)} paused for cover→page picker — ${shape}`);
           }
         }
       } catch (err) {
-        console.error(`[adHandler] multi-group detection error (non-fatal): ${err.message}`);
+        console.error(`[adHandler] group/multi-cover detection error (non-fatal): ${err.message}`);
       }
 
       // ── Ambiguous-brief detection + PAUSE ────────────────────────────────

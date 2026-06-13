@@ -209,6 +209,10 @@ function renderHeaderText(session, brief, assignedCount) {
   if (assignedCount >= totalCovers && totalCovers > 0) {
     lines.push("");
     lines.push("✅ All covers assigned — forwarding now. Each page gets its picked cover, the shared slides, the caption, and its brief.");
+  } else {
+    lines.push("");
+    lines.push(`⏸️ *Forwarding paused* — I found ${totalCovers} cover${totalCovers === 1 ? "" : "s"} but no per-page @handle, so I can't tell which goes where.`);
+    lines.push("Tap a page under each cover below to assign it. Auto-forwards once all are mapped.");
   }
   return lines.join("\n");
 }

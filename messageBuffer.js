@@ -938,8 +938,13 @@ function getBlockStructure(chatId, adMessageId, messagesOverride) {
   const LABEL_RE = /\^\s*$/;
   const kindOf = (t) => {
     if (/caption/i.test(t)) return "caption";
-    if (/slide/i.test(t))   return "slides";
+    // Check "cover" BEFORE "slide": the team labels cover images "Cover
+    // slides for all ^" (i.e. *the cover slides*), which contains both words.
+    // A label naming "cover" is about covers even if it also says "slide";
+    // only labels with no "cover" word ("2-4th slide for all ^") are genuine
+    // shared slides.
     if (/cover/i.test(t))   return "covers";
+    if (/slide/i.test(t))   return "slides";
     return null;
   };
   // Group key = the page descriptor after "for" ("these 7 pages", "all",

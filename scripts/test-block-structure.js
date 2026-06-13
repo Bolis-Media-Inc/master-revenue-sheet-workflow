@@ -89,5 +89,51 @@ console.log("\n── named-page groups → namedPages populated ──");
   assert(g2 && g2.namedPages.join(",") === "scooby,goal", "group 2 namedPages = scooby,goal");
 }
 
+console.log("\n── multi-cover 'for all' (Mexico WC shape) → single group, cover-rich ──");
+{
+  // 5 distinct covers labeled "Cover slides for all ^", then 4 shared slides
+  // labeled "2-4th slide for all ^", a bare caption, then the brief. This is
+  // NOT multi-group (one "all" key), but it carries ≥2 distinct covers with no
+  // per-page @handle — the shape that must route to the cover→page picker
+  // instead of blasting all 5 covers to every page.
+  const chat = -7004;
+  const msgs = [];
+  let id = 0; const next = () => ++id;
+  for (let i = 0; i < 5; i++) msgs.push({ message_id: next(), document: { file_name: `IMG_184${i}.jpg`, file_id: `cov-${i}` } });
+  msgs.push({ message_id: next(), text: "Cover slides for all ^" });
+  for (let i = 0; i < 4; i++) msgs.push({ message_id: next(), document: { file_name: `shared-slide-${i}.jpg`, file_id: `sld-${i}` } });
+  msgs.push({ message_id: next(), text: "2-4th slide for all ^" });
+  const briefId = next();
+  msgs.push({ message_id: briefId, text: 'Stake - E-com - $2,000\n\nPAGE INFO:\n@hoodreels - $200\n@historic - $200\n@scooby - $200' });
+  seed(chat, msgs);
+
+  const res = buf.getBlockStructure(chat, briefId);
+  assert(res && res.isMultiGroup === false, "single 'all' group → not multi-group");
+  assert(res.groups.length === 1, `exactly 1 group (got ${res.groups?.length})`);
+  const g = res.groups[0];
+  assert(g.coverCount === 5, `5 distinct covers captured (got ${g.coverCount})`);
+  assert(g.slideCount === 4, `4 shared slides captured (got ${g.slideCount})`);
+  const distinctCovers = new Set(g.covers.map((m) => m.document?.file_id)).size;
+  assert(distinctCovers === 5, `5 distinct cover file_ids → triggers picker (got ${distinctCovers})`);
+}
+
+console.log("\n── single shared cover 'for all' → NOT cover-pick (stays standard) ──");
+{
+  // One cover for all + one shared slide. distinctCovers === 1 → must NOT
+  // route to the picker (legit shared-to-all brief).
+  const chat = -7005;
+  seed(chat, [
+    { message_id: 1, document: { file_name: "cover.jpg", file_id: "c1" } },
+    { message_id: 2, text: "Cover for all ^" },
+    { message_id: 3, video: { file_name: "slide.mov", file_id: "s1" } },
+    { message_id: 4, text: "Slides for all ^" },
+    { message_id: 5, text: "Client - E-com - $100\n\nPAGE INFO:\n@moist - $100\n@scooby - $100" },
+  ]);
+  const res = buf.getBlockStructure(chat, 5);
+  assert(res && res.isMultiGroup === false, "single shared cover → not multi-group");
+  const distinctCovers = new Set((res.groups[0]?.covers || []).map((m) => m.document?.file_id)).size;
+  assert(distinctCovers === 1, `only 1 distinct cover → picker NOT triggered (got ${distinctCovers})`);
+}
+
 console.log("\n" + (pass ? "✅ All block-structure tests passed" : "❌ Some failed"));
 process.exit(pass ? 0 : 1);
