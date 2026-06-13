@@ -993,9 +993,12 @@ async function runGroupCoverForward(ctx, session, brief) {
  * the resolve session's header to show the outcome.
  */
 async function runPhase3Forward(ctx, session) {
+  // Works whether invoked from a button tap (callbackQuery) or a command like
+  // /replay (plain message) — summary/status messages go to whichever chat.
+  const _summaryChat = ctx.callbackQuery?.message?.chat?.id || ctx.chat?.id;
   const brief = await fetchBriefById(session.brief_id);
   if (!brief) {
-    await ctx.telegram.sendMessage(ctx.callbackQuery.message.chat.id,
+    await ctx.telegram.sendMessage(_summaryChat,
       "❌ Phase 3: couldn't fetch brief from DB — re-run /replay manually."
     ).catch(() => {});
     return;
@@ -1162,10 +1165,35 @@ async function runPhase3Forward(ctx, session) {
       : `_Run \`/syncsheets\` to backfill master + per-page sheet rows._`);
 
   try {
-    await ctx.telegram.sendMessage(ctx.callbackQuery.message.chat.id, summaryText, { parse_mode: "Markdown" });
+    await ctx.telegram.sendMessage(_summaryChat, summaryText, { parse_mode: "Markdown" });
   } catch (err) {
     console.error(`[resolve] Phase 3 summary post: ${err.message}`);
   }
+}
+
+/**
+ * /replay helper: re-fire the cover→page forward for a brief that already has
+ * a (fully-) assigned cover-pick session — re-using the operator's existing
+ * mapping and forwarding by message_id. Does NOT write sheets (Phase 3 never
+ * does), so the existing correct sheet rows are untouched. Returns true if a
+ * session existed and was re-forwarded; false if no session (so /replay falls
+ * back to its normal buffer/DB forward).
+ */
+async function replayCoverForward(ctx, briefId) {
+  if (!supabase || !briefId) return false;
+  const { data: rows } = await supabase
+    .from("pending_brief_assignments")
+    .select("*")
+    .eq("brief_id", briefId)
+    .order("created_at", { ascending: false })
+    .limit(1);
+  const session = rows?.[0];
+  if (!session) return false;
+  const assignedCount = Object.keys(session.assignments || {}).length;
+  if (assignedCount === 0) return false; // nothing mapped yet — let /resolve handle it
+  console.log(`[resolve] /replay re-firing Phase 3 for brief ${String(briefId).slice(0,8)} (session ${session.id.slice(0,8)}, ${assignedCount} assigned)`);
+  await runPhase3Forward(ctx, session);
+  return true;
 }
 
 /**
@@ -1235,5 +1263,6 @@ module.exports = {
   postAssignmentUI,
   remindAwaitingSessions,
   createGroupSessionAndPrompt,
+  replayCoverForward,
   parseGroupMapping, // exported for tests
 };

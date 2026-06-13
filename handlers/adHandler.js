@@ -979,6 +979,18 @@ async function handleReplayCommand(ctx) {
     console.log(`[adHandler] 🔁 /replay: backfill enabled — ${dbPages.length} DB page rows linked to brief`);
   }
 
+  // ── Cover-pick re-forward shortcut ───────────────────────────────────────
+  // If this brief already has a fully-assigned cover→page session, the correct
+  // re-forward is that saved mapping — it forwards covers by message_id and
+  // writes NO sheets, so the already-correct sheet rows stay put. Crucial for
+  // briefs recovered via /catchup whose media isn't in the buffer (a buffer
+  // re-scan would find nothing). Returns false if there's no assigned session,
+  // so normal briefs fall through to the standard re-scan forward below.
+  if (dbBriefForBackfill?.id) {
+    const { replayCoverForward } = require("./resolveHandler");
+    if (await replayCoverForward(ctx, dbBriefForBackfill.id)) return;
+  }
+
   // Re-build bundles from the messageBuffer (same logic as initial processing).
   // Same getStandardBundle fallback as the main handler so /replay handles
   // 6+ slide carousels without dropping early slides.
