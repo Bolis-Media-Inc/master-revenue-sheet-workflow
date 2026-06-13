@@ -2832,8 +2832,11 @@ async function handleAdMessage(ctx) {
           // then the source chat as a last resort so a paused brief is NEVER
           // silent (the SESH brief paused with WIZARD_ADMIN_USER_ID unset →
           // session created, prompt_chat_id null, 0 prompts sent).
-          const promptTarget = RESOLVE_ALERT_CHAT_ID || adminId || ctx.chat?.id;
-          const promptWhere = RESOLVE_ALERT_CHAT_ID ? "monetization chat" : adminId ? "admin DM" : "source chat";
+          // ctx._resolvePromptChatId is set by /catchup so a recovered brief's
+          // picker lands in the chat the operator ran /catchup from
+          // (Monetization), NOT the source ads chat the team watches.
+          const promptTarget = ctx._resolvePromptChatId || RESOLVE_ALERT_CHAT_ID || adminId || ctx.chat?.id;
+          const promptWhere = ctx._resolvePromptChatId ? "catchup chat" : RESOLVE_ALERT_CHAT_ID ? "monetization chat" : adminId ? "admin DM" : "source chat";
           console.warn(`[adHandler] ⏸️ PAUSED BRIEF ${briefShort} — ${ambKind}, session ${sessionShort}, prompting ${promptWhere} ${promptTarget}`);
 
           if (promptTarget) {

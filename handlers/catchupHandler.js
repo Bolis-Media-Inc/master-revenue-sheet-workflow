@@ -249,6 +249,9 @@ async function handleCatchupCallback(ctx) {
     from:                  briefMsg.from,
     telegram:              ctx.telegram,
     _isDeferredProcessing: true,
+    // If this brief needs cover assignment, post the picker to the chat the
+    // operator ran /catchup from (Monetization), NOT the source ads chat.
+    _resolvePromptChatId:  replyChatId,
     reply: (text, extra) => ctx.telegram.sendMessage(replyChatId, text, extra),
   };
   try {
