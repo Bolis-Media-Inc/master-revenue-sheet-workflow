@@ -41,6 +41,10 @@ const RESOLVE_ALERT_CHAT_ID = (process.env.RESOLVE_ALERT_CHAT_ID || process.env.
 // come through bot.action below.
 bot.action(/^ca:[0-9a-f-]+:[^:]+:.+$/, handleAssignmentCallback);
 
+// /catchup Forward/Skip buttons (recover briefs missed during downtime).
+const { handleCatchupCallback } = require("./handlers/catchupHandler");
+bot.action(/^catchup:(fwd|skip):-?\d+:\d+$/, handleCatchupCallback);
+
 // ── /update — unified brief mutation (price, name; more subcommands TODO) ────
 // Reply to a brief in Internal Network Ads then:
 //   /update price @handle $X   — update a page's price (sheets + DB + chat edit)

@@ -128,6 +128,31 @@ async function getLiveMessageIds(chatId, limit = 80) {
  * `hasMedia` lets the block scanner classify a message as media (its content
  * is forwarded by message_id, so the exact media kind isn't needed here).
  */
+// Map a gramJS message → the rich shape /catchup needs to re-inject it into
+// the bot's message buffer (so the normal bundle scanners + forward-by-
+// message_id pipeline work on caught-up briefs). gramJS is MTProto, NOT the
+// Bot API — the document filename lives on the `.file` helper (which reads
+// DocumentAttributeFilename), not `.document.file_name`. Getting this wrong
+// breaks @<handle>.<ext> per-page attribution, so use m.file.name.
+function _mapRichMessage(m) {
+  let kind = null;
+  if (m.video)          kind = "video";
+  else if (m.document)  kind = "document";
+  else if (m.audio)     kind = "audio";
+  else if (m.gif || m.videoNote) kind = "animation";
+  else if (m.photo)     kind = "photo";
+  let file_name = "";
+  try { file_name = m.file?.name || ""; } catch (_) { /* .file getter can throw on odd media */ }
+  return {
+    message_id: m.id,
+    date:       m.date,                 // unix seconds
+    text:       m.message || "",
+    hasMedia:   !!(m.media || m.photo || m.video || m.document),
+    kind,
+    file_name,
+  };
+}
+
 async function getMessagesBefore(chatId, beforeId, limit = 90) {
   const client = await getClient();
   const entity = await client.getEntity(Number(chatId));
@@ -138,11 +163,25 @@ async function getMessagesBefore(chatId, beforeId, limit = 90) {
   });
   return messages
     .reverse() // gramJS returns newest-first → chronological
-    .map((m) => ({
-      message_id: m.id,
-      text:       m.message || "",
-      hasMedia:   !!(m.media || m.photo || m.video || m.document),
-    }));
+    .map(_mapRichMessage);
+}
+
+/**
+ * Read the most-recent messages in a chat, newest going back, returning those
+ * NEWER than `sinceMs` (epoch ms). Used by /catchup to find briefs the bot
+ * missed during a downtime window (Telegram drops queued webhook updates on
+ * restart, so missed briefs exist only in chat history). Returns chronological
+ * (oldest→newest) rich messages. Caps at `limit` fetched regardless of window.
+ */
+async function getHistoryWindow(chatId, sinceMs, limit = 200) {
+  const client = await getClient();
+  const entity = await client.getEntity(Number(chatId));
+  const messages = await client.getMessages(entity, { limit });
+  const cutoffSec = Math.floor(sinceMs / 1000);
+  return messages
+    .reverse() // newest-first → chronological
+    .map(_mapRichMessage)
+    .filter((m) => (m.date || 0) >= cutoffSec);
 }
 
 // ── List all chats the account is in ─────────────────────────────────────────
@@ -333,4 +372,4 @@ async function sendText(chatId, text) {
   }
 }
 
-module.exports = { getClient, sendMessage, sendRecap, getRecentMessages, getLiveMessageIds, getMessagesBefore, listChats, getMessagesSince, onNewMessage, disconnect, forwardMessages, sendFile, sendText };
+module.exports = { getClient, sendMessage, sendRecap, getRecentMessages, getLiveMessageIds, getMessagesBefore, getHistoryWindow, listChats, getMessagesSince, onNewMessage, disconnect, forwardMessages, sendFile, sendText };

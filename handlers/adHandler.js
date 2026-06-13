@@ -346,6 +346,27 @@ function extractMediaRef(msg) {
 }
 
 /**
+ * Like extractMediaRef but ALWAYS carries the source message_id (and filename
+ * when present), even for media with no bot file_id — e.g. messages re-injected
+ * from chat history by /catchup, where only the message_id is bot-usable.
+ * Downstream (postAssignmentUI / runGroupCoverForward) sends by file_id when
+ * present, else copyMessage/forwardMessage by msg_id, so a ref with msg_id and
+ * no file_id still forwards. Returns null only for non-media messages.
+ */
+function mediaRefWithId(msg) {
+  if (!msg) return null;
+  const ref = extractMediaRef(msg);
+  const file_name = msg.document?.file_name || msg.video?.file_name || msg.audio?.file_name || null;
+  if (ref) return { ...ref, msg_id: msg.message_id, file_name };
+  if (msg.message_id == null) return null;
+  // No bot file_id (history re-inject) — infer kind from the media marker.
+  const kind = msg.video ? "video" : msg.animation ? "animation" : msg.audio ? "audio"
+             : msg.document ? "document" : msg.photo ? "photo" : null;
+  if (!kind) return null;
+  return { file_id: null, kind, msg_id: msg.message_id, file_name };
+}
+
+/**
  * Delete the bot's PRIOR forwarded messages for a campaign in one page's
  * chat, so a /replay can do a clean delete + resend instead of stacking a
  * second copy on top of the first (the Stake Day 19 cleanup ask).
@@ -2027,6 +2048,15 @@ async function handleAdMessage(ctx) {
       return await handleReplayCommand(ctx);
     }
 
+    // /catchup [hours] — find + replay briefs the bot missed during a downtime
+    // window (Telegram drops queued updates on restart, so they exist only in
+    // chat history). Reads history via the user account, lists each missed
+    // brief with Forward/Skip buttons. Sheet-safe: dedupes vs ad_briefs.
+    if (text && /^\/catchup\b/i.test(text.trim())) {
+      const { handleCatchupCommand } = require("./catchupHandler");
+      return await handleCatchupCommand(ctx);
+    }
+
     // /resolve — cover-to-page assignment for paused/ambiguous briefs.
     // Routed HERE (text-regex on bot.on "message") rather than via
     // bot.command("resolve") because in a multi-bot group (Monetization
@@ -2682,8 +2712,8 @@ async function handleAdMessage(ctx) {
             // back to it so the single group still forwards its caption.
             caption:    g.caption || (singleGroup ? (sharedBundle.caption || null) : null),
             namedPages: g.namedPages || null,
-            coverRefs:  (g.covers || []).map(extractMediaRef).filter(Boolean),
-            slideRefs:  (g.slides || []).map(extractMediaRef).filter(Boolean),
+            coverRefs:  (g.covers || []).map(mediaRefWithId).filter(Boolean),
+            slideRefs:  (g.slides || []).map(mediaRefWithId).filter(Boolean),
           }));
           const { createGroupSessionAndPrompt } = require("./resolveHandler");
           const created = await createGroupSessionAndPrompt(ctx.telegram, {
