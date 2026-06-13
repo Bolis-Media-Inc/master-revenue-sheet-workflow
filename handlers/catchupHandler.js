@@ -164,14 +164,16 @@ async function handleCatchupCommand(ctx) {
   for (const b of shown) {
     const snippet = b.text.split("\n").slice(0, 2).join(" / ").slice(0, 120);
     const pagesStr = b.pages.length ? b.pages.map((h) => `@${h}`).join(", ") : "(no @handles in brief)";
+    // Plain text — NO parse_mode. Handles like @i_have_no_memes96_v2 and
+    // @dailyhumor_4u contain underscores that open unterminated Markdown
+    // entities, which 400'd the multi-page cards. Reliability over bold.
     await ctx.telegram.sendMessage(promptChatId,
-      `🆕 *Missed brief*\n` +
-      `*Campaign:* ${b.client}\n` +
-      `*Pages (${b.pages.length}):* ${pagesStr}\n` +
-      `*Posted:* ${fmtTime(b.date)}\n` +
-      `\`${snippet.replace(/[`*_\[]/g, (c) => "\\" + c)}…\``,
+      `🆕 Missed brief\n` +
+      `Campaign: ${b.client}\n` +
+      `Pages (${b.pages.length}): ${pagesStr}\n` +
+      `Posted: ${fmtTime(b.date)}\n` +
+      `${snippet}…`,
       {
-        parse_mode: "Markdown",
         reply_markup: { inline_keyboard: [[
           { text: "✅ Forward", callback_data: `catchup:fwd:${sourceChatId}:${b.message_id}` },
           { text: "⏭️ Skip",    callback_data: `catchup:skip:${sourceChatId}:${b.message_id}` },
@@ -193,7 +195,7 @@ async function handleCatchupCallback(ctx) {
 
   if (action === "skip") {
     await ctx.answerCbQuery("Skipped").catch(() => {});
-    await ctx.editMessageText("⏭️ *Skipped* — not forwarded.", { parse_mode: "Markdown" }).catch(() => {});
+    await ctx.editMessageText("⏭️ Skipped — not forwarded.").catch(() => {});
     return;
   }
 
@@ -203,7 +205,7 @@ async function handleCatchupCallback(ctx) {
   // Guard against double-processing (double-tap, or processed since the scan).
   const existing = await adBriefs.findBriefByTelegramMessage(chatId, msgId).catch(() => null);
   if (existing) {
-    await ctx.editMessageText("⚠️ Already in the books (processed) — skipped to avoid a duplicate.", { parse_mode: "Markdown" }).catch(() => {});
+    await ctx.editMessageText("⚠️ Already in the books (processed) — skipped to avoid a duplicate.").catch(() => {});
     return;
   }
 
@@ -212,12 +214,12 @@ async function handleCatchupCallback(ctx) {
   try {
     around = await userClient.getMessagesBefore(chatId, msgId, WINDOW_BEFORE);
   } catch (err) {
-    await ctx.editMessageText(`❌ Couldn't re-read history: ${err.message}`, { parse_mode: "Markdown" }).catch(() => {});
+    await ctx.editMessageText(`❌ Couldn't re-read history: ${err.message}`).catch(() => {});
     return;
   }
   const briefRich = around.find((x) => x.message_id === msgId);
   if (!briefRich) {
-    await ctx.editMessageText("❌ Brief no longer found in chat history (deleted?).", { parse_mode: "Markdown" }).catch(() => {});
+    await ctx.editMessageText("❌ Brief no longer found in chat history (deleted?).").catch(() => {});
     return;
   }
 
@@ -251,10 +253,10 @@ async function handleCatchupCallback(ctx) {
   };
   try {
     await handleAdMessage(fakeCtx);
-    await ctx.editMessageText("✅ *Forwarded / processed.* If it needed cover assignment, the picker was posted below.", { parse_mode: "Markdown" }).catch(() => {});
+    await ctx.editMessageText("✅ Forwarded / processed. If it needed cover assignment, the picker was posted below.").catch(() => {});
   } catch (err) {
     console.error(`[catchup] forward failed for ${chatId}/${msgId}: ${err.message}`);
-    await ctx.editMessageText(`❌ Forward failed: ${err.message}`, { parse_mode: "Markdown" }).catch(() => {});
+    await ctx.editMessageText(`❌ Forward failed: ${err.message}`).catch(() => {});
   }
 }
 
