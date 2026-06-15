@@ -683,8 +683,13 @@ function getFilenameBundlesByPage(chatId, adMessageId) {
     if (hasMedia) {
       // Match "@<handle>" at the start, allow optional " (N)" duplicate
       // suffix and any extension. \w covers letters/digits/underscore;
-      // we add `.` for handles like "thefuck.tv".
-      const m = fileName.match(/^@([\w.]+?)(?:\s*\(\d+\))?\s*\.[a-zA-Z0-9]+$/);
+      // we add `.` for handles like "thefuck.tv" and `-` because digi
+      // sanitizes "_" and "." to "-" in generated cover filenames
+      // (@dailyhumor-4u.jpg for page @dailyhumor_4u, @thefuck-tv.jpg for
+      // @thefuck.tv). Without "-" here those covers failed to attribute and
+      // fell into the shared bucket → blasted to EVERY page. resolveHandle()
+      // maps the hyphenated form back to the real page (separator-insensitive).
+      const m = fileName.match(/^@([\w.-]+?)(?:\s*\(\d+\))?\s*\.[a-zA-Z0-9]+$/);
       if (m && m[1]) {
         const handle = m[1].toLowerCase().replace(/\.$/, "");
         // Telegram's media `caption` field — if Danielson typed something
