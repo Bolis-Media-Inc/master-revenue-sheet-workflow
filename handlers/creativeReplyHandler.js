@@ -47,9 +47,21 @@ function _mediaRef(msg) {
   return null;
 }
 
+// Source ads chat(s) — the ONLY place this shortcut is active. Operators post
+// briefs here and add creatives here. In page chats / DMs, sales people, VAs
+// and clients reply to forwarded briefs with analytics screenshots, "got it",
+// questions, etc. — replying there with a "name your creative" nag is pure
+// noise (and forwarding a creative back into a page chat would be circular).
+const SOURCE_CHATS = (process.env.TARGET_CHAT_ID || "")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+
 async function handleCreativeReply(ctx) {
   const msg = ctx.message;
   if (!msg) return false;
+
+  // Gate to the source ads chat(s). Outside them, do nothing — the message
+  // flows on to the normal (chat-gated) handlers, which ignore it.
+  if (SOURCE_CHATS.length && !SOURCE_CHATS.includes(String(ctx.chat?.id))) return false;
 
   const replied = msg.reply_to_message;
   if (!replied) return false;
