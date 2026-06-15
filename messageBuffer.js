@@ -277,6 +277,32 @@ function _extractSharedCaption(preceding) {
 }
 
 /**
+ * Fallback shared-caption source. The IG copy sometimes rides in as the
+ * CAPTION attached to a shared media item — e.g. Danielson types the copy
+ * directly under the shared video/slide that every page receives, rather
+ * than as a standalone text line above the brief. _extractSharedCaption only
+ * looks at standalone text, so that copy was silently DROPPED (the World Cup
+ * Stake brief — every page got the slides but no caption). Scan the shared
+ * media (chronological) for the first caption that looks like real IG copy:
+ * non-empty, not a "^" label, not a previous brief, not a bare @handle list.
+ *
+ * Only ever consulted when there's no standalone caption, and only over media
+ * that ended up in the SHARED bucket — per-page covers keep their own caption
+ * via byHandle, so this never steals a page-specific caption.
+ */
+function _captionFromSharedMedia(mediaArr) {
+  for (const m of (mediaArr || [])) {
+    const cap = (m.caption || "").trim();
+    if (!cap) continue;
+    if (cap.endsWith("^")) continue;
+    if (_looksLikePreviousBrief(cap)) continue;
+    if (/^(@[\w.-]+[\s,]*)+$/.test(cap)) continue; // bare @handle attribution line
+    return cap;
+  }
+  return null;
+}
+
+/**
  * Scan backwards from the ad message and group preceding content into
  * per-page bundles based on text label messages ending with "^".
  *
@@ -453,8 +479,9 @@ function getContentBundlesByPage(chatId, adMessageId) {
       // Inline-captured caption wins over the legacy _extractSharedCaption
       // (which only looks at preceding[last]). When no inline caption was
       // found AND the immediately-preceding message qualifies, fall back to
-      // _extractSharedCaption so simpler layouts still work.
-      caption: sharedCaption || _extractSharedCaption(preceding),
+      // _extractSharedCaption so simpler layouts still work; finally fall back
+      // to a caption riding on a shared media item.
+      caption: sharedCaption || _extractSharedCaption(preceding) || _captionFromSharedMedia(sharedMedia),
     },
   };
 }
@@ -760,7 +787,10 @@ function getFilenameBundlesByPage(chatId, adMessageId) {
     byHandle,
     shared: {
       media: sharedMedia,
-      caption: _extractSharedCaption(preceding),
+      // Standalone text above the brief wins; otherwise fall back to a caption
+      // riding on a shared media item (World Cup Stake brief: copy was on the
+      // shared video, previously dropped).
+      caption: _extractSharedCaption(preceding) || _captionFromSharedMedia(sharedMedia),
     },
   };
 }

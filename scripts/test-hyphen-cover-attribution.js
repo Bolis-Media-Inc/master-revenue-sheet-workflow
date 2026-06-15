@@ -44,6 +44,23 @@ console.log("\n── hyphenated per-page covers attribute (not shared) ──")
   assert(fb.byHandle.has("thefuck-tv"), "thefuck-tv attributed");
   assert(fb.byHandle.size === 4, `exactly 4 covers attributed (got ${fb.byHandle.size})`);
   assert(fb.shared.media.length === 1, `exactly 1 genuinely-shared slide (got ${fb.shared.media.length})`);
+  // The IG copy rode in as the shared video's caption — must NOT be dropped.
+  assert(fb.shared.caption === "Japan fans...", `shared caption recovered from media (got ${JSON.stringify(fb.shared.caption)})`);
+}
+
+console.log("\n── standalone caption above brief still wins over media caption ──");
+{
+  const chat = -9002;
+  let id = 0; const next = () => ++id;
+  const msgs = [];
+  msgs.push({ message_id: next(), document: { file_name: "@dailyhoodposts.jpg" } });
+  msgs.push({ message_id: next(), video: { file_name: "slide.mp4" }, caption: "incidental media caption" });
+  msgs.push({ message_id: next(), text: "The real IG caption copy goes here" }); // standalone, closest to brief
+  const briefId = next();
+  msgs.push({ message_id: briefId, text: "Client X - E-com - $100\n\nPAGE INFO:\n@dailyhoodposts - $100" });
+  for (const m of msgs) buf.addMessage({ chat: { id: chat }, ...m });
+  const fb = buf.getFilenameBundlesByPage(chat, briefId);
+  assert(fb.shared.caption === "The real IG caption copy goes here", `standalone caption wins (got ${JSON.stringify(fb.shared.caption)})`);
 }
 
 console.log("\n── pagesRegistry maps hyphenated handle → real page ──");
