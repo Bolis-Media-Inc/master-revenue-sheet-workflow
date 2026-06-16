@@ -898,7 +898,12 @@ function getStandardBundle(chatId, adMessageId) {
     byHandle: new Map(),
     shared: {
       media:   sharedMedia,
-      caption: sharedCaption,
+      // Standalone text above the brief wins; otherwise fall back to a caption
+      // riding on a shared media item. FashionNova (and other single-creative
+      // E-Com briefs) post ONE creative whose media caption IS the IG copy,
+      // with no standalone text line — that copy was being dropped (shared_caption
+      // NULL → no caption forwarded). Mirrors the filename/label scanners.
+      caption: sharedCaption || _captionFromSharedMedia(sharedMedia),
     },
   };
 }
