@@ -12,7 +12,7 @@
  */
 
 const { parseAdMessage }       = require("../parser");
-const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, repinDateByClient, fixDropdownColumn } = require("../sheets");
+const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, repinDateByClient, fixDropdownColumn, getColumnDropdownOptions, snapToDropdown } = require("../sheets");
 const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages, getStandardBundle, getBlockStructure } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
@@ -455,6 +455,35 @@ function buildPageRow(parsed) {
     parsed.adPrice != null ? `$${parsed.adPrice}` : "", // G: Ad Price
     "",                          // H: Notes
   ];
+}
+
+/**
+ * Like buildPageRow, but first snaps the dropdown fields (B Ad Type,
+ * E Post Type, F Post Duration) to the DESTINATION sheet's ACTUAL dropdown
+ * options. Each page has its own dropdowns, so this matches whatever that page
+ * expects (e.g. the bot's "30 Days" → that sheet's "30 days") — no red
+ * "invalid" flags on new rows. Fail-open: if the validation can't be read, the
+ * original values are written (never blocks a forward). Reads are cached per
+ * (sheet, column), so this is a one-time cost per sheet.
+ */
+async function buildPageRowSnapped(sheetId, parsed) {
+  try {
+    const [adType, postType, postDur] = await Promise.all([
+      getColumnDropdownOptions(sheetId, PAGE_TAB_NAME, "B"),
+      getColumnDropdownOptions(sheetId, PAGE_TAB_NAME, "E"),
+      getColumnDropdownOptions(sheetId, PAGE_TAB_NAME, "F"),
+    ]);
+    const snapped = {
+      ...parsed,
+      category:     adType   ? snapToDropdown(parsed.category, adType)      : parsed.category,
+      postType:     postType ? snapToDropdown(parsed.postType, postType)    : parsed.postType,
+      postDuration: postDur  ? snapToDropdown(parsed.postDuration, postDur) : parsed.postDuration,
+    };
+    return buildPageRow(snapped);
+  } catch (err) {
+    console.error(`[adHandler] buildPageRowSnapped (writing raw): ${err.message}`);
+    return buildPageRow(parsed);
+  }
 }
 
 /**
@@ -1352,7 +1381,7 @@ async function handleReplayCommand(ctx) {
           if (sheetId && !PLACEHOLDER_PATTERN.test(sheetId)) {
             try {
               const rowNum = await appendRow(
-                sheetId, PAGE_TAB_NAME, buildPageRow(parsedItem),
+                sheetId, PAGE_TAB_NAME, await buildPageRowSnapped(sheetId, parsedItem),
                 { anchorColumn: "A", endColumn: "H" },
               );
               if (rowNum) {
@@ -1556,7 +1585,7 @@ async function handleSyncSheetsCommand(ctx) {
         continue;
       }
       try {
-        const rowNum = await appendRow(sheetId, PAGE_TAB_NAME, buildPageRow(parsedItem), {
+        const rowNum = await appendRow(sheetId, PAGE_TAB_NAME, await buildPageRowSnapped(sheetId, parsedItem), {
           anchorColumn: "A", endColumn: "H",
         });
         if (rowNum) {
@@ -2805,7 +2834,7 @@ async function handleAdMessage(ctx) {
         continue;
       }
 
-      const row = buildPageRow(item);
+      const row = await buildPageRowSnapped(sheetId, item);
       try {
         // Per-page sheets: col A = Client Name (always filled), cols go A→H
         const pageSheetRowNum = await appendRow(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "A", endColumn: "H" });
