@@ -94,10 +94,16 @@ function parseAdMessage(text, date) {
         if (/^now\b/i.test(line)) {
           timeMST = "NOW";
         } else {
-          // Shared time-core: "7", "4:45", "7-8", "1-1:30", optional am/pm.
-          const TIME_CORE = "([\\d]{1,2}(?:[-–][\\d:apm]+)?(?::\\d{2})?\\s*(?:am|pm)?)";
+          // Shared time-core: hour, optional ":MM", optional "-H[:MM]" range,
+          // optional am/pm. Handles "7", "4:45", "7-8", "1-1:30", "6:30-7:30pm".
+          // The leading (?<![\d:]) lookbehind is critical: without it, when the
+          // hour doesn't line up the regex engine RESTARTS mid-number — e.g. it
+          // matched "30" out of "6:30-7:30pm" and wrote "30-7:30PM" into the
+          // master Time column. The lookbehind forbids starting right after a
+          // digit or a colon, so a time can only begin at a real hour.
+          const TIME_CORE = "(\\d{1,2}(?::\\d{2})?(?:\\s*[-–]\\s*\\d{1,2}(?::\\d{2})?)?\\s*(?:am|pm)?)";
           // Prefer an explicit AZ/MST time.
-          const azMatch = line.match(new RegExp(`${TIME_CORE}\\s*(?:AZ|MST|MDT)`, "i"));
+          const azMatch = line.match(new RegExp(`(?<![\\d:])${TIME_CORE}\\s*(?:AZ|MST|MDT)`, "i"));
           if (azMatch) {
             timeMST = azMatch[1].trim().toUpperCase();
           } else {
@@ -105,7 +111,7 @@ function parseAdMessage(text, date) {
             // calendar Pacific shares Mountain's offset (both UTC-7), so e.g.
             // "7-8pm PST / 10-11pm EST" → "7-8PM". Without this, Pacific/
             // Eastern-only time lines left the Time (MST) column blank.
-            const ptMatch = line.match(new RegExp(`${TIME_CORE}\\s*(?:PST|PDT|PT)\\b`, "i"));
+            const ptMatch = line.match(new RegExp(`(?<![\\d:])${TIME_CORE}\\s*(?:PST|PDT|PT)\\b`, "i"));
             if (ptMatch) timeMST = ptMatch[1].trim().toUpperCase();
           }
         }
