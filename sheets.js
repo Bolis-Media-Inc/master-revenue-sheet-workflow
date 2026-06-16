@@ -1381,8 +1381,115 @@ async function repinDateByClient(spreadsheetId, tabName, clientRegex, newDate, o
   return { count: matches.length, rows: matches };
 }
 
+// ── Dropdown (data-validation) matching ──────────────────────────────────────
+// Cells in Ad Type / Post Type / Post Duration have a data-validation dropdown.
+// When the bot writes a value whose casing/wording differs from the dropdown's
+// exact option text (e.g. "30 Days" vs the dropdown's "30 days"), Sheets shows
+// a red "invalid" flag. These helpers read a column's real dropdown options and
+// snap a value to the matching option so it's always valid.
+
+const _dropdownCache = new Map(); // `${sheetId}|${tab}|${col}` → string[]|null
+
+/**
+ * Read the allowed dropdown options for a column (from its data-validation
+ * rule on row 2). Handles inline lists (ONE_OF_LIST) and range-backed lists
+ * (ONE_OF_RANGE). Returns string[] of option texts, or null if the column has
+ * no dropdown. Cached per (sheet, tab, column) for the process lifetime.
+ */
+async function getColumnDropdownOptions(spreadsheetId, tabName, colLetter) {
+  const cacheKey = `${spreadsheetId}|${tabName}|${colLetter}`;
+  if (_dropdownCache.has(cacheKey)) return _dropdownCache.get(cacheKey);
+
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = getThrottledSheets(client);
+
+  let options = null;
+  try {
+    const resp = await sheets.spreadsheets.get({
+      spreadsheetId,
+      ranges: [`${tabName}!${colLetter}2`],
+      fields: "sheets(data(rowData(values(dataValidation))))",
+      includeGridData: true,
+    });
+    const cond = resp.data.sheets?.[0]?.data?.[0]?.rowData?.[0]?.values?.[0]?.dataValidation?.condition;
+    if (cond?.type === "ONE_OF_LIST") {
+      options = (cond.values || []).map((v) => v.userEnteredValue).filter((s) => s != null);
+    } else if (cond?.type === "ONE_OF_RANGE") {
+      const ref = (cond.values?.[0]?.userEnteredValue || "").replace(/^=/, "");
+      if (ref) {
+        const rr = await sheets.spreadsheets.values.get({ spreadsheetId, range: ref });
+        options = (rr.data.values || []).flat().map((s) => (s == null ? "" : String(s))).filter((s) => s.trim() !== "");
+      }
+    }
+  } catch (err) {
+    console.error(`[sheets] getColumnDropdownOptions ${tabName}!${colLetter}: ${err.message}`);
+  }
+  _dropdownCache.set(cacheKey, options);
+  return options;
+}
+
+/**
+ * Snap a value to the matching dropdown option. Tries (1) exact case-insensitive,
+ * (2) spaceless ("30days" ~ "30 days"), (3) unit-normalized (days→day, weeks→week,
+ * hours/hrs→hr). Returns the dropdown's EXACT text on a match, else the original
+ * value unchanged (so we never corrupt an unknown value — it just stays as-is).
+ */
+function snapToDropdown(value, options) {
+  if (value == null || !options || !options.length) return value;
+  const norm = (s) => String(s).trim().toLowerCase().replace(/\s+/g, " ");
+  const unit = (s) => s.replace(/\bdays?\b/g, "day").replace(/\bweeks?\b/g, "week").replace(/\b(?:hours?|hrs?)\b/g, "hr");
+  const v = norm(value);
+  let hit = options.find((o) => norm(o) === v);
+  if (!hit) { const vs = v.replace(/\s+/g, ""); hit = options.find((o) => norm(o).replace(/\s+/g, "") === vs); }
+  if (!hit) { const vu = unit(v); hit = options.find((o) => unit(norm(o)) === vu); }
+  return hit != null ? hit : value;
+}
+
+/**
+ * Scan a dropdown column and snap every mismatched cell to its valid option.
+ * Read-only when opts.dryRun. Skips the header (row 1) and blank cells.
+ * Returns { options, changes:[{row,from,to}], unmatched:[{row,value}] }.
+ *   - changes:   cells that differ from a valid option and were (or would be) fixed
+ *   - unmatched: cells whose value matches NO option even after normalization
+ *                (left untouched — likely a genuinely off value to review)
+ */
+async function fixDropdownColumn(spreadsheetId, tabName, colLetter, opts = {}) {
+  const options = await getColumnDropdownOptions(spreadsheetId, tabName, colLetter);
+  if (!options || !options.length) return { options: null, changes: [], unmatched: [] };
+
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = getThrottledSheets(client);
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId, range: `${tabName}!${colLetter}:${colLetter}`, majorDimension: "COLUMNS",
+  });
+  const col = (resp.data.values && resp.data.values[0]) || [];
+
+  const changes = [], unmatched = [], updates = [];
+  for (let i = 1; i < col.length; i++) { // skip header row
+    const raw = col[i];
+    if (raw == null || String(raw).trim() === "") continue;
+    const snapped = snapToDropdown(raw, options);
+    if (snapped !== raw) {
+      changes.push({ row: i + 1, from: String(raw), to: snapped });
+      updates.push({ range: `${tabName}!${colLetter}${i + 1}`, values: [[snapped]] });
+    } else if (!options.includes(String(raw))) {
+      unmatched.push({ row: i + 1, value: String(raw) });
+    }
+  }
+  if (!opts.dryRun && updates.length > 0) {
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId,
+      requestBody: { valueInputOption: "USER_ENTERED", data: updates },
+    });
+  }
+  return { options, changes, unmatched };
+}
+
 module.exports = {
   appendRow, markForwarded, markForwardedBatch, repinDateByClient,
+  getColumnDropdownOptions, snapToDropdown, fixDropdownColumn,
   applyCenterAlignmentBatch, applyColumnCenterAlignment,
   getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates,
   updateStatusToLive, updateAdPrice, updateAdClient, updateAdDate, deleteAdRows,

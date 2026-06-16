@@ -12,7 +12,7 @@
  */
 
 const { parseAdMessage }       = require("../parser");
-const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, repinDateByClient } = require("../sheets");
+const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, repinDateByClient, fixDropdownColumn } = require("../sheets");
 const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages, getStandardBundle, getBlockStructure } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
@@ -2051,6 +2051,101 @@ async function handleFixUndistributedCommand(ctx) {
 }
 
 /**
+ * /fixdropdowns [go] [@handle …] — snap the dropdown columns (B Ad Type,
+ * E Post Type, F Post Duration) to each sheet's ACTUAL data-validation options
+ * so there are no red "invalid" flags. e.g. the bot's "30 Days" → the
+ * dropdown's "30 days". Reads each column's real option list and matches
+ * case-insensitively (+ light wording normalization), then writes the exact
+ * option text. Genuinely-unknown values are left untouched and reported.
+ *
+ *   /fixdropdowns            → DRY RUN: list what would change, no writes
+ *   /fixdropdowns go         → apply on all pages
+ *   /fixdropdowns go @moist  → apply on just the named page(s)
+ */
+async function handleFixDropdownsCommand(ctx) {
+  const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+  if (adminId && ctx.from?.id !== adminId) return;
+
+  const cmdText = (ctx.message?.text || "").trim();
+  const apply   = /\bgo\b/i.test(cmdText);
+  const wantedHandles = (cmdText.match(/@([\w.]+)/g) || []).map((h) => h.slice(1).toLowerCase());
+
+  // Per-page schema: B = Ad Type, E = Post Type, F = Post Duration.
+  const COLS = [["B", "Ad Type"], ["E", "Post Type"], ["F", "Post Duration"]];
+
+  const allPages = pagesRegistry.listAllSync ? pagesRegistry.listAllSync() : [];
+  let targets = allPages.filter((p) => p.sheet_id && !PLACEHOLDER_PATTERN.test(p.sheet_id));
+  if (wantedHandles.length > 0) {
+    const want = new Set(wantedHandles.map((h) => pagesRegistry.resolveHandle(h) || h));
+    targets = targets.filter((p) => want.has(p.handle));
+  }
+  if (targets.length === 0) { await ctx.reply("⚠️ No matching per-page sheets.").catch(() => {}); return; }
+
+  const mode = apply ? "Applying" : "DRY RUN — previewing";
+  const statusMsg = await ctx.reply(`⏳ ${mode}: snapping dropdowns on ${targets.length} sheet(s)…`).catch(() => null);
+  const editStatus = async (t) => {
+    if (!statusMsg) return;
+    try { await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, t, { parse_mode: "Markdown" }); }
+    catch (err) { if (!/not modified/i.test(err.message || "")) console.error(`[adHandler] /fixdropdowns editStatus: ${err.message}`); }
+  };
+
+  const perPage = [];            // { handle, fixed, unmatched:[{col,value,row}] }
+  let processed = 0, failed = 0, totalFixed = 0, totalUnmatched = 0, lastEdit = Date.now();
+
+  for (const page of targets) {
+    let pageFixed = 0; const pageUnmatched = [];
+    try {
+      for (const [col, label] of COLS) {
+        const res = await fixDropdownColumn(page.sheet_id, PAGE_TAB_NAME, col, { dryRun: !apply });
+        if (res.options == null) continue; // no dropdown on this column for this sheet
+        pageFixed += res.changes.length;
+        for (const u of res.unmatched) pageUnmatched.push({ col: label, value: u.value, row: u.row });
+      }
+      if (pageFixed > 0 || pageUnmatched.length > 0) {
+        perPage.push({ handle: page.handle, fixed: pageFixed, unmatched: pageUnmatched });
+        totalFixed += pageFixed; totalUnmatched += pageUnmatched.length;
+      }
+    } catch (err) {
+      failed++;
+      console.error(`[adHandler] /fixdropdowns @${page.handle}: ${err.message}`);
+    }
+    processed++;
+    if (Date.now() - lastEdit > 5000) {
+      editStatus(`🛠️ ${mode} — ${processed}/${targets.length}\n${apply ? "Fixed" : "Would fix"} ${totalFixed} cell(s) · ${totalUnmatched} unmatched${failed ? ` · ${failed} failed` : ""}`).catch(() => {});
+      lastEdit = Date.now();
+    }
+  }
+
+  const lines = [
+    apply ? `🩹 *Dropdowns snapped to valid options*` : `🔎 *DRY RUN — dropdown snap*`,
+    "",
+    `Scanned: ${processed}/${targets.length} sheets${failed ? ` · ${failed} failed` : ""}`,
+    `${apply ? "Fixed" : "Would fix"}: *${totalFixed}* cell(s) on *${perPage.filter((p) => p.fixed).length}* page(s)`,
+    totalUnmatched > 0 ? `⚠️ Unmatched (no dropdown option): *${totalUnmatched}*` : null,
+  ].filter(Boolean);
+  if (perPage.length) {
+    lines.push("");
+    let shown = 0;
+    for (const p of perPage) {
+      if (shown >= 25) { lines.push("…more in logs"); break; }
+      const bits = [];
+      if (p.fixed) bits.push(`${p.fixed} fixed`);
+      if (p.unmatched.length) bits.push(`${p.unmatched.length} unmatched`);
+      lines.push(`• @${p.handle}: ${bits.join(", ")}`);
+      for (const u of p.unmatched.slice(0, 3)) lines.push(`    ⚠️ ${u.col} row ${u.row}: "${u.value}"`);
+      shown++;
+    }
+    console.log(`[adHandler] /fixdropdowns ${apply ? "APPLIED" : "dryrun"}:`, JSON.stringify(perPage));
+  } else {
+    lines.push("", "✅ Everything already matches the dropdowns.");
+  }
+  if (!apply && totalFixed > 0) lines.push("", "▶️ Run `/fixdropdowns go` to apply.");
+
+  if (statusMsg) await editStatus(lines.join("\n"));
+  else await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
+}
+
+/**
  * /auditcols — read-only audit. Checks every enabled per-page sheet's header
  * row against the standard layout the bot writes to:
  *   A Client · B Ad Type · C Bulk# · D Date · E Post Type · F Post Duration ·
@@ -2269,6 +2364,13 @@ async function handleAdMessage(ctx) {
     // Dry-run by default; "go" applies.
     if (text && /^\/fixundistributed\b/i.test(text.trim())) {
       return await handleFixUndistributedCommand(ctx);
+    }
+
+    // /fixdropdowns [go] [@handle …] — snap Ad Type / Post Type / Post Duration
+    // cells to each sheet's real dropdown options (kills red "invalid" flags).
+    // Dry-run by default; "go" applies.
+    if (text && /^\/fixdropdowns\b/i.test(text.trim())) {
+      return await handleFixDropdownsCommand(ctx);
     }
 
     // /auditnif — read-only scan of every per-page sheet's Post Duration
