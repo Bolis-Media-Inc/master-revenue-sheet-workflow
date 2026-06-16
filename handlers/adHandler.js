@@ -1918,6 +1918,9 @@ async function handleAuditDupesCommand(ctx) {
   if (adminId && ctx.from?.id !== adminId) return;
 
   const cmdText = (ctx.message?.text || "").trim();
+  // "verify" → cross-check each candidate group against the source of truth
+  // (distinct Telegram messages in the DB) so legit repeats aren't flagged.
+  const verify = /\bverify\b/i.test(cmdText);
   const monthArgs = (cmdText.match(/\b(1[0-2]|[1-9])\b/g) || []).map(Number);
   const months = monthArgs.length > 0 ? monthArgs : [4, 5]; // default Apr+May
   const monthNames = months.map((m) => ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][m]).join(" + ");
@@ -1955,12 +1958,59 @@ async function handleAuditDupesCommand(ctx) {
     }
   }
 
+  // ── verify: cross-check every candidate group against the source of truth ──
+  // (distinct Telegram messages in the DB for that page+client+date). More
+  // sheet rows than distinct real posts = TRUE duplicates; equal = legit
+  // repeats (e.g. LLM/DCW 4/23 ×2 = two different briefs); zero DB records =
+  // pre-tracking, can't verify here (check the chat). Fail-soft per group.
+  if (verify && pagesWithDupes.length > 0) {
+    const dnorm = (s) => { const m = String(s || "").match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/); return m ? `${+m[1]}/${+m[2]}/${(+m[3]) % 100}` : null; };
+    const realDupes = [], legit = [], unverifiable = [];
+    let vproc = 0;
+    for (const pg of pagesWithDupes) {
+      for (const d of pg.dupes) {
+        let briefs = [];
+        try { briefs = await adBriefs.getBriefsForPageClient(pg.handle, d.client); } catch (_) {}
+        const key  = dnorm(d.date);
+        const msgs = new Set(briefs.filter((b) => dnorm(b.date_posted) === key).map((b) => b.telegram_message_id));
+        const real = msgs.size;
+        if (real === 0)            unverifiable.push({ handle: pg.handle, client: d.client, date: d.date, count: d.count, rows: d.rows });
+        else if (real >= d.count)  legit.push({ handle: pg.handle, client: d.client, date: d.date, real, count: d.count });
+        else                       realDupes.push({ handle: pg.handle, client: d.client, date: d.date, price: d.price, sheetCount: d.count, real, excess: d.count - real, rows: d.rows });
+      }
+      vproc++;
+      if (Date.now() - lastEdit > 5000) { editStatus(`🔬 Verifying vs chat — ${vproc}/${pagesWithDupes.length} page(s)…`).catch(() => {}); lastEdit = Date.now(); }
+    }
+    const vlines = [
+      `🔬 *Source-of-truth dupe audit* (${monthNames})`,
+      "",
+      `Candidate groups: ${totalDupeGroups} on ${pagesWithDupes.length} page(s)`,
+      `🗑️ True dupes: *${realDupes.length}* · ✅ Legit repeats: *${legit.length}* · ❓ Unverifiable: *${unverifiable.length}*`,
+    ];
+    if (realDupes.length) {
+      vlines.push("", "*🗑️ TRUE DUPLICATES — delete the excess:*");
+      let n = 0;
+      for (const r of realDupes) { if (n++ >= 20) { vlines.push("…more in logs"); break; } vlines.push(`• @${r.handle}: ${r.client} · ${r.date} · $${r.price} — sheet ×${r.sheetCount}, real ${r.real} → delete ${r.excess} (rows ${r.rows.join(", ")})`); }
+    }
+    if (unverifiable.length) {
+      vlines.push("", "*❓ PRE-TRACKING — no DB record, check the chat:*");
+      let n = 0;
+      for (const u of unverifiable) { if (n++ >= 12) { vlines.push("…more in logs"); break; } vlines.push(`• @${u.handle}: ${u.client} · ${u.date} ×${u.count} (rows ${u.rows.join(", ")})`); }
+    }
+    if (legit.length) vlines.push("", `*✅ Legit repeats (left alone):* ${legit.length} group(s)`);
+    console.log(`[adHandler] /auditdupes verify:`, JSON.stringify({ realDupes, legit, unverifiable }));
+    if (statusMsg) await editStatus(vlines.join("\n"));
+    else await ctx.reply(vlines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
+    return;
+  }
+
   const lines = [
     `🔎 *Duplicate-entry audit done* (${monthNames}, >$0)`,
     "",
     `Scanned: ${scanned}/${targets.length} sheets${failed ? ` · ${failed} failed` : ""}`,
     `Found: *${totalDupeGroups}* duplicate group(s) across *${pagesWithDupes.length}* page(s)`,
-  ];
+    verify ? "\n_(verify: no candidate groups to check)_" : null,
+  ].filter(Boolean);
   if (pagesWithDupes.length > 0) {
     lines.push("");
     let shown = 0;
