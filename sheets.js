@@ -1336,8 +1336,53 @@ async function applyColumnCenterAlignment(spreadsheetId, tabName, endColumn = "K
   });
 }
 
+/**
+ * Re-pin the Date Posted (column D) for every row whose Client (column A)
+ * matches `clientRegex`. Used to repair special revenue rows that arrived
+ * without a date — e.g. "Undistributed Funds Allocation" — which /syncsheets
+ * then stamped with ~today and drifted to the bottom. Pinning a fixed old
+ * date (then sorting) floats them back to the top.
+ *
+ * Read-only when opts.dryRun is true (returns the matches without writing).
+ *
+ * @param {string} spreadsheetId
+ * @param {string} tabName
+ * @param {RegExp} clientRegex  matched against column A
+ * @param {string} newDate      e.g. "Fri 6/24/22"
+ * @param {object} [opts]
+ * @param {boolean} [opts.dryRun=false]
+ * @returns {Promise<{count:number, rows:Array<{row:number, oldDate:string}>}>}
+ */
+async function repinDateByClient(spreadsheetId, tabName, clientRegex, newDate, opts = {}) {
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = getThrottledSheets(client);
+
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId, range: `${tabName}!A:D`,
+  });
+  const rows = resp.data.values || [];
+  const matches = [];
+  for (let i = 0; i < rows.length; i++) {
+    const a = (rows[i]?.[0] ?? "").toString();
+    if (a && clientRegex.test(a)) {
+      matches.push({ row: i + 1, oldDate: (rows[i]?.[3] ?? "").toString() });
+    }
+  }
+  if (!opts.dryRun && matches.length > 0) {
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        valueInputOption: "USER_ENTERED",
+        data: matches.map((m) => ({ range: `${tabName}!D${m.row}`, values: [[newDate]] })),
+      },
+    });
+  }
+  return { count: matches.length, rows: matches };
+}
+
 module.exports = {
-  appendRow, markForwarded, markForwardedBatch,
+  appendRow, markForwarded, markForwardedBatch, repinDateByClient,
   applyCenterAlignmentBatch, applyColumnCenterAlignment,
   getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates,
   updateStatusToLive, updateAdPrice, updateAdClient, updateAdDate, deleteAdRows,

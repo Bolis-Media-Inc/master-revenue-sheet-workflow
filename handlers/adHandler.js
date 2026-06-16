@@ -12,7 +12,7 @@
  */
 
 const { parseAdMessage }       = require("../parser");
-const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates } = require("../sheets");
+const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, repinDateByClient } = require("../sheets");
 const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages, getStandardBundle, getBlockStructure } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
@@ -1953,6 +1953,104 @@ async function handleAuditDupesCommand(ctx) {
 }
 
 /**
+ * /fixundistributed [go] [@handle …] — repair the dateless "Undistributed
+ * Funds Allocation" revenue row. It arrived with no Date Posted, so /syncsheets
+ * stamped it ~today and it drifted toward the bottom of each page sheet. This
+ * pins it to 6/24/22 (well before any real ad) on every per-page sheet that
+ * has it, then re-sorts so it floats to the top.
+ *
+ *   /fixundistributed            → DRY RUN: list every page + current date, no writes
+ *   /fixundistributed go         → apply on all pages (set date 6/24/22 + re-sort)
+ *   /fixundistributed go @moist  → apply on just the named page(s)
+ *
+ * Matches column A on /funds\s+allocation/i so spelling/typo variants still hit.
+ */
+async function handleFixUndistributedCommand(ctx) {
+  const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+  if (adminId && ctx.from?.id !== adminId) return;
+
+  const cmdText = (ctx.message?.text || "").trim();
+  const apply   = /\bgo\b/i.test(cmdText);
+  const wantedHandles = (cmdText.match(/@([\w.]+)/g) || []).map((h) => h.slice(1).toLowerCase());
+
+  const CLIENT_RE   = /funds\s+allocation/i;
+  // 6/24/22 in the sheet's comma-free "Ddd M/D/YY" convention (e.g. "Fri
+  // 6/24/22"), noon-UTC pinned so AZ projection can't slip the day. Built
+  // without formatSheetDate because that emits a comma ("Fri, 6/24/22") which
+  // would look inconsistent next to the existing "Thu 6/11/26" rows. (Sort
+  // ignores the text anyway — it keys off a numeric scratch column.)
+  const _t = new Date(Date.UTC(2022, 5, 24, 12, 0, 0));
+  const TARGET_DATE =
+    _t.toLocaleDateString("en-US", { timeZone: "America/Phoenix", weekday: "short" }) + " " +
+    _t.toLocaleDateString("en-US", { timeZone: "America/Phoenix", month: "numeric", day: "numeric", year: "2-digit" });
+
+  const allPages = pagesRegistry.listAllSync ? pagesRegistry.listAllSync() : [];
+  let targets = allPages.filter((p) => p.sheet_id && !PLACEHOLDER_PATTERN.test(p.sheet_id));
+  if (wantedHandles.length > 0) {
+    const want = new Set(wantedHandles.map((h) => pagesRegistry.resolveHandle(h) || h));
+    targets = targets.filter((p) => want.has(p.handle));
+  }
+  if (targets.length === 0) { await ctx.reply("⚠️ No matching per-page sheets.").catch(() => {}); return; }
+
+  const mode = apply ? "Applying" : "DRY RUN — previewing";
+  const statusMsg = await ctx.reply(`⏳ ${mode}: scanning ${targets.length} sheet(s) for "Funds Allocation" → ${TARGET_DATE}…`).catch(() => null);
+  const editStatus = async (t) => {
+    if (!statusMsg) return;
+    try { await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, t, { parse_mode: "Markdown" }); }
+    catch (err) { if (!/not modified/i.test(err.message || "")) console.error(`[adHandler] /fixundistributed editStatus: ${err.message}`); }
+  };
+
+  const hits = [];           // { handle, count, oldDates:[] }
+  let processed = 0, failed = 0, totalRows = 0, sorted = 0, lastEdit = Date.now();
+
+  for (const page of targets) {
+    try {
+      const res = await repinDateByClient(page.sheet_id, PAGE_TAB_NAME, CLIENT_RE, TARGET_DATE, { dryRun: !apply });
+      if (res.count > 0) {
+        hits.push({ handle: page.handle, count: res.count, oldDates: res.rows.map((r) => r.oldDate || "(blank)") });
+        totalRows += res.count;
+        if (apply) {
+          await sortSheetByDate(page.sheet_id, PAGE_TAB_NAME).then(() => { sorted++; })
+            .catch((e) => console.error(`[adHandler] /fixundistributed sort @${page.handle}: ${e.message}`));
+        }
+      }
+    } catch (err) {
+      failed++;
+      console.error(`[adHandler] /fixundistributed @${page.handle}: ${err.message}`);
+    }
+    processed++;
+    if (Date.now() - lastEdit > 5000) {
+      editStatus(`🛠️ ${mode} — ${processed}/${targets.length}\n${hits.length} page(s), ${totalRows} row(s)${failed ? ` · ${failed} failed` : ""}`).catch(() => {});
+      lastEdit = Date.now();
+    }
+  }
+
+  const lines = [
+    apply ? `🩹 *Undistributed Funds fixed* → ${TARGET_DATE}` : `🔎 *DRY RUN — Undistributed Funds* (would set → ${TARGET_DATE})`,
+    "",
+    `Scanned: ${processed}/${targets.length} sheets${failed ? ` · ${failed} failed` : ""}`,
+    `${apply ? "Fixed" : "Found"}: *${totalRows}* row(s) on *${hits.length}* page(s)${apply ? ` · re-sorted ${sorted}` : ""}`,
+  ];
+  if (hits.length) {
+    lines.push("");
+    let shown = 0;
+    for (const h of hits) {
+      if (shown >= 30) { lines.push("…and more (see logs)"); break; }
+      lines.push(`• @${h.handle}${h.count > 1 ? ` ×${h.count} ⚠️` : ""} — was: ${h.oldDates.join(", ")}`);
+      shown++;
+    }
+    if (hits.some((h) => h.count > 1)) lines.push("", "⚠️ pages marked ×N have multiple matching rows — likely dupes, review after.");
+    console.log(`[adHandler] /fixundistributed ${apply ? "APPLIED" : "dryrun"}:`, JSON.stringify(hits));
+  } else {
+    lines.push("", "✅ No 'Funds Allocation' rows found.");
+  }
+  if (!apply && hits.length) lines.push("", "▶️ Run `/fixundistributed go` to apply (+ re-sort). Note: rows with malformed dates (e.g. `10/20//22`) will sort to the bottom — fix those first.");
+
+  if (statusMsg) await editStatus(lines.join("\n"));
+  else await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
+}
+
+/**
  * /auditcols — read-only audit. Checks every enabled per-page sheet's header
  * row against the standard layout the bot writes to:
  *   A Client · B Ad Type · C Bulk# · D Date · E Post Type · F Post Duration ·
@@ -2164,6 +2262,13 @@ async function handleAdMessage(ctx) {
     // first). Master sheet excluded (its colored rows + day-bars need care).
     if (text && /^\/sortsheets\b/i.test(text.trim())) {
       return await handleSortSheetsCommand(ctx);
+    }
+
+    // /fixundistributed [go] [@handle …] — pin the dateless "Undistributed
+    // Funds Allocation" row to 6/24/22 across per-page sheets + re-sort.
+    // Dry-run by default; "go" applies.
+    if (text && /^\/fixundistributed\b/i.test(text.trim())) {
+      return await handleFixUndistributedCommand(ctx);
     }
 
     // /auditnif — read-only scan of every per-page sheet's Post Duration
