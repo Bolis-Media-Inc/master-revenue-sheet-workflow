@@ -716,13 +716,27 @@ async function handleReplayCommand(ctx) {
         return;
       }
     }
-  } else if (/^\/replay\s+\d{4,}\s*$/i.test(cmdText)) {
-    // Message-id mode — "/replay 67165": resolve the brief from the DB by its
-    // Telegram message id. Lets /replay run from ANY chat (e.g. Monetization)
-    // without replying to the source message — so the ads-chat team never sees
-    // the command, the forward summary, or the cover picker (which posts to
-    // wherever /replay was run). Unambiguous (no name matching).
-    const mid = Number(cmdText.replace(/^\/replay\s*/i, "").trim());
+  } else if (/^\/replay\s+(?:\d{4,}|(?:https?:\/\/)?t\.me\/\S+)\s*$/i.test(cmdText)) {
+    // Message-id mode — "/replay 67165" OR "/replay <pasted message link>".
+    // The team has no easy way to read a raw message id, so accept the link
+    // Telegram gives them directly (tap message → Copy Link →
+    // https://t.me/c/1868750472/67165) and pull the id out ourselves — it's the
+    // LAST number in the link (c/<chatId>/<msgId>, or .../<topic>/<msgId>).
+    // Resolves the brief from the DB by Telegram message id, so /replay can run
+    // from ANY chat (e.g. Monetization) without replying to the source message.
+    const arg = cmdText.replace(/^\/replay\s*/i, "").trim();
+    const link = arg.match(/t\.me\/\S+/i);
+    let mid;
+    if (link) {
+      const nums = link[0].match(/\d+/g) || [];
+      mid = nums.length ? Number(nums[nums.length - 1]) : NaN;
+    } else {
+      mid = Number(arg);
+    }
+    if (!Number.isFinite(mid) || mid <= 0) {
+      await ctx.reply("❌ Couldn't read a message id. Paste the message link (tap the message → Copy Link) or the number, e.g. /replay 67165").catch(() => {});
+      return;
+    }
     let b = null;
     if (adBriefs._supabase) {
       const { data } = await adBriefs._supabase
