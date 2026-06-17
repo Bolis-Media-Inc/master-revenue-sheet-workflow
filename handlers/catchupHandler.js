@@ -327,17 +327,31 @@ async function handleCatchupCallback(ctx) {
 async function handleFixNameCommand(ctx) {
   if (!isAdmin(ctx)) return;
   const txt = (ctx.message?.text || "").trim();
-  // /fixname <msgId> <name>   or   /fixname <chatId> <msgId> <name>
-  let m = txt.match(/^\/fixname\s+(-100\d{6,})\s+(\d+)\s+(.+)$/i);
   let chatId, msgId, name;
-  if (m) { chatId = Number(m[1]); msgId = Number(m[2]); name = m[3].trim(); }
-  else {
-    m = txt.match(/^\/fixname\s+(\d+)\s+(.+)$/i);
-    if (!m) {
-      await ctx.reply("Usage: /fixname <messageId> <new client name>\n(or /fixname <chatId> <messageId> <name>)").catch(() => {});
-      return;
-    }
+  // Preferred: /fixname <pasted message link> <name>. The team copies the
+  // link (tap message → Copy Link) instead of hunting for a raw id. A private
+  // "c/<chatId>/<msgId>" link gives us BOTH the chat and the message id; a
+  // topic link "c/<chat>/<topic>/<msg>" or public "username/<msg>" still yields
+  // the msg id (last number) — chat falls back to the ads source chat.
+  let m = txt.match(/^\/fixname\s+(?:https?:\/\/)?t\.me\/(\S+)\s+(.+)$/i);
+  if (m) {
+    const path = m[1]; name = m[2].trim();
+    const c = path.match(/^c\/(\d+)\/(?:\d+\/)?(\d+)/i);
+    if (c) { chatId = Number("-100" + c[1]); msgId = Number(c[2]); }
+    else { const nums = path.match(/\d+/g) || []; msgId = nums.length ? Number(nums[nums.length - 1]) : NaN; chatId = Number(DEFAULT_SOURCE_CHAT); }
+  } else if ((m = txt.match(/^\/fixname\s+(-100\d{6,})\s+(\d+)\s+(.+)$/i))) {
+    // /fixname <chatId> <msgId> <name>
+    chatId = Number(m[1]); msgId = Number(m[2]); name = m[3].trim();
+  } else if ((m = txt.match(/^\/fixname\s+(\d+)\s+(.+)$/i))) {
+    // /fixname <msgId> <name>
     chatId = Number(DEFAULT_SOURCE_CHAT); msgId = Number(m[1]); name = m[2].trim();
+  } else {
+    await ctx.reply("Usage: /fixname <message link> <new client name>\n(paste the link: tap the message → Copy Link)\nA raw message id also works: /fixname 67165 New Name").catch(() => {});
+    return;
+  }
+  if (!Number.isFinite(msgId) || msgId <= 0 || !name) {
+    await ctx.reply("❌ Couldn't read the message link/id. Paste the message link then the new name, e.g.\n/fixname https://t.me/c/1868750472/67165 Stake Day 25").catch(() => {});
+    return;
   }
   if (!adBriefs._supabase) { await ctx.reply("❌ DB unavailable.").catch(() => {}); return; }
   const { error } = await adBriefs._supabase
