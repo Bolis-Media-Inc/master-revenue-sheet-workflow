@@ -1258,9 +1258,20 @@ async function remindAwaitingSessions(telegram, fallbackChatId) {
     return;
   }
 
+  // The ads/source chat(s) — cover-assignment reminders must NEVER land here
+  // (the sales team shouldn't see internal "needs cover" nags). prompt_chat_id
+  // can be a source chat for sessions created via the old source-chat fallback,
+  // so force those back to the Monetization alert chat.
+  const SOURCE_CHATS = (process.env.TARGET_CHAT_ID || "")
+    .split(",").map((x) => x.trim()).filter(Boolean);
+
   for (const s of sessions) {
-    const target = s.prompt_chat_id || fallbackChatId;
-    if (!target) continue;
+    let target = s.prompt_chat_id || fallbackChatId;
+    if (SOURCE_CHATS.includes(String(target))) target = fallbackChatId;
+    if (!target || SOURCE_CHATS.includes(String(target))) continue; // never nag the ads chat
+    if (target !== s.prompt_chat_id && s.prompt_chat_id) {
+      console.log(`[resolve] ⏰ reminder re-routed off source chat ${s.prompt_chat_id} → ${target}`);
+    }
     // /resolve matches on the BRIEF id prefix (not the session id).
     const briefShort = (s.brief_id || "").slice(0, 8);
     const pagesCt  = Array.isArray(s.pages) ? s.pages.length : 0;
