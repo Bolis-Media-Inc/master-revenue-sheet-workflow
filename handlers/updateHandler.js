@@ -495,8 +495,78 @@ async function _runOneUpdateLine(ctx, brief, briefPages, line) {
   return { error: `Unknown subcommand: \`${_md(subcommand)}\` (available: price, name)` };
 }
 
+/**
+ * /remove <message link | id> [@page …] — whole-adset takedown by link.
+ *
+ * Runnable from ANY chat (e.g. Monetization) without replying in the ads chat,
+ * matching /replay's UX. Resolves the brief from its Telegram message id (last
+ * number in a pasted message link, or a raw id), then runs the SAME per-page
+ * takedown as reply-mode `/update remove` — for EVERY page of the brief (or
+ * just the @pages you name): deletes each forwarded post + master & per-page
+ * sheet rows + the DB row, and decrements the brief total. Irreversible.
+ */
+async function handleRemoveCommand(ctx) {
+  const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+  if (adminId && ctx.from?.id !== adminId) return;
+  const txt = (ctx.message?.text || "").trim();
+
+  // Optional @page filter; strip handles + command to isolate the link/id.
+  const handleArgs = (txt.match(/@([\w.]+)/g) || []).map((h) => h.slice(1).toLowerCase());
+  const rest = txt.replace(/^\/remove\s*/i, "").replace(/@[\w.]+/g, "").trim();
+
+  // Message id = last number of a t.me link, or a bare id.
+  let msgId = NaN;
+  const link = rest.match(/t\.me\/(\S+)/i);
+  if (link) {
+    const nums = link[1].match(/\d+/g) || [];
+    msgId = nums.length ? Number(nums[nums.length - 1]) : NaN;
+  } else if (/^\d{4,}$/.test(rest)) {
+    msgId = Number(rest);
+  }
+  if (!Number.isFinite(msgId) || msgId <= 0) {
+    await ctx.reply(
+      "Usage: /remove <message link> [@page …]\n" +
+      "(paste the link: tap the message → Copy Link)\n" +
+      "Removes the WHOLE adset — every page's post + sheet rows. Add @page to limit it."
+    ).catch(() => {});
+    return;
+  }
+
+  if (!adBriefs._supabase) { await ctx.reply("❌ DB unavailable.").catch(() => {}); return; }
+  const { data } = await adBriefs._supabase
+    .from("ad_briefs").select("*")
+    .eq("telegram_message_id", msgId)
+    .order("received_at", { ascending: false })
+    .limit(1);
+  const brief = data?.[0];
+  if (!brief) { await ctx.reply(`❌ No brief in the books with message id ${msgId}.`).catch(() => {}); return; }
+
+  const briefPages = await adBriefs.getBriefPages(brief.id);
+  if (!briefPages.length) { await ctx.reply(`❌ "${brief.client}" has no pages on record to remove.`).catch(() => {}); return; }
+  const handles = handleArgs.length
+    ? handleArgs.filter((h) => briefPages.some((p) => p.page_handle.toLowerCase() === h))
+    : briefPages.map((p) => p.page_handle);
+  if (!handles.length) { await ctx.reply("❌ None of those @pages are in this brief.").catch(() => {}); return; }
+
+  const statusMsg = await ctx.reply(`🗑️ Removing ${handles.length} page(s) from "${brief.client}"…`).catch(() => null);
+  const { replies, chatEdits } = await updateTakedown(ctx, brief, briefPages, handles);
+  const out = [
+    `🗑️ *Removed from ${_md(brief.client || "brief")}* (${handles.length} page${handles.length === 1 ? "" : "s"})`,
+    ...replies.map((l) => "  " + l),
+    ``,
+    `Posts deleted: ${chatEdits.edited} · skipped ${chatEdits.skipped} · failed ${chatEdits.failed}`,
+  ].join("\n");
+  if (statusMsg) {
+    await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, out, { parse_mode: "Markdown" })
+      .catch(() => ctx.reply(out, { parse_mode: "Markdown" }).catch(() => {}));
+  } else {
+    await ctx.reply(out, { parse_mode: "Markdown" }).catch(() => {});
+  }
+}
+
 module.exports = {
   handleUpdateCommand,
+  handleRemoveCommand,
   // exported for reuse by handlers/auditHandler.js (backwards compat)
   updatePrice,
   updateName,

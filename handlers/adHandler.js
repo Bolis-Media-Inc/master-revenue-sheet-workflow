@@ -2466,6 +2466,14 @@ async function handleAdMessage(ctx) {
       return await handleFixDropdownsCommand(ctx);
     }
 
+    // /remove <message link|id> [@page …] — whole-adset takedown by link,
+    // runnable from Monetization (no reply needed in the ads chat). Deletes
+    // every page's forwarded post + master & per-page sheet rows + DB.
+    if (text && /^\/remove\b/i.test(text.trim())) {
+      const { handleRemoveCommand } = require("./updateHandler");
+      return await handleRemoveCommand(ctx);
+    }
+
     // /auditnif — read-only scan of every per-page sheet's Post Duration
     // column (F) for stray "… NIF" values (legacy pre-fix rows). Reports
     // only; makes no edits.
