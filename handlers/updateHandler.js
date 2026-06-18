@@ -308,9 +308,13 @@ async function updateTakedown(ctx, brief, briefPages, handles) {
 
     // 2. Delete Master sheet row
     let masterDel = 0;
+    // Scope deletion to THIS brief's date so we remove the one ad, not the
+    // page's entire history for this client (the over-delete that wiped 269
+    // rows of @howeverythingworks). dateFilter pins it to the brief's day.
+    const _dateFilter = brief.date_posted || null;
     try {
       if (MASTER_SHEET_ID) {
-        masterDel = await sheetsLib.deleteAdRows(MASTER_SHEET_ID, MASTER_TAB_NAME, [norm], brief.client, true);
+        masterDel = await sheetsLib.deleteAdRows(MASTER_SHEET_ID, MASTER_TAB_NAME, [norm], brief.client, true, { dateFilter: _dateFilter });
       }
     } catch (err) {
       console.error(`[update takedown] master sheet @${norm}: ${err.message}`);
@@ -321,7 +325,7 @@ async function updateTakedown(ctx, brief, briefPages, handles) {
     const pgSheetId = pagesRegistry.getSheetId(norm);
     if (pgSheetId) {
       try {
-        pageDel = await sheetsLib.deleteAdRows(pgSheetId, PAGE_TAB_NAME, [norm], brief.client, false);
+        pageDel = await sheetsLib.deleteAdRows(pgSheetId, PAGE_TAB_NAME, [norm], brief.client, false, { dateFilter: _dateFilter });
       } catch (err) {
         console.error(`[update takedown] per-page sheet @${norm}: ${err.message}`);
       }

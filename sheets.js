@@ -1094,7 +1094,7 @@ async function updateAdClient(spreadsheetId, tabName, pageHandles, oldClient, ne
  * Rows are deleted bottom-to-top so indices don't shift mid-request.
  * Returns the number of rows deleted.
  */
-async function deleteAdRows(spreadsheetId, tabName, pageHandles, clientName, isMasterSheet = true) {
+async function deleteAdRows(spreadsheetId, tabName, pageHandles, clientName, isMasterSheet = true, opts = {}) {
   const auth   = getAuth();
   const client = await auth.getClient();
   const sheets = getThrottledSheets(client);
@@ -1106,6 +1106,12 @@ async function deleteAdRows(spreadsheetId, tabName, pageHandles, clientName, isM
   const sheetId = sheet.properties.sheetId;
 
   const normClient = clientName?.toLowerCase().trim() || null;
+  // Normalize a date string to M/D/YY so "Mon 6/12/26" == "6/12/26". A
+  // dateFilter scopes the delete to ONE brief's day — without it, a client-name
+  // match is sheet-wide (that's what wiped 269 rows of @howeverythingworks
+  // history from a single /remove of one LLM/DCW brief).
+  const dnorm = (s) => { const m = String(s || "").match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/); return m ? `${+m[1]}/${+m[2]}/${(+m[3]) % 100}` : null; };
+  const wantDate = opts.dateFilter ? dnorm(opts.dateFilter) : null;
   let rowsToDelete = []; // 0-indexed row indices in the sheet
 
   if (isMasterSheet) {
@@ -1119,32 +1125,50 @@ async function deleteAdRows(spreadsheetId, tabName, pageHandles, clientName, isM
     for (let i = 0; i < rows.length; i++) {
       const clientCell = (rows[i]?.[0] || "").trim().toLowerCase(); // B
       const pageCell   = (rows[i]?.[4] || "").trim().toLowerCase(); // F
+      const dateCell   = rows[i]?.[2];                              // D
       const clientMatches = !normClient || clientCell === normClient;
+      const dateMatches   = !wantDate || dnorm(dateCell) === wantDate;
 
-      if (normalised.includes(pageCell) && clientMatches) {
+      if (normalised.includes(pageCell) && clientMatches && dateMatches) {
         rowsToDelete.push(i); // 0-indexed
       }
     }
 
   } else {
-    // Page sheet — match client only
+    // Page sheet — match client (col A), scoped to the date (col D) when given.
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId,
-      range: `${tabName}!A:A`,
+      range: `${tabName}!A:D`,
     });
     const rows = response.data.values || [];
 
     for (let i = 0; i < rows.length; i++) {
-      const clientCell    = (rows[i]?.[0] || "").trim().toLowerCase();
+      const clientCell    = (rows[i]?.[0] || "").trim().toLowerCase(); // A
+      const dateCell      = rows[i]?.[3];                              // D
       const clientMatches = !normClient || clientCell === normClient;
+      const dateMatches   = !wantDate || dnorm(dateCell) === wantDate;
 
-      if (clientMatches && clientCell) {
+      if (clientMatches && clientCell && dateMatches) {
         rowsToDelete.push(i);
       }
     }
   }
 
   if (rowsToDelete.length === 0) return 0;
+
+  // ── SAFETY BACKSTOP — never mass-delete ──────────────────────────────────
+  // A single-brief takedown should touch 1–2 rows. A client-name match with no
+  // date is sheet-wide and already nuked a page's entire client history once.
+  // Cap it: small without a date filter (forces precise, date-scoped deletes),
+  // a bit higher with one. Fail LOUD (throw) instead of silently deleting.
+  const cap = opts.maxRows != null ? opts.maxRows : (wantDate ? 8 : 2);
+  if (rowsToDelete.length > cap) {
+    throw new Error(
+      `deleteAdRows refused to delete ${rowsToDelete.length} rows ` +
+      `(client="${normClient}", date=${wantDate || "ANY"}, cap=${cap}) on "${tabName}" — ` +
+      `pass a dateFilter to target one brief instead of a client's whole history.`
+    );
+  }
 
   // Delete bottom-to-top so earlier indices don't shift
   rowsToDelete.sort((a, b) => b - a);
