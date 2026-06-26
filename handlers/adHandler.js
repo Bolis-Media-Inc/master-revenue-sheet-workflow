@@ -13,11 +13,12 @@
 
 const { parseAdMessage }       = require("../parser");
 const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, repinDateByClient, fixDropdownColumn, getColumnDropdownOptions, snapToDropdown } = require("../sheets");
-const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages, getStandardBundle, getBlockStructure } = require("../messageBuffer");
+const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages, getStandardBundle, getBlockStructure, getBriefBlockForAI } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
 const pagesRegistry            = require("../lib/pages");
 const adBriefs                 = require("../lib/adBriefs");
+const briefAI                  = require("../lib/briefAI");
 
 // Supports comma-separated chat IDs so a test group can run alongside production.
 // e.g. TARGET_CHAT_ID=-1001111111111,-1002222222222
@@ -3056,6 +3057,34 @@ async function handleAdMessage(ctx) {
         `shared caption: ${sharedBundle.caption ? "yes" : "no"}, ` +
         `fallback media: ${fallbackMedia.length})`,
       );
+
+      // ── Brief-AI shadow compare (fire-and-forget, never blocks forward) ──
+      // Run Claude over the whole brief block in parallel and flag any place it
+      // reads the caption / creative count differently than the heuristics did.
+      // Gated behind BRIEF_AI_SHADOW; hard no-op otherwise. Never alters this
+      // forward — see lib/briefAI.js.
+      if (briefAI.SHADOW_ENABLED) {
+        try {
+          const serialized = getBriefBlockForAI(sourceChatId, adMessageId);
+          if (serialized) {
+            const hCap = sharedBundle.caption && !isBareHandleCaption(sharedBundle.caption)
+              ? sharedBundle.caption : null;
+            const hPages = [...new Set(parsedList.map((p) => p.pageHandle?.toLowerCase()).filter(Boolean))];
+            briefAI.shadowCompare(ctx.telegram, RESOLVE_ALERT_CHAT_ID, {
+              serialized,
+              heuristic: {
+                caption: hCap,
+                creativeCount: sharedBundle.media.length || fallbackMedia.length,
+                format: detectedFormat,
+                pages: hPages,
+              },
+              label: `${parsedList[0]?.clientName || "?"} · ${detectedFormat} · ${hPages.length}p`,
+            }); // intentionally not awaited
+          }
+        } catch (err) {
+          console.error(`[adHandler] briefAI shadow hook error (non-fatal): ${err.message}`);
+        }
+      }
 
       // ── Group / multi-cover detection → pause + cover→page picker ────────
       // Two shapes get routed to the interactive picker (NO sheet writes —
