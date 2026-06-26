@@ -263,17 +263,33 @@ function getPrecedingMessages(chatId, beforeMessageId, count = 2) {
  * once, right above the brief, and every page's IG Ads chat should
  * receive it.
  */
+// A text that is nothing but @handles (e.g. "@moist", "@a @b @c") is a
+// page-LABEL the operator typed to attribute a creative — NOT IG caption copy.
+// It must never be stored or forwarded as a caption (a bare "@page" cover
+// caption was hijacking + suppressing the real shared caption).
+function _isBareHandles(s) {
+  const t = String(s || "").trim();
+  return t.length > 0 && /^(@[\w.-]+[\s,]*)+$/.test(t);
+}
+
+// Normalize a raw media/text caption to real IG copy or null: drops empties,
+// "^" annotations, previous-brief text, and bare-@handle page labels.
+function _realCaption(raw) {
+  const t = (raw || "").trim();
+  if (!t) return null;
+  if (t.endsWith("^")) return null;
+  if (_isBareHandles(t)) return null;
+  if (_looksLikePreviousBrief(t)) return null;
+  return t;
+}
+
 function _extractSharedCaption(preceding) {
   if (preceding.length === 0) return null;
   const last = preceding[preceding.length - 1];
-  const text = (last.text || "").trim();
   const hasMedia = !!(last.photo || last.video || last.document ||
                       last.animation || last.audio || last.sticker);
   if (hasMedia) return null;
-  if (!text) return null;
-  if (text.endsWith("^")) return null;
-  if (_looksLikePreviousBrief(text)) return null;
-  return text;
+  return _realCaption(last.text);
 }
 
 /**
@@ -292,12 +308,8 @@ function _extractSharedCaption(preceding) {
  */
 function _captionFromSharedMedia(mediaArr) {
   for (const m of (mediaArr || [])) {
-    const cap = (m.caption || "").trim();
-    if (!cap) continue;
-    if (cap.endsWith("^")) continue;
-    if (_looksLikePreviousBrief(cap)) continue;
-    if (/^(@[\w.-]+[\s,]*)+$/.test(cap)) continue; // bare @handle attribution line
-    return cap;
+    const cap = _realCaption(m.caption);
+    if (cap) return cap;
   }
   return null;
 }
@@ -684,9 +696,9 @@ function getFilenameBundlesByPage(chatId, adMessageId) {
     // Capture any caption attached to the media itself (Telegram's
     // .caption field on a photo/video/doc message). Mirrors what the
     // @-filename branch does so label-attributed media also get their
-    // per-page caption forwarded. Without this, GOAL TEMPLATE png 2's
-    // "Kevin De Bruyne... Odds by @stake" caption would be dropped.
-    const mediaCaption = (msg.caption || "").trim() || null;
+    // per-page caption forwarded. _realCaption drops bare-@handle page
+    // labels so they never get stored/forwarded as a caption.
+    const mediaCaption = _realCaption(msg.caption);
     if (!byHandle.has(handle)) {
       byHandle.set(handle, { media: [msg], caption: mediaCaption });
     } else {
@@ -722,7 +734,9 @@ function getFilenameBundlesByPage(chatId, adMessageId) {
         // Telegram's media `caption` field — if Danielson typed something
         // under the file in his client, it surfaces here. Becomes the
         // per-page caption forwarded as a separate text after the cover.
-        const mediaCaption = (msg.caption || "").trim() || null;
+        // _realCaption drops bare-@handle page labels (a "@page" cover caption
+        // is attribution, not IG copy).
+        const mediaCaption = _realCaption(msg.caption);
         if (!byHandle.has(handle)) {
           byHandle.set(handle, { media: [msg], caption: mediaCaption });
         } else {
@@ -905,6 +919,37 @@ function getStandardBundle(chatId, adMessageId) {
       // NULL → no caption forwarded). Mirrors the filename/label scanners.
       caption: sharedCaption || _captionFromSharedMedia(sharedMedia),
     },
+  };
+}
+
+/**
+ * Serialize a brief's whole block (every preceding message in this brief's
+ * block, in chronological order, plus the brief message itself) into plain
+ * objects an LLM classifier can read. Used by the shadow "brief understanding"
+ * pass — it needs to see each piece's kind + filename + text/caption to decide
+ * its PURPOSE (creative vs caption vs instruction vs audio-ref vs irrelevant),
+ * which regex heuristics can't do reliably.
+ *
+ * @returns {{ block: Array<{message_id,kind,file_name,text,caption}>, brief: {...} }|null}
+ */
+function getBriefBlockForAI(chatId, adMessageId) {
+  const buf = _buffers.get(String(chatId)) || [];
+  const adIdx = buf.findIndex((m) => m.message_id === adMessageId);
+  if (adIdx < 0) return null;
+  const ser = (m) => {
+    const kind = m.photo ? "photo" : m.video ? "video" : m.document ? "document"
+               : m.animation ? "animation" : m.audio ? "audio" : m.sticker ? "sticker" : "text";
+    return {
+      message_id: m.message_id,
+      kind,
+      file_name: m.document?.file_name || m.video?.file_name || m.audio?.file_name || null,
+      text:      (m.text || "").trim() || null,
+      caption:   (m.caption || "").trim() || null,
+    };
+  };
+  return {
+    block: _currentBlock(buf.slice(0, adIdx)).map(ser),
+    brief: ser(buf[adIdx]),
   };
 }
 
@@ -1099,6 +1144,7 @@ module.exports = {
   getCollabBundlesByPage,
   getFilenameBundlesByPage,
   getStandardBundle,
+  getBriefBlockForAI,
   getBlockStructure,
   getMessages,
   clearBufferUpTo,
