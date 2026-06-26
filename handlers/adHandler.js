@@ -1348,10 +1348,11 @@ async function handleReplayCommand(ctx) {
         console.log(`[adHandler] ✅ /replay forwarded ${sharedTotal} shared msg(s) → @${handle} (buffer: ${sharedBundle.media.length}, DB: ${dbSharedMedia.length})`);
       }
 
-      // 3. Caption (per-page wins over shared) — buffer first, then DB
-      const _rawReplayCaption = perPageBundle.caption || sharedBundle.caption
-                          || dbPerPageCaption || dbSharedCaption;
-      const captionToSend = isBareHandleCaption(_rawReplayCaption) ? null : _rawReplayCaption;
+      // 3. Caption (per-page wins over shared) — buffer first, then DB.
+      // Pick the first REAL caption, skipping bare-@handle junk so a cover whose
+      // caption is just "@page" can't suppress the real shared caption.
+      const captionToSend = [perPageBundle.caption, sharedBundle.caption, dbPerPageCaption, dbSharedCaption]
+        .find((c) => c && !isBareHandleCaption(c)) || null;
       if (captionToSend) {
         const sent = await ctx.telegram.sendMessage(destChatId, captionToSend);
         if (sent?.message_id) replayIds.push(sent.message_id);
@@ -3532,10 +3533,15 @@ async function handleAdMessage(ctx) {
           console.log(`[adHandler] ✅ Forwarded ${sharedBundle.media.length} shared msg(s) → @${handle}`);
         }
 
-        // 3️⃣ Caption — per-page wins over shared. Either way, sent as a
-        // separate text message after media so VA can copy/paste into IG.
-        const _rawCaption = perPageCaption || sharedBundle.caption;
-        const captionToSend = isBareHandleCaption(_rawCaption) ? null : _rawCaption;
+        // 3️⃣ Caption — a real per-page caption wins over the shared one.
+        // Filter EACH candidate for bare-@handle junk BEFORE choosing: a cover
+        // whose media caption is just "@page" must NOT suppress the real shared
+        // caption. (Old `perPageCaption || shared` then a single bare-handle
+        // check let "@page" win the ||, then nulled it → the real IG caption
+        // silently dropped on every brief whose cover carried a @handle caption.)
+        const _ppCap = perPageCaption && !isBareHandleCaption(perPageCaption) ? perPageCaption : null;
+        const _shCap = sharedBundle.caption && !isBareHandleCaption(sharedBundle.caption) ? sharedBundle.caption : null;
+        const captionToSend = _ppCap || _shCap;
         if (captionToSend) {
           try {
             const sent = await ctx.telegram.sendMessage(String(destChatId), captionToSend);
