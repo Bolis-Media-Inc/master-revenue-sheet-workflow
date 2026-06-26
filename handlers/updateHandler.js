@@ -547,18 +547,21 @@ async function handleRemoveCommand(ctx) {
 
   const briefPages = await adBriefs.getBriefPages(brief.id);
   if (!briefPages.length) { await ctx.reply(`❌ "${brief.client}" has no pages on record to remove.`).catch(() => {}); return; }
-  const handles = handleArgs.length
-    ? handleArgs.filter((h) => briefPages.some((p) => p.page_handle.toLowerCase() === h))
-    : briefPages.map((p) => p.page_handle);
-  if (!handles.length) { await ctx.reply("❌ None of those @pages are in this brief.").catch(() => {}); return; }
+  const targetPages = handleArgs.length
+    ? briefPages.filter((p) => handleArgs.includes(p.page_handle.toLowerCase().replace(/^@/, "")))
+    : briefPages;
+  if (!targetPages.length) { await ctx.reply("❌ None of those @pages are in this brief.").catch(() => {}); return; }
 
-  const statusMsg = await ctx.reply(`🗑️ Removing ${handles.length} page(s) from "${brief.client}"…`).catch(() => null);
-  const { replies, chatEdits } = await updateTakedown(ctx, brief, briefPages, handles);
+  const statusMsg = await ctx.reply(`🗑️ Removing this send of "${brief.client}" — ${targetPages.length} page(s)…`).catch(() => null);
+  const { replies, chat, masterDel, pageRowsDeleted, dbDel, stale, removedPrice } =
+    await takedownBriefPrecise(ctx, brief, targetPages);
   const out = [
-    `🗑️ *Removed from ${_md(brief.client || "brief")}* (${handles.length} page${handles.length === 1 ? "" : "s"})`,
+    `🗑️ *Removed this send — ${_md(brief.client || "brief")}* (msg ${msgId})`,
+    `Pages ${targetPages.length} · sheet rows: ${pageRowsDeleted} per-page + ${masterDel} master · posts: ${chat.deleted} deleted` +
+      (chat.skipped ? `, ${chat.skipped} skipped` : "") + (chat.failed ? `, ${chat.failed} failed` : ""),
+    `−$${removedPrice} off brief total · DB rows removed: ${dbDel}`,
     ...replies.map((l) => "  " + l),
-    ``,
-    `Posts deleted: ${chatEdits.edited} · skipped ${chatEdits.skipped} · failed ${chatEdits.failed}`,
+    ...(stale.length ? ["", "⚠️ Couldn't auto-remove (sheet moved / not tracked) — handle by hand:", ...stale.map((s) => "  • " + s)] : []),
   ].join("\n");
   if (statusMsg) {
     await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, out, { parse_mode: "Markdown" })
@@ -566,6 +569,87 @@ async function handleRemoveCommand(ctx) {
   } else {
     await ctx.reply(out, { parse_mode: "Markdown" }).catch(() => {});
   }
+}
+
+/**
+ * Precise whole-send takedown for /remove <link>. Removes ONLY the rows THIS
+ * brief recorded: its forwarded posts (by forwarded_message_ids), its exact
+ * sheet rows (page_sheet_row / master_sheet_row, content-verified), and its DB
+ * page rows — never a client-wide or whole-date sweep. So a duplicate same-day
+ * send can be pulled without touching the legit copy. A recorded row whose
+ * number no longer matches the brief (sheet was re-sorted) is REPORTED for
+ * manual handling, never force-deleted.
+ */
+async function takedownBriefPrecise(ctx, brief, briefPages) {
+  const replies = [];
+  const chat = { deleted: 0, skipped: 0, failed: 0 };
+  const masterItems = [];
+  const stale = [];
+  let pageRowsDeleted = 0, removedPrice = 0;
+
+  for (const pr of briefPages) {
+    const norm = pr.page_handle.toLowerCase().replace(/^@/, "");
+    removedPrice += Number(pr.page_price || 0);
+
+    // 1. Delete this send's forwarded posts in the page chat (exact msg ids).
+    const ids = Array.isArray(pr.forwarded_message_ids) ? pr.forwarded_message_ids : [];
+    const destChatId = pagesRegistry.getChatId(norm);
+    let postsDeleted = 0;
+    if (ids.length && destChatId) {
+      for (const mid of ids) {
+        try { await ctx.telegram.deleteMessage(String(destChatId), Number(mid)); postsDeleted++; chat.deleted++; }
+        catch (err) {
+          if (/can't be deleted|message to delete not found|MESSAGE_ID_INVALID/i.test(err.message || "")) chat.skipped++;
+          else { chat.failed++; console.error(`[remove] del msg @${norm}: ${err.message}`); }
+        }
+      }
+    } else { chat.skipped++; }
+
+    // 2. Per-page sheet — delete ONLY this brief's recorded row, verified.
+    let pgDel = 0;
+    const pgSheetId = pagesRegistry.getSheetId(norm);
+    if (pr.page_sheet_row && pgSheetId) {
+      try {
+        const res = await sheetsLib.deleteRowsByNumber(pgSheetId, PAGE_TAB_NAME,
+          [{ row: pr.page_sheet_row, client: brief.client, date: brief.date_posted }],
+          { isMasterSheet: false });
+        pgDel = res.deleted; pageRowsDeleted += res.deleted;
+        if (res.stale.length) stale.push(`@${norm} per-page row ${pr.page_sheet_row} moved (now: ${res.stale[0].found})`);
+      } catch (err) { console.error(`[remove] per-page @${norm}: ${err.message}`); }
+    } else {
+      stale.push(`@${norm} — no recorded per-page row`);
+    }
+
+    // 3. Queue this brief's master row for one batched verified delete.
+    if (pr.master_sheet_row) masterItems.push({ row: pr.master_sheet_row, client: brief.client, date: brief.date_posted, page: norm });
+
+    replies.push(`@${norm}: ${postsDeleted} post(s) · ${pgDel} sheet row`);
+  }
+
+  // 4. Master sheet — delete this brief's recorded rows (verified, one call).
+  let masterDel = 0;
+  if (masterItems.length && MASTER_SHEET_ID) {
+    try {
+      const res = await sheetsLib.deleteRowsByNumber(MASTER_SHEET_ID, MASTER_TAB_NAME, masterItems, { isMasterSheet: true });
+      masterDel = res.deleted;
+      if (res.stale.length) stale.push(`${res.stale.length} master row(s) moved`);
+    } catch (err) { console.error(`[remove] master: ${err.message}`); }
+  }
+
+  // 5. DB — remove these pages' rows + decrement the brief total.
+  let dbDel = 0;
+  if (adBriefs._supabase) {
+    try {
+      const handles = briefPages.map((p) => p.page_handle.toLowerCase());
+      const { data } = await adBriefs._supabase.from("ad_brief_pages").delete()
+        .eq("brief_id", brief.id).in("page_handle", handles).select("id");
+      dbDel = data?.length || 0;
+      const newTotal = Math.max(0, Number(brief.total_price || 0) - removedPrice);
+      await adBriefs._supabase.from("ad_briefs").update({ total_price: newTotal }).eq("id", brief.id);
+    } catch (err) { console.error(`[remove] DB: ${err.message}`); }
+  }
+
+  return { replies, chat, masterDel, pageRowsDeleted, dbDel, stale, removedPrice };
 }
 
 module.exports = {

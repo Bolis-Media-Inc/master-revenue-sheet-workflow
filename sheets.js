@@ -1192,6 +1192,71 @@ async function deleteAdRows(spreadsheetId, tabName, pageHandles, clientName, isM
   return rowsToDelete.length;
 }
 
+/**
+ * Delete SPECIFIC rows by their 1-indexed row number — but only after verifying
+ * each row still holds the brief we expect (client + date, and page on the
+ * master). This is the surgical takedown for /remove <link>: it removes exactly
+ * the rows ONE send recorded (its page_sheet_row / master_sheet_row), never a
+ * client-wide sweep — so a duplicate same-day send can be pulled without
+ * touching the legit copy. The content check guards against stale row numbers
+ * (a re-sort or earlier delete shifts them): a row that no longer matches is
+ * SKIPPED (reported as stale), never deleted, so an unrelated row can't be hit.
+ *
+ * Column layout: master B=client, D=date, F=page, H=price; per-page A=client,
+ * D=date, G=price. We read A:I and index absolutely.
+ *
+ * @param {Array<{row:number, client?:string, date?:string, page?:string}>} items
+ * @param {object} opts  { isMasterSheet }
+ * @returns {Promise<{deleted:number, stale:Array<{row:number, found:string}>}>}
+ */
+async function deleteRowsByNumber(spreadsheetId, tabName, items, opts = {}) {
+  if (!items || !items.length) return { deleted: 0, stale: [] };
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = getThrottledSheets(client);
+
+  const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId });
+  const sheet = spreadsheet.data.sheets?.find((s) => s.properties.title === tabName);
+  if (!sheet) throw new Error(`Tab "${tabName}" not found in spreadsheet ${spreadsheetId}`);
+  const sheetId = sheet.properties.sheetId;
+
+  const resp = await sheets.spreadsheets.values.get({ spreadsheetId, range: `${tabName}!A:I` });
+  const rows = resp.data.values || [];
+  const dnorm = (s) => { const m = String(s || "").match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/); return m ? `${+m[1]}/${+m[2]}/${(+m[3]) % 100}` : null; };
+  const M = !!opts.isMasterSheet;
+  const cClient = M ? 1 : 0; // B vs A
+  const cDate   = 3;         // D (both)
+  const cPage   = M ? 5 : -1; // F (master only)
+
+  const verified = [], stale = [];
+  for (const it of items) {
+    if (!it || !it.row || it.row < 1) continue;
+    const r = rows[it.row - 1];
+    if (!r) { stale.push({ row: it.row, found: "(empty / out of range)" }); continue; }
+    const rClient = (r[cClient] || "").toString().trim().toLowerCase();
+    const rDate   = dnorm(r[cDate]);
+    const rPage   = cPage >= 0 ? (r[cPage] || "").toString().trim().toLowerCase().replace(/^@/, "") : null;
+    const okClient = !it.client || rClient === it.client.toString().trim().toLowerCase();
+    const okDate   = !it.date   || rDate === dnorm(it.date);
+    const okPage   = cPage < 0 || !it.page || rPage === it.page.toString().trim().toLowerCase().replace(/^@/, "");
+    if (okClient && okDate && okPage) verified.push(it.row);
+    else stale.push({ row: it.row, found: `${rClient} | ${rDate || "?"}${rPage != null ? " | " + rPage : ""}` });
+  }
+  if (!verified.length) return { deleted: 0, stale };
+
+  // Delete bottom-to-top so earlier indices don't shift.
+  const uniq = [...new Set(verified)].sort((a, b) => b - a);
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: uniq.map((rowNum) => ({
+        deleteDimension: { range: { sheetId, dimension: "ROWS", startIndex: rowNum - 1, endIndex: rowNum } },
+      })),
+    },
+  });
+  return { deleted: uniq.length, stale };
+}
+
 // ── Reminders tab helpers ─────────────────────────────────────────────────────
 // Schema (columns A–F):
 //   A: page handle   B: client   C: destChatId   D: type (permanent|timed)
@@ -1516,6 +1581,6 @@ module.exports = {
   getColumnDropdownOptions, snapToDropdown, fixDropdownColumn,
   applyCenterAlignmentBatch, applyColumnCenterAlignment,
   getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates,
-  updateStatusToLive, updateAdPrice, updateAdClient, updateAdDate, deleteAdRows,
+  updateStatusToLive, updateAdPrice, updateAdClient, updateAdDate, deleteAdRows, deleteRowsByNumber,
   appendReminder, appendRemindersBatch, getPendingReminders, markReminderSent,
 };
