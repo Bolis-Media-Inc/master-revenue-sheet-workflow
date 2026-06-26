@@ -1779,6 +1779,59 @@ async function handleCenterSheetsCommand(ctx) {
 }
 
 /**
+ * /briefai [days] — review the Brief-AI shadow log. Read-only: shows how often
+ * the LLM's read of each brief agreed with the live heuristics, and lists the
+ * recent disagreements (caption dropped / suspect / mismatch / creative-count).
+ * This is the "come back in a few days and see what's happening" surface — the
+ * data lives in brief_ai_shadow_log, this just summarizes it on demand.
+ */
+async function handleBriefAICommand(ctx) {
+  const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+  if (adminId && ctx.from?.id !== adminId) return;
+
+  const m = (ctx.message?.text || "").match(/\/briefai(?:@\w+)?\s+(\d{1,3})/i);
+  const days = m ? Math.min(parseInt(m[1], 10) || 7, 90) : 7;
+
+  if (!briefAI.SHADOW_ENABLED) {
+    await ctx.reply("⚠️ Brief-AI shadow is OFF (set BRIEF_AI_SHADOW=true). No data is being collected.").catch(() => {});
+    return;
+  }
+
+  const s = await briefAI.summarize(days, 20);
+  if (!s) { await ctx.reply("⚠️ Could not read the shadow log (DB unavailable).").catch(() => {}); return; }
+  if (s.total === 0) {
+    await ctx.reply(`📊 *Brief-AI shadow* — last ${days}d\n\nNo briefs compared yet. The log fills as new briefs forward.`, { parse_mode: "Markdown" }).catch(() => {});
+    return;
+  }
+
+  const rate = s.agreementRate != null ? `${(s.agreementRate * 100).toFixed(0)}%` : "—";
+  const lines = [
+    `📊 *Brief-AI shadow* — last ${days}d`,
+    ``,
+    `Compared: *${s.total}*  ·  agreed: *${s.agreed}*  ·  disagreed: *${s.disagreed}*`,
+    `Agreement rate: *${rate}*`,
+    ``,
+    `Disagreements by type:`,
+    `🟥 caption dropped: ${s.byKind.dropped}`,
+    `🟧 caption suspect: ${s.byKind.suspect}`,
+    `🟨 caption mismatch: ${s.byKind.mismatch}`,
+    `🟦 creative count: ${s.byKind.count}`,
+  ];
+  if (s.recent.length) {
+    lines.push(``, `*Recent disagreements:*`);
+    for (const r of s.recent.slice(0, 12)) {
+      const when = (r.created_at || "").slice(5, 16).replace("T", " ");
+      const who = r.client || "?";
+      const first = (r.diffs && r.diffs[0]) ? r.diffs[0].split("\n")[0] : "";
+      lines.push(`• ${when} — ${who}: ${first}`);
+    }
+  }
+  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(async () => {
+    await ctx.reply(lines.join("\n").replace(/[*_`]/g, "")).catch(() => {});
+  });
+}
+
+/**
  * /sortsheets [@handle …] — re-sort per-page rev sheets chronologically by
  * date. With @handles, sorts only those (good for eyeballing one first).
  * Without, sorts every enabled per-page sheet. Master sheet is excluded.
@@ -2454,6 +2507,12 @@ async function handleAdMessage(ctx) {
       return await handleSortSheetsCommand(ctx);
     }
 
+    // /briefai [days] — review the Brief-AI shadow log: agreement rate +
+    // recent disagreements between the LLM's read and the heuristics. Read-only.
+    if (text && /^\/briefai\b/i.test(text.trim())) {
+      return await handleBriefAICommand(ctx);
+    }
+
     // /fixundistributed [go] [@handle …] — pin the dateless "Undistributed
     // Funds Allocation" row to 6/24/22 across per-page sheets + re-sort.
     // Dry-run by default; "go" applies.
@@ -3072,11 +3131,14 @@ async function handleAdMessage(ctx) {
             const hPages = [...new Set(parsedList.map((p) => p.pageHandle?.toLowerCase()).filter(Boolean))];
             briefAI.shadowCompare(ctx.telegram, RESOLVE_ALERT_CHAT_ID, {
               serialized,
+              chatId: sourceChatId,
+              briefMessageId: adMessageId,
               heuristic: {
                 caption: hCap,
                 creativeCount: sharedBundle.media.length || fallbackMedia.length,
                 format: detectedFormat,
                 pages: hPages,
+                client: parsedList[0]?.clientName || null,
               },
               label: `${parsedList[0]?.clientName || "?"} · ${detectedFormat} · ${hPages.length}p`,
             }); // intentionally not awaited
