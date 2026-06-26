@@ -272,6 +272,27 @@ function _isBareHandles(s) {
   return t.length > 0 && /^(@[\w.-]+[\s,]*)+$/.test(t);
 }
 
+// A page-LIST block: a destination list the operator types, e.g.
+//   posted on
+//   @howeverythingworks
+//   @moist
+//   @hoodreels …
+// It's NOT IG caption copy. Distinguished from a real caption that merely
+// MENTIONS a handle ("…keep up with me and my @FashionNova") because here
+// every content line is a bare @handle — only a short header like "posted on"
+// / "pages" is allowed. Requires ≥2 handle lines and no prose lines.
+function _isHandleList(s) {
+  const lines = String(s || "").split("\n").map((l) => l.trim()).filter(Boolean);
+  if (lines.length < 2) return false; // single line → _isBareHandles handles it
+  let handleLines = 0;
+  for (const l of lines) {
+    if (/^(@[\w.-]+[\s,]*)+$/.test(l)) handleLines++;
+    else if (/^(posted on|pages?|page info|tag|tags?|live links?)\s*:?\s*$/i.test(l)) continue; // header, ignore
+    else return false; // a real prose line → it's a caption, not a list
+  }
+  return handleLines >= 2;
+}
+
 // Normalize a raw media/text caption to real IG copy or null: drops empties,
 // "^" annotations, previous-brief text, and bare-@handle page labels.
 function _realCaption(raw) {
@@ -279,17 +300,33 @@ function _realCaption(raw) {
   if (!t) return null;
   if (t.endsWith("^")) return null;
   if (_isBareHandles(t)) return null;
+  if (_isHandleList(t)) return null;          // "posted on / @a / @b …" destination list
   if (_looksLikePreviousBrief(t)) return null;
   return t;
 }
 
 function _extractSharedCaption(preceding) {
-  if (preceding.length === 0) return null;
-  const last = preceding[preceding.length - 1];
-  const hasMedia = !!(last.photo || last.video || last.document ||
-                      last.animation || last.audio || last.sticker);
-  if (hasMedia) return null;
-  return _realCaption(last.text);
+  // Walk BACK from the brief and return the first standalone text that's real
+  // IG copy. The caption is NOT always the immediately-preceding message — a
+  // trailing creative + a "Story ^" / "Slides ^" label often sit between the
+  // caption and the brief (FashionNova: "…keep up with me and my @FashionNova"
+  // → IMG_4619 → "Story ^" → brief). Checking only preceding[last] missed it.
+  // _realCaption skips "^" labels, bare-@handle labels, and previous briefs;
+  // we skip media (their captions are handled separately) and stop at a
+  // previous-brief boundary.
+  for (let i = preceding.length - 1; i >= 0; i--) {
+    const m = preceding[i];
+    const hasMedia = !!(m.photo || m.video || m.document ||
+                        m.animation || m.audio || m.sticker);
+    if (hasMedia) continue;
+    const text = (m.text || "").trim();
+    if (!text) continue;
+    if (_looksLikePreviousBrief(text)) break; // don't cross into an older brief
+    const real = _realCaption(text);
+    if (real) return real;                     // first real caption wins
+    // otherwise it's a "^" label / bare-@handle — keep walking back
+  }
+  return null;
 }
 
 /**
@@ -464,11 +501,15 @@ function getContentBundlesByPage(chatId, adMessageId) {
       break;
 
     } else {
-      // Random text — could be the shared IG caption or just chatter.
-      // Capture the FIRST one we see going backwards (closest to brief)
-      // since that's the caption-slot by team convention. Older plain-text
-      // messages are treated as chatter and ignored.
-      if (sharedCaption == null) sharedCaption = text;
+      // Random text — could be the shared IG caption or just chatter / a
+      // "posted on @a @b" destination list. Capture the FIRST REAL caption we
+      // see going backwards (closest to brief). _realCaption skips "^" labels,
+      // bare-@handle labels, and "posted on / @a / @b" page lists so they don't
+      // get mistaken for the caption.
+      if (sharedCaption == null) {
+        const rc = _realCaption(text);
+        if (rc) sharedCaption = rc;
+      }
       continue;
     }
   }
@@ -876,9 +917,9 @@ function getStandardBundle(chatId, adMessageId) {
   // "Slides 2-7 for ALL ^" → caption → brief) often have an annotation or
   // media sitting between the caption and the brief, so checking only the
   // last message missed the caption (stored empty → /resolve sent no caption).
-  // A caption qualifies when it's non-empty, not a "^" annotation/label, not
-  // a pure @-handle list, and not a previous brief.
-  const HANDLE_LIST_ONLY = /^(@[\w.]+(?:\s+|$))+$/;
+  // A caption qualifies when it's real IG copy — _realCaption rejects "^"
+  // annotations, bare-@handle labels, "posted on / @a / @b" page lists, and
+  // previous briefs.
   let sharedCaption = null;
 
   // Walk backwards from the message just before the brief. Collect media,
@@ -899,11 +940,10 @@ function getStandardBundle(chatId, adMessageId) {
     }
     if (!text) continue;
     if (_looksLikePreviousBrief(text)) break;
-    // First qualifying caption going back wins (closest to the brief).
-    if (sharedCaption == null &&
-        !text.endsWith("^") &&
-        !HANDLE_LIST_ONLY.test(text)) {
-      sharedCaption = text;
+    // First REAL caption going back wins (closest to the brief).
+    if (sharedCaption == null) {
+      const rc = _realCaption(text);
+      if (rc) sharedCaption = rc;
     }
     // Otherwise: annotation ("…^"), handle list, or older chatter — skip.
   }
