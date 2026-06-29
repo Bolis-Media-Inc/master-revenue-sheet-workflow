@@ -2444,6 +2444,28 @@ async function handleAdMessage(ctx) {
   try {
     const text = ctx.message?.text || ctx.message?.caption;
 
+    // ── /chatid — reply with THIS chat's numeric ID ────────────────────────────
+    // Setup helper: add bm_tracking_bot to any IG Ads group and run /chatid to
+    // get the exact ID to paste into the page registry. Works in any chat the
+    // bot is in (placed BEFORE the TARGET_CHAT_IDS gate). Ungated — it only
+    // reveals the chat's own ID, which is exactly what's needed during setup.
+    if (text && /^\/chatid\b/i.test(text.trim())) {
+      const c = ctx.chat || {};
+      const lines = [
+        `🆔 *Chat ID*`,
+        `\`${c.id}\``,
+        ``,
+        `*Title:* ${c.title || (c.type === "private" ? "(private chat)" : "—")}`,
+        `*Type:* ${c.type}`,
+      ];
+      if (c.type === "group") {
+        lines.push(``, `⚠️ _Basic group — this ID changes if it's ever upgraded to a supergroup._`);
+      }
+      await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" })
+        .catch(() => ctx.reply(`Chat ID: ${c.id}`).catch(() => {}));
+      return;
+    }
+
     // ── /replay — re-run forwarding for a previously-processed brief ───────────
     // Runs BEFORE the TARGET_CHAT_IDS gate so it can be invoked from any
     // chat the bot is in (e.g. Monetization Team + AI). Admin-only via
