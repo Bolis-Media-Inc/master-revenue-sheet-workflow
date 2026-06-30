@@ -12,7 +12,7 @@
  */
 
 const { parseAdMessage }       = require("../parser");
-const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, repinDateByClient, fixDropdownColumn, getColumnDropdownOptions, snapToDropdown } = require("../sheets");
+const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, repinDateByClient, fixDropdownColumn, getColumnDropdownOptions, snapToDropdown, getClientDateKeys, dateKeyOf } = require("../sheets");
 const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages, getStandardBundle, getBlockStructure, getBriefBlockForAI } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
@@ -1917,6 +1917,142 @@ async function handleSortSheetsCommand(ctx) {
 }
 
 /**
+ * Reconcile DB ↔ per-page sheets. Finds ads that forwarded successfully but
+ * have no tracked page_sheet_row, then VERIFIES each against the actual sheet
+ * (by client + date) instead of trusting the NULL. Read-only.
+ *
+ * Returns { candidates, checked, present, missing:[{handle,client,date,price}],
+ *           noSheet, sheetsRead, failedSheets }.
+ *   present = row found in the sheet → fine, DB just lost track (/syncsheets
+ *             intentionally skips these).
+ *   missing = forwarded but NO matching row in the sheet → the genuine
+ *             "sent but never sheeted" case.
+ *
+ * `onProgress(done, total)` is called periodically for live status edits.
+ */
+async function reconcileMissingSheetRows(onProgress) {
+  const candidates = await adBriefs.findForwardedMissingPageRows({ limit: 2000 });
+
+  // Group candidates by the resolved sheet so each sheet is read exactly once.
+  const bySheet = new Map(); // sheetId → { handle, items:[{client,date,price,handle}] }
+  let noSheet = 0;
+  for (const row of candidates) {
+    const canonical = pagesRegistry.resolveHandle(row.page_handle) || row.page_handle;
+    const sheetId   = pagesRegistry.getSheetId(canonical);
+    if (!sheetId || PLACEHOLDER_PATTERN.test(sheetId)) { noSheet++; continue; }
+    const date = row.brief?.date_posted || null;
+    const client = row.brief?.client || null;
+    if (!client || !date) { noSheet++; continue; }   // can't match without both
+    if (!bySheet.has(sheetId)) bySheet.set(sheetId, { handle: canonical, items: [] });
+    bySheet.get(sheetId).items.push({
+      client, date, handle: canonical, price: row.page_price,
+    });
+  }
+
+  let present = 0, checked = 0, sheetsRead = 0, failedSheets = 0;
+  const missing = [];
+  const sheetIds = [...bySheet.keys()];
+  for (let s = 0; s < sheetIds.length; s++) {
+    const sheetId = sheetIds[s];
+    const { items } = bySheet.get(sheetId);
+    let keys;
+    try {
+      keys = await getClientDateKeys(sheetId, PAGE_TAB_NAME);
+      sheetsRead++;
+    } catch (err) {
+      failedSheets++;
+      console.error(`[adHandler] /audit reconcile read failed for sheet ${sheetId}: ${err.message}`);
+      if (onProgress) onProgress(s + 1, sheetIds.length);
+      continue; // can't verify this sheet — don't guess "missing"
+    }
+    for (const it of items) {
+      checked++;
+      const dk = dateKeyOf(it.date);
+      const key = `${(it.client || "").trim().toLowerCase()}|${dk}`;
+      if (dk && keys.has(key)) present++;
+      else missing.push(it);
+    }
+    if (onProgress) onProgress(s + 1, sheetIds.length);
+  }
+
+  return { candidates: candidates.length, checked, present, missing, noSheet, sheetsRead, failedSheets };
+}
+
+/**
+ * /auditmissing — reconcile DB ↔ sheets and report ads that forwarded but have
+ * no matching per-page sheet row (the "sent but never sheeted" cases). Removed
+ * ads are excluded automatically (a takedown deletes the ad_brief_pages row).
+ * Read-only — reports only, writes nothing.
+ */
+async function handleAuditMissingCommand(ctx) {
+  const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+  if (adminId && ctx.from?.id !== adminId) return;
+
+  const statusMsg = await ctx.reply("⏳ Reconciling DB ↔ per-page sheets…").catch(() => null);
+  const editStatus = async (t) => {
+    if (!statusMsg) return;
+    try { await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, t, { parse_mode: "Markdown" }); }
+    catch (err) { if (!/not modified/i.test(err.message || "")) console.error(`[adHandler] /auditmissing editStatus: ${err.message}`); }
+  };
+
+  let lastEdit = Date.now();
+  const res = await reconcileMissingSheetRows((done, total) => {
+    if (Date.now() - lastEdit > 4000) {
+      editStatus(`🔍 Verifying sheets… ${done}/${total}`).catch(() => {});
+      lastEdit = Date.now();
+    }
+  });
+
+  const lines = [
+    `📋 *Sent-but-not-sheeted audit*`,
+    ``,
+    `Forwarded w/ untracked row: *${res.candidates}*`,
+    `Verified against sheets: *${res.checked}* (${res.sheetsRead} sheets)`,
+    `✅ Found in sheet (just untracked): *${res.present}*`,
+    `🟥 Genuinely missing: *${res.missing.length}*`,
+  ];
+  if (res.noSheet) lines.push(`⚪ Skipped (no page sheet / no date): ${res.noSheet}`);
+  if (res.failedSheets) lines.push(`⚠️ Sheets unreadable (not judged): ${res.failedSheets}`);
+  if (res.missing.length) {
+    lines.push(``, `*Missing rows — verify, then /replay or /syncsheets:*`);
+    res.missing.slice(0, 25).forEach((m) => {
+      lines.push(`• @${m.handle} — ${m.client} (${dateKeyOf(m.date) || m.date})${m.price ? ` $${m.price}` : ""}`);
+    });
+    if (res.missing.length > 25) lines.push(`…and ${res.missing.length - 25} more (see logs)`);
+    console.log(`[adHandler] /auditmissing full list:`, JSON.stringify(res.missing));
+  } else {
+    lines.push(``, `✅ Every forwarded ad has a row in its page sheet.`);
+  }
+  await editStatus(lines.join("\n"));
+  return res;
+}
+
+/**
+ * /audit — full sweep: runs all four sheet audits + the DB↔sheet
+ * reconciliation, each posting its own report. Heavy (reads every sheet
+ * several times) — for a quick single check, run the specific command.
+ */
+async function handleAuditCommand(ctx) {
+  const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+  if (adminId && ctx.from?.id !== adminId) return;
+
+  await ctx.reply(
+    "🔎 *Full audit* — running all checks. This reads every sheet a few times, so give it a minute.\n" +
+    "_(For a quick single check: /auditdupes, /auditcols, /auditdates, /auditnif, /auditmissing)_",
+    { parse_mode: "Markdown" },
+  ).catch(() => {});
+
+  // Sequential so the Sheets rate-limiter isn't slammed and reports arrive in order.
+  await handleAuditDupesCommand(ctx).catch((e) => console.error(`[adHandler] /audit dupes: ${e.message}`));
+  await handleAuditColsCommand(ctx).catch((e) => console.error(`[adHandler] /audit cols: ${e.message}`));
+  await handleAuditDatesCommand(ctx).catch((e) => console.error(`[adHandler] /audit dates: ${e.message}`));
+  await handleAuditNifCommand(ctx).catch((e) => console.error(`[adHandler] /audit nif: ${e.message}`));
+  await handleAuditMissingCommand(ctx).catch((e) => console.error(`[adHandler] /audit missing: ${e.message}`));
+
+  await ctx.reply("✅ Full audit complete.").catch(() => {});
+}
+
+/**
  * /auditnif — read-only audit. Scans every enabled per-page sheet's Post
  * Duration column (F) for cells containing "NIF" (legacy rows where the old
  * parser dumped a NIF into the duration column). Reports counts + the
@@ -2582,6 +2718,19 @@ async function handleAdMessage(ctx) {
     // every per-page sheet (future-year typos like "2/26/27", ancient dates).
     if (text && /^\/auditdates\b/i.test(text.trim())) {
       return await handleAuditDatesCommand(ctx);
+    }
+
+    // /auditmissing — reconcile DB vs sheets: ads that forwarded successfully
+    // but whose per-page sheet row can't be found in the actual sheet (the
+    // genuine "sent but never sheeted" cases). Read-only.
+    if (text && /^\/auditmissing\b/i.test(text.trim())) {
+      return await handleAuditMissingCommand(ctx);
+    }
+
+    // /audit — run all sheet audits + the DB↔sheet reconciliation in one sweep.
+    // (\b after "audit" means this never matches /auditdupes, /auditmissing, …)
+    if (text && /^\/audit\b/i.test(text.trim())) {
+      return await handleAuditCommand(ctx);
     }
 
     const chatId = String(ctx.chat?.id);

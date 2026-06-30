@@ -663,6 +663,45 @@ async function getHeaderRow(spreadsheetId, tabName) {
 }
 
 /**
+ * Read a per-page sheet and return a Set of "client|m/d/yy" keys — one per
+ * non-empty (Client, Date) row. Read-only. Used by the /audit reconciliation
+ * to confirm whether a forwarded-but-untracked ad actually has a row in its
+ * page sheet, rather than trusting the (often-NULL) page_sheet_row in the DB.
+ *
+ * Per-page columns: A=Client, D=Date. Date is parsed loosely (m/d/yy out of
+ * any "Wed, 6/3/26"-style string) so it matches ad_briefs.date_posted.
+ */
+async function getClientDateKeys(spreadsheetId, tabName) {
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = getThrottledSheets(client);
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId, range: `${tabName}!A:D`,
+  });
+  const rows = resp.data.values || [];
+  const keys = new Set();
+  for (const r of rows) {
+    const clientCell = (r?.[0] || "").trim().toLowerCase();
+    const m = String(r?.[3] || "").match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+    if (!clientCell || !m) continue;
+    let y = +m[3]; if (y < 100) y += 2000;
+    keys.add(`${clientCell}|${+m[1]}/${+m[2]}/${String(y).slice(-2)}`);
+  }
+  return keys;
+}
+
+/**
+ * Normalize a date string ("Wed, 6/3/26", "6/3/2026", …) to the m/d/yy key
+ * used by getClientDateKeys. Returns null if no date found.
+ */
+function dateKeyOf(s) {
+  const m = String(s || "").match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+  if (!m) return null;
+  let y = +m[3]; if (y < 100) y += 2000;
+  return `${+m[1]}/${+m[2]}/${String(y).slice(-2)}`;
+}
+
+/**
  * Scan a single column for cells whose value matches a regex. Read-only.
  * Returns [{ row, value }] (1-indexed rows). Used by the NIF-in-Duration
  * audit to surface legacy rows where the old parser dumped a NIF into the
@@ -1580,7 +1619,7 @@ module.exports = {
   appendRow, markForwarded, markForwardedBatch, repinDateByClient,
   getColumnDropdownOptions, snapToDropdown, fixDropdownColumn,
   applyCenterAlignmentBatch, applyColumnCenterAlignment,
-  getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates,
+  getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, getClientDateKeys, dateKeyOf,
   updateStatusToLive, updateAdPrice, updateAdClient, updateAdDate, deleteAdRows, deleteRowsByNumber,
   appendReminder, appendRemindersBatch, getPendingReminders, markReminderSent,
 };
