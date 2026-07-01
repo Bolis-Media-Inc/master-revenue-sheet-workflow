@@ -2001,7 +2001,11 @@ async function handleRevenueCommand(ctx) {
   const paid = inMonth.filter((r) => r.price > 0).length;
 
   // Optional: sum every page P/L for the month and cross-check vs master.
-  let pageSum = null, pagesRead = 0, pagesFailed = 0, pageRows = 0;
+  // Split AD-revenue rows (comparable to the master ad-overview total) from
+  // non-ad rows the page P/Ls carry but the ad tab doesn't — clipping, CPM,
+  // IG/FB bonus payouts, designer fees, splits (often added retroactively).
+  const NONAD = /\b(clip|clipping|cpm|bonus|payout|invideo|in-video|designer|split|kick)\b/i;
+  let pageSum = null, pageOther = 0, otherRows = 0, pagesRead = 0, pagesFailed = 0, pageRows = 0;
   if (wantPages) {
     const allPages = (pagesRegistry.listAllSync ? pagesRegistry.listAllSync() : [])
       .filter((p) => p.sheet_id && !PLACEHOLDER_PATTERN.test(p.sheet_id));
@@ -2010,7 +2014,9 @@ async function handleRevenueCommand(ctx) {
     for (const pg of allPages) {
       try {
         for (const r of await readPagePlacements(pg.sheet_id, PAGE_TAB_NAME)) {
-          if (r.mo === mo && r.yr === yr) { pageSum += r.price; pageRows++; }
+          if (r.mo !== mo || r.yr !== yr) continue;
+          if (NONAD.test(r.client)) { pageOther += r.price; otherRows++; }
+          else { pageSum += r.price; pageRows++; }
         }
         pagesRead++;
       } catch (err) { pagesFailed++; console.error(`[revenue] P/L @${pg.handle}: ${err.message}`); }
@@ -2057,12 +2063,14 @@ async function handleRevenueCommand(ctx) {
     lines.push(
       ``,
       `*Page-P/L cross-check* (${pagesRead} sheets${pagesFailed ? `, ${pagesFailed} unreadable` : ""}):`,
-      `Master: *${money(total)}*`,
-      `Σ Page P/Ls: *${money(pageSum)}* (${pageRows} rows)`,
-      `Δ *${delta >= 0 ? "+" : "−"}${money(Math.abs(delta))}*`,
+      `Master ad revenue: *${money(total)}*`,
+      `Σ Page P/Ls (ads only): *${money(pageSum)}* (${pageRows} rows)`,
+      `Δ vs master: *${delta >= 0 ? "+" : "−"}${money(Math.abs(delta))}*`,
       Math.abs(delta) < 1
-        ? `✅ Master and page P/Ls tie out exactly.`
-        : `_Δ = rows in one but not the other (page-P/L-only manual entries like bonuses/designer fees inflate the page side; deleted-in-master-only rows inflate it too). Run /reconcile to itemize._`,
+        ? `✅ Ad revenue ties out master ↔ page P/Ls.`
+        : `_Δ = ad rows in one but not the other. Run /reconcile to itemize._`,
+      ``,
+      `_Excluded from the tie-out (page-P/L-only, not ad revenue): clipping / bonus / payout / designer =_ *${money(pageOther)}* _(${otherRows} rows). These live on the page P/Ls (often retroactive) and in the master's own clipping/bonus tabs, not the ad overview._`,
     );
   }
   if (statusMsg) {
