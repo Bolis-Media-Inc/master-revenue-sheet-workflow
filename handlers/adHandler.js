@@ -2004,8 +2004,18 @@ async function handleRevenueCommand(ctx) {
   // Split AD-revenue rows (comparable to the master ad-overview total) from
   // non-ad rows the page P/Ls carry but the ad tab doesn't — clipping, CPM,
   // IG/FB bonus payouts, designer fees, splits (often added retroactively).
-  const NONAD = /\b(clip|clipping|cpm|bonus|payout|invideo|in-video|designer|split|kick)\b/i;
+  const NONAD = /\b(clip|clipping|cpm|bonus|payout|invideo|in-video|designer|design|split|kick)\b/i;
+  const catOf = (c) => {
+    const s = c.toLowerCase();
+    if (/clip|cpm|invideo|in-video/.test(s)) return "Clipping / CPM";
+    if (/bonus|payout/.test(s))             return "Bonus / Payout";
+    if (/design/.test(s))                   return "Designer";
+    if (/split|kick/.test(s))               return "Splits";
+    return "Other";
+  };
   let pageSum = null, pageOther = 0, otherRows = 0, pagesRead = 0, pagesFailed = 0, pageRows = 0;
+  const otherByCat = new Map();    // category → { sum, rows }
+  const otherByLabel = new Map();  // exact client label → { display, sum, rows }
   if (wantPages) {
     const allPages = (pagesRegistry.listAllSync ? pagesRegistry.listAllSync() : [])
       .filter((p) => p.sheet_id && !PLACEHOLDER_PATTERN.test(p.sheet_id));
@@ -2015,8 +2025,13 @@ async function handleRevenueCommand(ctx) {
       try {
         for (const r of await readPagePlacements(pg.sheet_id, PAGE_TAB_NAME)) {
           if (r.mo !== mo || r.yr !== yr) continue;
-          if (NONAD.test(r.client)) { pageOther += r.price; otherRows++; }
-          else { pageSum += r.price; pageRows++; }
+          if (NONAD.test(r.client)) {
+            pageOther += r.price; otherRows++;
+            const c = catOf(r.client);
+            const cc = otherByCat.get(c) || { sum: 0, rows: 0 }; cc.sum += r.price; cc.rows++; otherByCat.set(c, cc);
+            const lk = r.client.trim().toLowerCase();
+            const lc = otherByLabel.get(lk) || { display: r.client.trim(), sum: 0, rows: 0 }; lc.sum += r.price; lc.rows++; otherByLabel.set(lk, lc);
+          } else { pageSum += r.price; pageRows++; }
         }
         pagesRead++;
       } catch (err) { pagesFailed++; console.error(`[revenue] P/L @${pg.handle}: ${err.message}`); }
@@ -2069,9 +2084,23 @@ async function handleRevenueCommand(ctx) {
       Math.abs(delta) < 1
         ? `✅ Ad revenue ties out master ↔ page P/Ls.`
         : `_Δ = ad rows in one but not the other. Run /reconcile to itemize._`,
-      ``,
-      `_Excluded from the tie-out (page-P/L-only, not ad revenue): clipping / bonus / payout / designer =_ *${money(pageOther)}* _(${otherRows} rows). These live on the page P/Ls (often retroactive) and in the master's own clipping/bonus tabs, not the ad overview._`,
     );
+    // Categorize the excluded (page-P/L-only, non-ad) bucket instead of a lump sum.
+    lines.push(``, `*Page-P/L-only (not ad revenue): ${money(pageOther)} · ${otherRows} rows*`);
+    const catsSorted = [...otherByCat.entries()].sort((a, b) => b[1].sum - a[1].sum);
+    for (const [c, v] of catsSorted) lines.push(`   • ${c}: ${money(v.sum)} (${v.rows})`);
+    // Always fully surface anything that fell into "Other" — that's where a
+    // mislabeled clipping/bonus row (or a miscategorized ad) would hide.
+    const otherLabels = [...otherByLabel.values()]
+      .filter((l) => catOf(l.display) === "Other")
+      .sort((a, b) => b.sum - a.sum);
+    if (otherLabels.length) {
+      lines.push(`   _"Other" breakdown (verify these):_`);
+      otherLabels.slice(0, 15).forEach((l) => lines.push(`      – ${l.display}: ${money(l.sum)} (${l.rows})`));
+      if (otherLabels.length > 15) lines.push(`      …+${otherLabels.length - 15} more (see logs)`);
+      console.log(`[revenue] page-only "Other" labels:`, JSON.stringify(otherLabels));
+    }
+    lines.push(`_(These sit on page P/Ls — often retroactive — and in the master's clipping/bonus tabs, not the ad overview.)_`);
   }
   if (statusMsg) {
     await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, lines.join("\n"), { parse_mode: "Markdown" }).catch(async () => {
