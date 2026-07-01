@@ -2152,7 +2152,15 @@ async function handleReconcileCommand(ctx) {
   const scannedBack = Number.isFinite(oldestSec) ? new Date(oldestSec * 1000).toISOString().slice(0, 10) : "?";
   lines.push(`_Scanned ${window.length} msgs back to ${scannedBack}. 3-way: chat / master / page P&L._`, ``);
 
-  let mismatchPages = 0, totalFlags = 0;
+  // Only two things actually need a human:
+  //   🟥 real miss   — in the chat, in NEITHER sheet (chat≥1, master 0, P/L 0)
+  //   🟧 sheets disagree — master ≠ P/L (internal inconsistency)
+  // Everything else where master == P/L is chat-side noise (a re-post inflating
+  // chat, or a chat-parse date landing outside the month) — the books are
+  // internally consistent, so we suppress those with a count instead of listing
+  // ~100 lines. `chat 0 · master 0` rows are manual P/L-only bookkeeping
+  // (bonuses, designer fees, Undistributed Funds) — not ads, skipped.
+  let mismatchPages = 0, totalFlags = 0, suppressed = 0, manualSkipped = 0;
   for (const page of targetPages.sort()) {
     const hasSheet = !noSheet.has(page);
     const clientKeys = new Set([...(chat.get(page)?.keys() || []), ...(master.get(page)?.keys() || []), ...(pl.get(page)?.keys() || [])]);
@@ -2160,17 +2168,21 @@ async function handleReconcileCommand(ctx) {
     for (const ck of clientKeys) {
       const c = cnt(chat, page, ck), ms = cnt(master, page, ck), p = cnt(pl, page, ck);
       const disp = chat.get(page)?.get(ck)?.client || master.get(page)?.get(ck)?.client || pl.get(page)?.get(ck)?.client || ck;
-      const bad = hasSheet ? !(c === ms && ms === p) : (c !== ms);
-      if (bad) flags.push(`   • ${disp}: chat ${c} · master ${ms} · P/L ${hasSheet ? p : "—"}`);
+      if (c === 0 && ms === 0) { manualSkipped++; continue; }                    // manual P/L-only bookkeeping
+      const realMiss      = c >= 1 && ms === 0 && (!hasSheet || p === 0);         // in chat, in neither sheet
+      const sheetDisagree = hasSheet && ms !== p;                                 // the two sheets disagree
+      if (realMiss)           flags.push(`   🟥 ${disp}: chat ${c} · master ${ms} · P/L ${hasSheet ? p : "—"} — MISSING`);
+      else if (sheetDisagree) flags.push(`   🟧 ${disp}: chat ${c} · master ${ms} · P/L ${p} — sheets disagree`);
+      else                    suppressed++;                                        // master==P/L, chat differs → re-post/date; books consistent
     }
     if (flags.length) {
       mismatchPages++; totalFlags += flags.length;
       lines.push(`*@${page}*${hasSheet ? "" : " _(P/L unreadable)_"}`, ...flags);
     }
   }
-  if (totalFlags === 0) lines.push(`✅ Chat, master, and page P/Ls all agree across ${targetPages.length} page(s).`);
-  else lines.push(``, `⚠️ ${totalFlags} mismatch(es) across ${mismatchPages} page(s). Read-only — decide + fix manually.`,
-    `_chat 1·master 0·P/L 0 = real miss · chat 0·master 1·P/L 1 = date quirk (sheets agree) · chat 2·master 1·P/L 1 = re-post (don't replay)._`);
+  if (totalFlags === 0) lines.push(`✅ No real misses or sheet disagreements across ${targetPages.length} flagged page(s).`);
+  else lines.push(``, `⚠️ *${totalFlags}* to review across ${mismatchPages} page(s) — 🟥 real miss (recover) · 🟧 sheets disagree (reconcile).`);
+  lines.push(`_Hid ${suppressed} chat-side line(s) where master = P/L (re-posts / date quirks — books consistent)${manualSkipped ? ` + ${manualSkipped} manual P/L-only entr${manualSkipped === 1 ? "y" : "ies"}` : ""}._`);
 
   // Telegram messages cap ~4096 chars; chunk if needed.
   const full = lines.join("\n");
