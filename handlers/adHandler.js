@@ -12,7 +12,7 @@
  */
 
 const { parseAdMessage }       = require("../parser");
-const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, repinDateByClient, fixDropdownColumn, getColumnDropdownOptions, snapToDropdown, getClientDateKeys, dateKeyOf } = require("../sheets");
+const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, repinDateByClient, fixDropdownColumn, getColumnDropdownOptions, snapToDropdown, getClientDateKeys, dateKeyOf, readMasterPlacements } = require("../sheets");
 const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages, getStandardBundle, getBlockStructure, getBriefBlockForAI } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
@@ -1916,6 +1916,89 @@ async function handleSortSheetsCommand(ctx) {
   else await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
 }
 
+const _MONTHS = { jan:1, feb:2, mar:3, apr:4, may:5, jun:6, jul:7, aug:8, sep:9, oct:10, nov:11, dec:12,
+  january:1, february:2, march:3, april:4, june:6, july:7, august:8, september:9, october:10, november:11, december:12 };
+const _MONTH_NAMES = ["", "January","February","March","April","May","June","July","August","September","October","November","December"];
+
+/**
+ * /revenue <month> [year] — total the master sheet's Price column (H) for a
+ * given month. Works for ANY month present in the sheet, including months
+ * before DB tracking existed (e.g. May). Read-only. Reports total + top
+ * clients. Defaults to the current-ish year (2026) if none given.
+ */
+async function handleRevenueCommand(ctx) {
+  const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+  if (adminId && ctx.from?.id !== adminId) return;
+
+  const arg = (ctx.message?.text || "").replace(/^\/revenue(?:@\w+)?\s*/i, "").trim().toLowerCase();
+  const monthTok = arg.match(/[a-z]+|\d{1,2}/)?.[0];
+  const yearTok  = arg.match(/\b(20\d{2}|\d{2})\b(?!\/)/g)?.slice(-1)[0];
+  let mo = null;
+  if (monthTok) mo = /^\d+$/.test(monthTok) ? parseInt(monthTok, 10) : _MONTHS[monthTok];
+  if (!mo || mo < 1 || mo > 12) {
+    await ctx.reply("Usage: `/revenue <month> [year]`  — e.g. `/revenue may` or `/revenue 5 2026`", { parse_mode: "Markdown" }).catch(() => {});
+    return;
+  }
+  let yr = 2026;
+  if (yearTok) { yr = parseInt(yearTok, 10); if (yr < 100) yr += 2000; }
+
+  if (!MASTER_SHEET_ID || PLACEHOLDER_PATTERN.test(MASTER_SHEET_ID)) {
+    await ctx.reply("⚠️ MASTER_SHEET_ID not configured.").catch(() => {});
+    return;
+  }
+
+  const statusMsg = await ctx.reply(`⏳ Totaling ${_MONTH_NAMES[mo]} ${yr} from the master sheet…`).catch(() => null);
+  let rows;
+  try {
+    rows = await readMasterPlacements(MASTER_SHEET_ID, TAB_NAME);
+  } catch (err) {
+    console.error(`[adHandler] /revenue read error: ${err.message}`);
+    if (statusMsg) await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, `⚠️ Could not read master sheet: ${err.message}`).catch(() => {});
+    return;
+  }
+
+  const inMonth = rows.filter((r) => r.mo === mo && r.yr === yr);
+  const total = inMonth.reduce((s, r) => s + r.price, 0);
+  const paid = inMonth.filter((r) => r.price > 0).length;
+
+  // Top clients (rolled up by leading brand token for readability).
+  const fam = (c) => {
+    const s = c.toLowerCase();
+    if (s.startsWith("stake")) return "Stake";
+    if (s.startsWith("algo agency")) return "Algo Agency";
+    if (s.startsWith("karam")) return "Karam (music)";
+    if (s.startsWith("ytk media")) return "YTK Media";
+    if (s.startsWith("phil heave")) return "Phil Heave";
+    if (s.includes("get engaged")) return "Get Engaged";
+    if (s.startsWith("10k projects") || s.startsWith("10k projects")) return "10k Projects";
+    if (s.startsWith("wve")) return "WVE";
+    if (s.startsWith("umg")) return "UMG";
+    if (s.startsWith("spencer")) return "Spencer";
+    return c;
+  };
+  const byFam = new Map();
+  for (const r of inMonth) byFam.set(fam(r.client), (byFam.get(fam(r.client)) || 0) + r.price);
+  const top = [...byFam.entries()].filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]).slice(0, 12);
+
+  const money = (n) => "$" + Math.round(n).toLocaleString("en-US");
+  const lines = [
+    `💰 *${_MONTH_NAMES[mo]} ${yr} revenue* (master sheet)`,
+    ``,
+    `Total: *${money(total)}*`,
+    `Placements: ${inMonth.length} (${paid} paid)`,
+    ``,
+    `*Top clients:*`,
+    ...top.map(([c, v], i) => `${i + 1}. ${c} — ${money(v)}`),
+  ];
+  if (statusMsg) {
+    await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, lines.join("\n"), { parse_mode: "Markdown" }).catch(async () => {
+      await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, lines.join("\n").replace(/[*_`]/g, "")).catch(() => {});
+    });
+  } else {
+    await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" }).catch(() => {});
+  }
+}
+
 /**
  * Reconcile DB ↔ per-page sheets. Finds ads that forwarded successfully but
  * have no tracked page_sheet_row, then VERIFIES each against the actual sheet
@@ -2731,6 +2814,12 @@ async function handleAdMessage(ctx) {
     // (\b after "audit" means this never matches /auditdupes, /auditmissing, …)
     if (text && /^\/audit\b/i.test(text.trim())) {
       return await handleAuditCommand(ctx);
+    }
+
+    // /revenue <month> [year] — total the master sheet's price column for a
+    // month (works for any month, incl. pre-DB ones like May). Read-only.
+    if (text && /^\/revenue\b/i.test(text.trim())) {
+      return await handleRevenueCommand(ctx);
     }
 
     const chatId = String(ctx.chat?.id);

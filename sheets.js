@@ -691,6 +691,37 @@ async function getClientDateKeys(spreadsheetId, tabName) {
 }
 
 /**
+ * Read every placement row from the master sheet and return parsed rows
+ * { client, page, mo, day, yr, price } for revenue reporting. Read-only.
+ * Master columns: B=Client, D=Date, F=Page, H=Price ($-prefixed). Rows without
+ * a client, a parseable date, or a numeric price are skipped, as is the pinned
+ * "Undistributed Funds Allocation" line.
+ */
+async function readMasterPlacements(spreadsheetId, tabName) {
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = getThrottledSheets(client);
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId, range: `${tabName}!A:K`,
+  });
+  const rows = resp.data.values || [];
+  const out = [];
+  for (const r of rows) {
+    const clientCell = (r?.[1] || "").trim();          // B
+    if (!clientCell || /undistributed/i.test(clientCell)) continue;
+    const m = String(r?.[3] || "").match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/); // D
+    if (!m) continue;
+    const priceRaw = String(r?.[7] || "").replace(/[$,\s]/g, "");            // H
+    if (priceRaw === "") continue;
+    const price = parseFloat(priceRaw);
+    if (!Number.isFinite(price)) continue;
+    let yr = +m[3]; if (yr < 100) yr += 2000;
+    out.push({ client: clientCell, page: (r?.[5] || "").trim(), mo: +m[1], day: +m[2], yr, price });
+  }
+  return out;
+}
+
+/**
  * Normalize a date string ("Wed, 6/3/26", "6/3/2026", …) to the m/d/yy key
  * used by getClientDateKeys. Returns null if no date found.
  */
@@ -1619,7 +1650,7 @@ module.exports = {
   appendRow, markForwarded, markForwardedBatch, repinDateByClient,
   getColumnDropdownOptions, snapToDropdown, fixDropdownColumn,
   applyCenterAlignmentBatch, applyColumnCenterAlignment,
-  getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, getClientDateKeys, dateKeyOf,
+  getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, getClientDateKeys, dateKeyOf, readMasterPlacements,
   updateStatusToLive, updateAdPrice, updateAdClient, updateAdDate, deleteAdRows, deleteRowsByNumber,
   appendReminder, appendRemindersBatch, getPendingReminders, markReminderSent,
 };
