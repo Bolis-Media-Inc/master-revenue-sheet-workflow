@@ -12,7 +12,7 @@
  */
 
 const { parseAdMessage }       = require("../parser");
-const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, repinDateByClient, fixDropdownColumn, getColumnDropdownOptions, snapToDropdown, getClientDateKeys, dateKeyOf, readMasterPlacements } = require("../sheets");
+const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, repinDateByClient, fixDropdownColumn, getColumnDropdownOptions, snapToDropdown, getClientDateKeys, dateKeyOf, readMasterPlacements, readPagePlacements } = require("../sheets");
 const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages, getStandardBundle, getBlockStructure, getBriefBlockForAI } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
@@ -2000,6 +2000,141 @@ async function handleRevenueCommand(ctx) {
 }
 
 /**
+ * /reconcile <month> [year] [@page …] — GROUND-TRUTH reconciliation. The
+ * Internal Network Ads chat (what's actually live in there) is the source of
+ * truth. For each (client × page) placement live in the chat, compare the count
+ * against the master sheet — and, when specific @pages are given, against each
+ * page's own P/L too. READ-ONLY: reports mismatches, changes nothing.
+ *
+ *   • With @pages → full three-way (chat vs master vs page P/L) for those pages.
+ *   • Without    → chat vs master across every page (cheaper; no per-page reads).
+ *
+ * Mismatch types surfaced:
+ *   chat > sheet  → sent in chat, missing from the sheet (untracked / lost)
+ *   sheet > chat  → in the sheet but not live in the chat (phantom / manual dup)
+ */
+async function handleReconcileCommand(ctx) {
+  const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+  if (adminId && ctx.from?.id !== adminId) return;
+
+  const arg = (ctx.message?.text || "").replace(/^\/reconcile(?:@\w+)?\s*/i, "").trim();
+  const monthTok = arg.toLowerCase().match(/\b([a-z]+|\d{1,2})\b/)?.[1];
+  const yearTok  = arg.match(/\b(20\d{2})\b/)?.[1];
+  let mo = null;
+  if (monthTok) mo = /^\d+$/.test(monthTok) ? parseInt(monthTok, 10) : _MONTHS[monthTok];
+  if (!mo || mo < 1 || mo > 12) {
+    await ctx.reply("Usage: `/reconcile <month> [year] [@page …]` — e.g. `/reconcile june @goal`", { parse_mode: "Markdown" }).catch(() => {});
+    return;
+  }
+  const yr = yearTok ? parseInt(yearTok, 10) : 2026;
+  const wantPages = (arg.match(/@([\w.]+)/g) || []).map((h) => (pagesRegistry.resolveHandle(h.slice(1)) || h.slice(1)).toLowerCase());
+
+  const SOURCE = ((process.env.TARGET_CHAT_ID || "").split(",")[0].trim()) || "-1001868750472";
+  const monthStartMs = Date.UTC(yr, mo - 1, 1) - 2 * 86400000; // small back-buffer
+  const norm = (s) => (s || "").trim().toLowerCase();
+  const inMonth = (dk, msgDateSec) => {
+    if (dk) { const m = dk.match(/(\d+)\/(\d+)\/(\d+)/); return m && +m[1] === mo && 2000 + (+m[3]) === yr; }
+    const d = new Date((msgDateSec || 0) * 1000); return d.getMonth() + 1 === mo && d.getFullYear() === yr;
+  };
+
+  const statusMsg = await ctx.reply(`⏳ Reading Internal Network Ads history for ${_MONTH_NAMES[mo]} ${yr} (ground truth)…`).catch(() => null);
+  const edit = async (t) => { if (statusMsg) await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, t, { parse_mode: "Markdown" }).catch(() => {}); };
+
+  // ── 1. Ground truth from the chat ────────────────────────────────────────
+  let window;
+  try {
+    const userClient = require("../userClient");
+    window = await userClient.getHistoryWindow(Number(SOURCE), monthStartMs, 8000);
+  } catch (err) {
+    await edit(`❌ Couldn't read chat history: ${err.message}`);
+    return;
+  }
+  const { parseAdMessage } = require("../parser");
+  const chat = new Map();     // page → Map(clientKey → {client, n})
+  const bump = (map, page, client) => {
+    if (!map.has(page)) map.set(page, new Map());
+    const cm = map.get(page), k = norm(client);
+    cm.set(k, { client, n: (cm.get(k)?.n || 0) + 1 });
+  };
+  let oldestSec = Infinity;
+  for (const m of window) {
+    if ((m.date || 0) < oldestSec) oldestSec = m.date || oldestSec;
+    if (!m.text || m.kind) continue;
+    if (/^\/[a-z]/i.test(m.text.trim())) continue; // skip bot commands
+    let parsed; try { parsed = parseAdMessage(m.text, new Date((m.date || 0) * 1000)); } catch { parsed = null; }
+    if (!parsed) continue;
+    for (const it of (Array.isArray(parsed) ? parsed : [parsed])) {
+      if (!it.client || !it.pageHandle) continue;
+      if (!inMonth(it.datePosted && dateKeyOf(it.datePosted), m.date)) continue;
+      bump(chat, norm(pagesRegistry.resolveHandle(it.pageHandle) || it.pageHandle), it.client);
+    }
+  }
+
+  // ── 2. Master sheet counts ───────────────────────────────────────────────
+  await edit(`📄 Parsed the chat. Reading the master sheet…`);
+  const master = new Map();
+  try {
+    for (const r of await readMasterPlacements(MASTER_SHEET_ID, TAB_NAME)) {
+      if (r.mo !== mo || r.yr !== yr) continue;
+      bump(master, norm((r.page || "").replace(/^@/, "")), r.client);
+    }
+  } catch (err) { await edit(`❌ Couldn't read master sheet: ${err.message}`); return; }
+
+  const pageList = wantPages.length ? wantPages : [...new Set([...chat.keys(), ...master.keys()])];
+
+  // ── 3. Per-page P/L counts (only when @pages given) ──────────────────────
+  const pl = new Map();
+  if (wantPages.length) {
+    await edit(`📄 Reading ${wantPages.length} page P/L sheet(s)…`);
+    for (const page of wantPages) {
+      const sid = pagesRegistry.getSheetId(pagesRegistry.resolveHandle(page) || page);
+      if (!sid || PLACEHOLDER_PATTERN.test(sid)) continue;
+      try {
+        for (const r of await readPagePlacements(sid, PAGE_TAB_NAME)) {
+          if (r.mo !== mo || r.yr !== yr) continue;
+          bump(pl, page, r.client);
+        }
+      } catch (err) { console.error(`[reconcile] P/L read @${page}: ${err.message}`); }
+    }
+  }
+
+  // ── 4. Diff + report ─────────────────────────────────────────────────────
+  const cnt = (map, page, ck) => map.get(page)?.get(ck)?.n || 0;
+  const lines = [`🔎 *Reconcile — ${_MONTH_NAMES[mo]} ${yr}* (chat = truth)`];
+  const scannedBack = Number.isFinite(oldestSec) ? new Date(oldestSec * 1000).toISOString().slice(0, 10) : "?";
+  lines.push(`_Scanned ${window.length} msgs back to ${scannedBack}. ${wantPages.length ? "3-way (chat/master/P&L)" : "chat vs master"}._`, ``);
+
+  let mismatchPages = 0, totalFlags = 0;
+  for (const page of pageList.sort()) {
+    const clientKeys = new Set([...(chat.get(page)?.keys() || []), ...(master.get(page)?.keys() || []), ...(pl.get(page)?.keys() || [])]);
+    const flags = [];
+    for (const ck of clientKeys) {
+      const c = cnt(chat, page, ck), ms = cnt(master, page, ck), p = cnt(pl, page, ck);
+      const disp = chat.get(page)?.get(ck)?.client || master.get(page)?.get(ck)?.client || pl.get(page)?.get(ck)?.client || ck;
+      const bad = wantPages.length ? !(c === ms && ms === p) : (c !== ms);
+      if (bad) flags.push(`   • ${disp}: chat ${c} · master ${ms}${wantPages.length ? ` · P/L ${p}` : ""}`);
+    }
+    if (flags.length) {
+      mismatchPages++; totalFlags += flags.length;
+      lines.push(`*@${page}*`, ...flags);
+    }
+  }
+  if (totalFlags === 0) lines.push(`✅ Every client count matches across ${pageList.length} page(s).`);
+  else lines.push(``, `⚠️ ${totalFlags} mismatch(es) across ${mismatchPages} page(s). Read-only — decide + fix manually.`);
+
+  // Telegram messages cap ~4096 chars; chunk if needed.
+  const full = lines.join("\n");
+  if (full.length <= 3900) { await edit(full); }
+  else {
+    await edit(lines.slice(0, 1).concat(`_(${totalFlags} mismatches — sending in parts)_`).join("\n"));
+    let buf = [];
+    const flush = async () => { if (buf.length) { await ctx.reply(buf.join("\n"), { parse_mode: "Markdown" }).catch(() => {}); buf = []; } };
+    for (const ln of lines.slice(1)) { if (buf.join("\n").length + ln.length > 3900) await flush(); buf.push(ln); }
+    await flush();
+  }
+}
+
+/**
  * Reconcile DB ↔ per-page sheets. Finds ads that forwarded successfully but
  * have no tracked page_sheet_row, then VERIFIES each against the actual sheet
  * (by client + date) instead of trusting the NULL. Read-only.
@@ -2820,6 +2955,13 @@ async function handleAdMessage(ctx) {
     // month (works for any month, incl. pre-DB ones like May). Read-only.
     if (text && /^\/revenue\b/i.test(text.trim())) {
       return await handleRevenueCommand(ctx);
+    }
+
+    // /reconcile <month> [@page…] — GROUND-TRUTH three-way count check: for each
+    // (client × page) live in the Internal Network Ads chat, compare the count
+    // against the master sheet and that page's P/L. Read-only — reports only.
+    if (text && /^\/reconcile\b/i.test(text.trim())) {
+      return await handleReconcileCommand(ctx);
     }
 
     const chatId = String(ctx.chat?.id);

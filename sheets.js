@@ -722,6 +722,34 @@ async function readMasterPlacements(spreadsheetId, tabName) {
 }
 
 /**
+ * Read a per-page P/L sheet and return parsed placement rows
+ * { client, mo, day, yr, price }. Read-only. Per-page columns:
+ * A=Client, D=Date, G=Ad Price. Used by /reconcile to count how many times a
+ * client appears in a page's own sheet.
+ */
+async function readPagePlacements(spreadsheetId, tabName) {
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = getThrottledSheets(client);
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId, range: `${tabName}!A:H`,
+  });
+  const rows = resp.data.values || [];
+  const out = [];
+  for (const r of rows) {
+    const clientCell = (r?.[0] || "").trim();          // A
+    if (!clientCell || /^client\b/i.test(clientCell)) continue;
+    const m = String(r?.[3] || "").match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/); // D
+    if (!m) continue;
+    const priceRaw = String(r?.[6] || "").replace(/[$,\s]/g, "");            // G
+    const price = parseFloat(priceRaw);
+    let yr = +m[3]; if (yr < 100) yr += 2000;
+    out.push({ client: clientCell, mo: +m[1], day: +m[2], yr, price: Number.isFinite(price) ? price : 0 });
+  }
+  return out;
+}
+
+/**
  * Normalize a date string ("Wed, 6/3/26", "6/3/2026", …) to the m/d/yy key
  * used by getClientDateKeys. Returns null if no date found.
  */
@@ -1650,7 +1678,7 @@ module.exports = {
   appendRow, markForwarded, markForwardedBatch, repinDateByClient,
   getColumnDropdownOptions, snapToDropdown, fixDropdownColumn,
   applyCenterAlignmentBatch, applyColumnCenterAlignment,
-  getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, getClientDateKeys, dateKeyOf, readMasterPlacements,
+  getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, getClientDateKeys, dateKeyOf, readMasterPlacements, readPagePlacements,
   updateStatusToLive, updateAdPrice, updateAdClient, updateAdDate, deleteAdRows, deleteRowsByNumber,
   appendReminder, appendRemindersBatch, getPendingReminders, markReminderSent,
 };
