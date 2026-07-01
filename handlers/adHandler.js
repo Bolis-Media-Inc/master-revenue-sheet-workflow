@@ -2118,47 +2118,59 @@ async function handleReconcileCommand(ctx) {
     }
   } catch (err) { await edit(`❌ Couldn't read master sheet: ${err.message}`); return; }
 
-  const pageList = wantPages.length ? wantPages : [...new Set([...chat.keys(), ...master.keys()])];
+  // ── 3. Cross-reference every flagged page against its own P/L sheet ───────
+  // Find pages where chat ≠ master, then read the P/L for exactly those (plus
+  // any explicitly named) — cheap (only flagged pages, not all ~100) and gives a
+  // full three-way so each mismatch is diagnosable.
+  const cnt = (map, page, ck) => map.get(page)?.get(ck)?.n || 0;
+  const allPages = wantPages.length ? wantPages : [...new Set([...chat.keys(), ...master.keys()])];
+  const flaggedPages = allPages.filter((page) => {
+    const keys = new Set([...(chat.get(page)?.keys() || []), ...(master.get(page)?.keys() || [])]);
+    for (const ck of keys) if (cnt(chat, page, ck) !== cnt(master, page, ck)) return true;
+    return false;
+  });
+  const targetPages = wantPages.length ? wantPages : flaggedPages;
 
-  // ── 3. Per-page P/L counts (only when @pages given) ──────────────────────
   const pl = new Map();
-  if (wantPages.length) {
-    await edit(`📄 Reading ${wantPages.length} page P/L sheet(s)…`);
-    for (const page of wantPages) {
+  const noSheet = new Set();
+  if (targetPages.length) {
+    await edit(`📄 Cross-referencing ${targetPages.length} page P/L sheet(s)…`);
+    for (const page of targetPages) {
       const sid = pagesRegistry.getSheetId(pagesRegistry.resolveHandle(page) || page);
-      if (!sid || PLACEHOLDER_PATTERN.test(sid)) continue;
+      if (!sid || PLACEHOLDER_PATTERN.test(sid)) { noSheet.add(page); continue; }
       try {
         for (const r of await readPagePlacements(sid, PAGE_TAB_NAME)) {
           if (r.mo !== mo || r.yr !== yr) continue;
           bump(pl, page, r.client);
         }
-      } catch (err) { console.error(`[reconcile] P/L read @${page}: ${err.message}`); }
+      } catch (err) { noSheet.add(page); console.error(`[reconcile] P/L read @${page}: ${err.message}`); }
     }
   }
 
-  // ── 4. Diff + report ─────────────────────────────────────────────────────
-  const cnt = (map, page, ck) => map.get(page)?.get(ck)?.n || 0;
+  // ── 4. Report — three-way per flagged (client, page) ─────────────────────
   const lines = [`🔎 *Reconcile — ${_MONTH_NAMES[mo]} ${yr}* (chat = truth)`];
   const scannedBack = Number.isFinite(oldestSec) ? new Date(oldestSec * 1000).toISOString().slice(0, 10) : "?";
-  lines.push(`_Scanned ${window.length} msgs back to ${scannedBack}. ${wantPages.length ? "3-way (chat/master/P&L)" : "chat vs master"}._`, ``);
+  lines.push(`_Scanned ${window.length} msgs back to ${scannedBack}. 3-way: chat / master / page P&L._`, ``);
 
   let mismatchPages = 0, totalFlags = 0;
-  for (const page of pageList.sort()) {
+  for (const page of targetPages.sort()) {
+    const hasSheet = !noSheet.has(page);
     const clientKeys = new Set([...(chat.get(page)?.keys() || []), ...(master.get(page)?.keys() || []), ...(pl.get(page)?.keys() || [])]);
     const flags = [];
     for (const ck of clientKeys) {
       const c = cnt(chat, page, ck), ms = cnt(master, page, ck), p = cnt(pl, page, ck);
       const disp = chat.get(page)?.get(ck)?.client || master.get(page)?.get(ck)?.client || pl.get(page)?.get(ck)?.client || ck;
-      const bad = wantPages.length ? !(c === ms && ms === p) : (c !== ms);
-      if (bad) flags.push(`   • ${disp}: chat ${c} · master ${ms}${wantPages.length ? ` · P/L ${p}` : ""}`);
+      const bad = hasSheet ? !(c === ms && ms === p) : (c !== ms);
+      if (bad) flags.push(`   • ${disp}: chat ${c} · master ${ms} · P/L ${hasSheet ? p : "—"}`);
     }
     if (flags.length) {
       mismatchPages++; totalFlags += flags.length;
-      lines.push(`*@${page}*`, ...flags);
+      lines.push(`*@${page}*${hasSheet ? "" : " _(P/L unreadable)_"}`, ...flags);
     }
   }
-  if (totalFlags === 0) lines.push(`✅ Every client count matches across ${pageList.length} page(s).`);
-  else lines.push(``, `⚠️ ${totalFlags} mismatch(es) across ${mismatchPages} page(s). Read-only — decide + fix manually.`);
+  if (totalFlags === 0) lines.push(`✅ Chat, master, and page P/Ls all agree across ${targetPages.length} page(s).`);
+  else lines.push(``, `⚠️ ${totalFlags} mismatch(es) across ${mismatchPages} page(s). Read-only — decide + fix manually.`,
+    `_chat 1·master 0·P/L 0 = real miss · chat 0·master 1·P/L 1 = date quirk (sheets agree) · chat 2·master 1·P/L 1 = re-post (don't replay)._`);
 
   // Telegram messages cap ~4096 chars; chunk if needed.
   const full = lines.join("\n");
