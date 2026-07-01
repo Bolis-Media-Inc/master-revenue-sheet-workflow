@@ -749,7 +749,45 @@ async function handleReplayCommand(ctx) {
       b = data?.[0] || null;
     }
     if (!b) {
-      await ctx.reply(`❌ No brief in the books with message id ${mid}.`).catch(() => {});
+      // Never-ingested brief — no DB row to replay from (dropped Telegram
+      // update; the bot never saw the message). Recover it straight from chat
+      // history the same way /catchup's Forward button does: re-read + re-inject
+      // the block, then run the normal forward pipeline. Works for ANY age
+      // (unlike /catchup's 72h window). No dup risk — we just confirmed there's
+      // no existing record.
+      const DEFAULT_SOURCE = ((process.env.TARGET_CHAT_ID || "").split(",")[0].trim()) || "-1001868750472";
+      let recoverChat = DEFAULT_SOURCE;
+      if (link) { const c = link[0].match(/c\/(\d+)\//i); if (c) recoverChat = "-100" + c[1]; }
+      await ctx.reply(`🔎 Not in the books — recovering brief ${mid} from chat history…`).catch(() => {});
+      let briefMsg;
+      try {
+        const { reinjectBriefWindow } = require("./catchupHandler");
+        briefMsg = await reinjectBriefWindow(Number(recoverChat), mid);
+      } catch (err) {
+        await ctx.reply(`❌ Couldn't re-read history: ${err.message}`).catch(() => {});
+        return;
+      }
+      if (!briefMsg) {
+        await ctx.reply(`❌ Message ${mid} not found in chat history (deleted?).`).catch(() => {});
+        return;
+      }
+      const replyChatId = ctx.chat?.id || Number(recoverChat);
+      const fakeCtx = {
+        message:               briefMsg,
+        chat:                  { id: Number(recoverChat) },
+        from:                  briefMsg.from,
+        telegram:              ctx.telegram,
+        _isDeferredProcessing: true,
+        _resolvePromptChatId:  replyChatId,
+        reply: (t, e) => ctx.telegram.sendMessage(replyChatId, t, e),
+      };
+      try {
+        await handleAdMessage(fakeCtx);
+        await ctx.reply(`✅ Recovered + forwarded brief ${mid} (was a missed / never-ingested update).`).catch(() => {});
+      } catch (err) {
+        console.error(`[adHandler] /replay recover failed ${recoverChat}/${mid}: ${err.message}`);
+        await ctx.reply(`❌ Recovery forward failed: ${err.message}`).catch(() => {});
+      }
       return;
     }
     briefText      = b.raw_text;
