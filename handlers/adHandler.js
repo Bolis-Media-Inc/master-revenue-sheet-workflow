@@ -1969,7 +1969,8 @@ async function handleRevenueCommand(ctx) {
   if (adminId && ctx.from?.id !== adminId) return;
 
   const arg = (ctx.message?.text || "").replace(/^\/revenue(?:@\w+)?\s*/i, "").trim().toLowerCase();
-  const monthTok = arg.match(/[a-z]+|\d{1,2}/)?.[0];
+  const wantPages = /\b(pages?|pnl|full)\b/i.test(arg);   // also sum every page P/L
+  const monthTok = arg.replace(/\b(pages?|pnl|full)\b/gi, "").match(/[a-z]+|\d{1,2}/)?.[0];
   const yearTok  = arg.match(/\b(20\d{2}|\d{2})\b(?!\/)/g)?.slice(-1)[0];
   let mo = null;
   if (monthTok) mo = /^\d+$/.test(monthTok) ? parseInt(monthTok, 10) : _MONTHS[monthTok];
@@ -1998,6 +1999,29 @@ async function handleRevenueCommand(ctx) {
   const inMonth = rows.filter((r) => r.mo === mo && r.yr === yr);
   const total = inMonth.reduce((s, r) => s + r.price, 0);
   const paid = inMonth.filter((r) => r.price > 0).length;
+
+  // Optional: sum every page P/L for the month and cross-check vs master.
+  let pageSum = null, pagesRead = 0, pagesFailed = 0, pageRows = 0;
+  if (wantPages) {
+    const allPages = (pagesRegistry.listAllSync ? pagesRegistry.listAllSync() : [])
+      .filter((p) => p.sheet_id && !PLACEHOLDER_PATTERN.test(p.sheet_id));
+    pageSum = 0;
+    let lastEdit = Date.now(), done = 0;
+    for (const pg of allPages) {
+      try {
+        for (const r of await readPagePlacements(pg.sheet_id, PAGE_TAB_NAME)) {
+          if (r.mo === mo && r.yr === yr) { pageSum += r.price; pageRows++; }
+        }
+        pagesRead++;
+      } catch (err) { pagesFailed++; console.error(`[revenue] P/L @${pg.handle}: ${err.message}`); }
+      done++;
+      if (statusMsg && Date.now() - lastEdit > 5000) {
+        await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined,
+          `⏳ Cross-checking page P/Ls… ${done}/${allPages.length}`, {}).catch(() => {});
+        lastEdit = Date.now();
+      }
+    }
+  }
 
   // Top clients (rolled up by leading brand token for readability).
   const fam = (c) => {
@@ -2028,6 +2052,19 @@ async function handleRevenueCommand(ctx) {
     `*Top clients:*`,
     ...top.map(([c, v], i) => `${i + 1}. ${c} — ${money(v)}`),
   ];
+  if (wantPages && pageSum != null) {
+    const delta = pageSum - total;
+    lines.push(
+      ``,
+      `*Page-P/L cross-check* (${pagesRead} sheets${pagesFailed ? `, ${pagesFailed} unreadable` : ""}):`,
+      `Master: *${money(total)}*`,
+      `Σ Page P/Ls: *${money(pageSum)}* (${pageRows} rows)`,
+      `Δ *${delta >= 0 ? "+" : "−"}${money(Math.abs(delta))}*`,
+      Math.abs(delta) < 1
+        ? `✅ Master and page P/Ls tie out exactly.`
+        : `_Δ = rows in one but not the other (page-P/L-only manual entries like bonuses/designer fees inflate the page side; deleted-in-master-only rows inflate it too). Run /reconcile to itemize._`,
+    );
+  }
   if (statusMsg) {
     await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, lines.join("\n"), { parse_mode: "Markdown" }).catch(async () => {
       await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, lines.join("\n").replace(/[*_`]/g, "")).catch(() => {});
