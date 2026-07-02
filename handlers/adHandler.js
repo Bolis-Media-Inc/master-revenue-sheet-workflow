@@ -2034,7 +2034,8 @@ async function handleBonusCommand(ctx) {
   ).catch(() => null);
 
   const money = (n) => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  const written = [], noSheet = [], failed = [];
+  const bonusKey = `ig payout (instagram bonus)|${dateKeyOf(dateStr)}`;
+  const written = [], noSheet = [], failed = [], already = [];
   const touchedSheets = new Set();
   let total = 0, done = 0, lastEdit = Date.now();
 
@@ -2042,6 +2043,13 @@ async function handleBonusCommand(ctx) {
     const canonical = pagesRegistry.resolveHandle(handle) || handle;
     const sheetId = pagesRegistry.getSheetId(canonical);
     if (!sheetId || PLACEHOLDER_PATTERN.test(sheetId)) { noSheet.push(handle); done++; continue; }
+    // Double-write guard: skip if this page already has a bonus row for this
+    // date, so a re-run only fills gaps (never duplicates). Fail-open: if the
+    // read errors, proceed to write rather than silently skip.
+    try {
+      const keys = await getClientDateKeys(sheetId, PAGE_TAB_NAME);
+      if (keys.has(bonusKey)) { already.push(canonical); done++; continue; }
+    } catch { /* fail-open → write */ }
     // A=Client, B=AdType, C=Bulk, D=Date, E=PostType, F=Duration, G=Price, H=Notes
     const row = ["IG Payout (Instagram Bonus)", "Bonus", "", dateStr, "", "", money(amount), ""];
     try {
@@ -2056,32 +2064,37 @@ async function handleBonusCommand(ctx) {
     done++;
     if (statusMsg && Date.now() - lastEdit > 5000) {
       await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined,
-        `⏳ Bonus payouts… ${done}/${parsed.length} written`, {}).catch(() => {});
+        `⏳ Bonus payouts… ${done}/${parsed.length}`, {}).catch(() => {});
       lastEdit = Date.now();
     }
   }
 
-  // Re-sort each touched sheet so the end-of-month row lands in date order.
-  for (const sid of touchedSheets) {
-    try { await sortSheetByDate(sid, PAGE_TAB_NAME); } catch (err) { console.error(`[bonus] sort ${sid}: ${err.message}`); }
-  }
-
+  // POST THE SUMMARY *BEFORE* SORTING. Writes are the important part and are
+  // now done + counted; posting first means a stalled sort (or a mid-run
+  // restart) can never again orphan the run at "⏳ Writing…".
   const lines = [
-    `💸 *Bonus payouts written* — ${dateStr}`,
+    `💸 *Bonus payouts* — ${dateStr}`,
     ``,
-    `✅ ${written.length} page(s) · total *${money(total)}*`,
-    `_Written to page P/Ls only — master sheet untouched._`,
+    `✅ Written: *${written.length}* · total *${money(total)}*`,
+    `_Page P/Ls only — master untouched._`,
   ];
-  if (zero.length)    lines.push(`⚪ Skipped $0: ${zero.map((h) => "@" + h).join(", ")}`);
-  if (bad.length)     lines.push(`⚠️ Skipped errors (#VALUE! etc.): ${bad.map((h) => "@" + h).join(", ")}`);
-  if (noSheet.length) lines.push(`❓ No P/L sheet (add to registry): ${noSheet.map((h) => "@" + h).join(", ")}`);
-  if (failed.length)  lines.push(`❌ Write failed: ${failed.map((h) => "@" + h).join(", ")}`);
+  if (already.length)  lines.push(`↩️ Already had this date (skipped, no dupe): ${already.length}`);
+  if (zero.length)     lines.push(`⚪ Skipped $0: ${zero.map((h) => "@" + h).join(", ")}`);
+  if (bad.length)      lines.push(`⚠️ Skipped bad amount (fix + re-run): ${bad.map((h) => "@" + h).join(", ")}`);
+  if (noSheet.length)  lines.push(`❓ No P/L sheet: ${noSheet.map((h) => "@" + h).join(", ")}`);
+  if (failed.length)   lines.push(`❌ Write failed (safe to re-run): ${failed.map((h) => "@" + h).join(", ")}`);
 
   const out = lines.join("\n");
   if (statusMsg) await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, out, { parse_mode: "Markdown" }).catch(() => {
     ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, out.replace(/[*_`]/g, "")).catch(() => {});
   });
   else await ctx.reply(out, { parse_mode: "Markdown" }).catch(() => {});
+
+  // Best-effort re-sort AFTER the summary is posted. If a sort stalls here, the
+  // run is already reported + safe to re-run — nothing gets orphaned.
+  for (const sid of touchedSheets) {
+    try { await sortSheetByDate(sid, PAGE_TAB_NAME); } catch (err) { console.error(`[bonus] sort ${sid}: ${err.message}`); }
+  }
 }
 
 /**
