@@ -1961,9 +1961,10 @@ const _MONTH_NAMES = ["", "January","February","March","April","May","June","Jul
 /**
  * /bonus [M/D or M/D/YY] + pasted "$amount  @page" lines — bulk-write monthly
  * bonus payouts directly into each page's P/L sheet ONLY (never the master
- * ad-overview). Each row is logged as client "IG Bonus Payout" (so the
- * /revenue + /reconcile classifiers treat it as non-ad bonus, not a placement),
- * dated to the given day (default = last day of the prior month), then the
+ * ad-overview). Each row: client "IG Payout (Instagram Bonus)", Ad Type
+ * "Bonus", date "Tue 6/30/26" (weekday, no comma), price = the amount — so the
+ * /revenue + /reconcile classifiers treat it as non-ad bonus, not a placement.
+ * Dated to the given day (default = last day of the prior month), then the
  * touched sheets are re-sorted so it lands in date order.
  *
  * Skips $0 / #VALUE! lines and reports them; reports pages with no P/L sheet.
@@ -1990,7 +1991,8 @@ async function handleBonusCommand(ctx) {
     mo = lastPrev.getMonth() + 1; day = lastPrev.getDate(); yr = lastPrev.getFullYear();
   }
   const WD = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-  const dateStr = `${WD[new Date(yr, mo - 1, day).getDay()]}, ${mo}/${day}/${String(yr).slice(-2)}`;
+  // Per-page date format: "Tue 6/30/26" (weekday, NO comma).
+  const dateStr = `${WD[new Date(yr, mo - 1, day).getDay()]} ${mo}/${day}/${String(yr).slice(-2)}`;
 
   if (!body.trim()) {
     await ctx.reply(
@@ -2036,7 +2038,7 @@ async function handleBonusCommand(ctx) {
     const sheetId = pagesRegistry.getSheetId(canonical);
     if (!sheetId || PLACEHOLDER_PATTERN.test(sheetId)) { noSheet.push(handle); done++; continue; }
     // A=Client, B=AdType, C=Bulk, D=Date, E=PostType, F=Duration, G=Price, H=Notes
-    const row = ["IG Bonus Payout", "", "", dateStr, "", "", money(amount), "Monthly IG bonus"];
+    const row = ["IG Payout (Instagram Bonus)", "Bonus", "", dateStr, "", "", money(amount), ""];
     try {
       const rowNum = await appendRow(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "A", endColumn: "H" });
       if (rowNum) {
