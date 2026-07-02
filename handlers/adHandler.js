@@ -1959,6 +1959,125 @@ const _MONTHS = { jan:1, feb:2, mar:3, apr:4, may:5, jun:6, jul:7, aug:8, sep:9,
 const _MONTH_NAMES = ["", "January","February","March","April","May","June","July","August","September","October","November","December"];
 
 /**
+ * /bonus [M/D or M/D/YY] + pasted "$amount  @page" lines — bulk-write monthly
+ * bonus payouts directly into each page's P/L sheet ONLY (never the master
+ * ad-overview). Each row is logged as client "IG Bonus Payout" (so the
+ * /revenue + /reconcile classifiers treat it as non-ad bonus, not a placement),
+ * dated to the given day (default = last day of the prior month), then the
+ * touched sheets are re-sorted so it lands in date order.
+ *
+ * Skips $0 / #VALUE! lines and reports them; reports pages with no P/L sheet.
+ * Stopgap until the ledger revamp — deliberately does NOT touch the master.
+ */
+async function handleBonusCommand(ctx) {
+  const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+  if (adminId && ctx.from?.id !== adminId) return;
+
+  const raw = ctx.message?.text || "";
+  const nl = raw.indexOf("\n");
+  const header = (nl >= 0 ? raw.slice(0, nl) : raw).replace(/^\/bonus(?:@\w+)?\s*/i, "").trim();
+  const body = nl >= 0 ? raw.slice(nl + 1) : "";
+
+  // Date: explicit M/D[/YY] on the command line, else last day of prior month.
+  let mo, day, yr;
+  const dm = header.match(/(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?/);
+  if (dm) {
+    mo = +dm[1]; day = +dm[2];
+    yr = dm[3] ? (+dm[3] < 100 ? 2000 + +dm[3] : +dm[3]) : 2026;
+  } else {
+    const now = new Date();
+    const lastPrev = new Date(now.getFullYear(), now.getMonth(), 0); // day 0 = last day of prev month
+    mo = lastPrev.getMonth() + 1; day = lastPrev.getDate(); yr = lastPrev.getFullYear();
+  }
+  const WD = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const dateStr = `${WD[new Date(yr, mo - 1, day).getDay()]}, ${mo}/${day}/${String(yr).slice(-2)}`;
+
+  if (!body.trim()) {
+    await ctx.reply(
+      "*Usage:* `/bonus [M/D]` then paste lines of `$amount  @page` (one per line).\n" +
+      "Writes each into that page's P/L only (never master), dated end-of-month.\n" +
+      "_Default date = last day of the prior month._",
+      { parse_mode: "Markdown" },
+    ).catch(() => {});
+    return;
+  }
+
+  // Parse "$amount  @page" (order-agnostic) per line.
+  const parsed = [];   // { handle, amount }
+  const zero = [], bad = [];
+  for (const line of body.split("\n").map((l) => l.trim()).filter(Boolean)) {
+    const hm = line.match(/@([A-Za-z0-9._]+)/);
+    if (!hm) continue;                                   // no @handle → skip silently (e.g. "Miscellaneous")
+    const handle = hm[1];
+    if (/#(VALUE|REF|N\/A|ERROR|DIV)/i.test(line)) { bad.push(handle); continue; }
+    const am = line.replace(/@[A-Za-z0-9._]+/, "").match(/-?\$?\s*([\d,]+(?:\.\d+)?)/);
+    const amt = am ? parseFloat(am[1].replace(/,/g, "")) : NaN;
+    if (!Number.isFinite(amt)) { bad.push(handle); continue; }
+    if (amt === 0) { zero.push(handle); continue; }
+    parsed.push({ handle, amount: amt });
+  }
+
+  if (parsed.length === 0) {
+    await ctx.reply(`⚠️ No valid bonus lines found. (skipped ${zero.length} zero, ${bad.length} error)`).catch(() => {});
+    return;
+  }
+
+  const statusMsg = await ctx.reply(
+    `⏳ Writing ${parsed.length} bonus payout(s) → page P/Ls, dated ${dateStr} (not master)…`
+  ).catch(() => null);
+
+  const money = (n) => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const written = [], noSheet = [], failed = [];
+  const touchedSheets = new Set();
+  let total = 0, done = 0, lastEdit = Date.now();
+
+  for (const { handle, amount } of parsed) {
+    const canonical = pagesRegistry.resolveHandle(handle) || handle;
+    const sheetId = pagesRegistry.getSheetId(canonical);
+    if (!sheetId || PLACEHOLDER_PATTERN.test(sheetId)) { noSheet.push(handle); done++; continue; }
+    // A=Client, B=AdType, C=Bulk, D=Date, E=PostType, F=Duration, G=Price, H=Notes
+    const row = ["IG Bonus Payout", "", "", dateStr, "", "", money(amount), "Monthly IG bonus"];
+    try {
+      const rowNum = await appendRow(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "A", endColumn: "H" });
+      if (rowNum) {
+        applyCenterAlignmentBatch(sheetId, PAGE_TAB_NAME, [rowNum], "H").catch(() => {});
+        written.push({ handle: canonical, amount });
+        total += amount;
+        touchedSheets.add(sheetId);
+      } else { failed.push(handle); }
+    } catch (err) { failed.push(handle); console.error(`[bonus] @${handle}: ${err.message}`); }
+    done++;
+    if (statusMsg && Date.now() - lastEdit > 5000) {
+      await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined,
+        `⏳ Bonus payouts… ${done}/${parsed.length} written`, {}).catch(() => {});
+      lastEdit = Date.now();
+    }
+  }
+
+  // Re-sort each touched sheet so the end-of-month row lands in date order.
+  for (const sid of touchedSheets) {
+    try { await sortSheetByDate(sid, PAGE_TAB_NAME); } catch (err) { console.error(`[bonus] sort ${sid}: ${err.message}`); }
+  }
+
+  const lines = [
+    `💸 *Bonus payouts written* — ${dateStr}`,
+    ``,
+    `✅ ${written.length} page(s) · total *${money(total)}*`,
+    `_Written to page P/Ls only — master sheet untouched._`,
+  ];
+  if (zero.length)    lines.push(`⚪ Skipped $0: ${zero.map((h) => "@" + h).join(", ")}`);
+  if (bad.length)     lines.push(`⚠️ Skipped errors (#VALUE! etc.): ${bad.map((h) => "@" + h).join(", ")}`);
+  if (noSheet.length) lines.push(`❓ No P/L sheet (add to registry): ${noSheet.map((h) => "@" + h).join(", ")}`);
+  if (failed.length)  lines.push(`❌ Write failed: ${failed.map((h) => "@" + h).join(", ")}`);
+
+  const out = lines.join("\n");
+  if (statusMsg) await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, out, { parse_mode: "Markdown" }).catch(() => {
+    ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, out.replace(/[*_`]/g, "")).catch(() => {});
+  });
+  else await ctx.reply(out, { parse_mode: "Markdown" }).catch(() => {});
+}
+
+/**
  * /revenue <month> [year] — total the master sheet's Price column (H) for a
  * given month. Works for ANY month present in the sheet, including months
  * before DB tracking existed (e.g. May). Read-only. Reports total + top
@@ -3098,6 +3217,13 @@ async function handleAdMessage(ctx) {
     // against the master sheet and that page's P/L. Read-only — reports only.
     if (text && /^\/reconcile\b/i.test(text.trim())) {
       return await handleReconcileCommand(ctx);
+    }
+
+    // /bonus [M/D] <paste "$amount @page" lines> — bulk-write monthly bonus
+    // payouts straight into each page's P/L (NEVER the master sheet), dated
+    // end-of-month, then sort into place. Stopgap until the ledger revamp.
+    if (text && /^\/bonus\b/i.test(text.trim())) {
+      return await handleBonusCommand(ctx);
     }
 
     const chatId = String(ctx.chat?.id);
