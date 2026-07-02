@@ -2038,6 +2038,7 @@ async function handleBonusCommand(ctx) {
   const written = [], noSheet = [], failed = [], already = [];
   const touchedSheets = new Set();
   let total = 0, done = 0, lastEdit = Date.now();
+  console.log(`[bonus] start — ${parsed.length} page(s) for ${dateStr}`);
 
   for (const { handle, amount } of parsed) {
     const canonical = pagesRegistry.resolveHandle(handle) || handle;
@@ -2069,6 +2070,8 @@ async function handleBonusCommand(ctx) {
     }
   }
 
+  console.log(`[bonus] writes done — written ${written.length}, already ${already.length}, noSheet ${noSheet.length}, failed ${failed.length}`);
+
   // POST THE SUMMARY *BEFORE* SORTING. Writes are the important part and are
   // now done + counted; posting first means a stalled sort (or a mid-run
   // restart) can never again orphan the run at "⏳ Writing…".
@@ -2092,9 +2095,12 @@ async function handleBonusCommand(ctx) {
 
   // Best-effort re-sort AFTER the summary is posted. If a sort stalls here, the
   // run is already reported + safe to re-run — nothing gets orphaned.
+  console.log(`[bonus] sorting ${touchedSheets.size} sheet(s)…`);
+  let sorted = 0;
   for (const sid of touchedSheets) {
-    try { await sortSheetByDate(sid, PAGE_TAB_NAME); } catch (err) { console.error(`[bonus] sort ${sid}: ${err.message}`); }
+    try { await sortSheetByDate(sid, PAGE_TAB_NAME); sorted++; } catch (err) { console.error(`[bonus] sort ${sid}: ${err.message}`); }
   }
+  console.log(`[bonus] done — sorted ${sorted}/${touchedSheets.size} sheet(s)`);
 }
 
 /**
