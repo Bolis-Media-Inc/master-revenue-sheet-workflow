@@ -142,7 +142,7 @@ function parseAdMessage(text, date) {
       }
 
       // Single-page format with price: "@handle - $price"
-      const singleMatch = line.match(/^@([\w.]+)\s*-\s*\$?([\d,]+(?:\.\d{1,2})?)/);
+      const singleMatch = line.match(/^@([\w.]+)\s*(?:-\s*\$?|\$)([\d,]+(?:\.\d{1,2})?)/);
       if (singleMatch) {
         pageEntries.push({
           handle: singleMatch[1].toLowerCase(),
@@ -191,7 +191,7 @@ function parseAdMessage(text, date) {
     for (let i = scanStart; i < lines.length; i++) {
       const line = lines[i];
       // @handle - $price
-      const priceMatch = line.match(/^@([\w.]+)\s*-\s*\$?([\d,]+(?:\.\d{1,2})?)/);
+      const priceMatch = line.match(/^@([\w.]+)\s*(?:-\s*\$?|\$)([\d,]+(?:\.\d{1,2})?)/);
       if (priceMatch) {
         pageEntries.push({
           handle: priceMatch[1].toLowerCase(),

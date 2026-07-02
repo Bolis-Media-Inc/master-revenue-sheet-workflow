@@ -1913,7 +1913,7 @@ async function handleSortSheetsCommand(ctx) {
   };
 
   let sorted = 0, skipped = 0, failed = 0, processed = 0;
-  const errors = [];
+  const errors = [], skippedList = [];
   let lastEdit = Date.now();
 
   for (const page of targets) {
@@ -1924,6 +1924,7 @@ async function handleSortSheetsCommand(ctx) {
         console.log(`[adHandler] 🔢 /sortsheets @${page.handle}: sorted ${res.rows} rows`);
       } else {
         skipped++;
+        skippedList.push(`@${page.handle} — ${res.reason}`);
         console.log(`[adHandler] ⏭️ /sortsheets @${page.handle}: skipped (${res.reason})`);
       }
     } catch (err) {
@@ -1945,6 +1946,12 @@ async function handleSortSheetsCommand(ctx) {
     skipped > 0 ? `⏭️ skipped: ${skipped} (no dated rows / <2 rows)` : null,
     failed > 0 ? `❌ failed: ${failed}` : null,
   ].filter(Boolean);
+  if (skippedList.length > 0) {
+    lines.push("", "*Skipped (nothing to sort — 0–1 dated rows):*");
+    skippedList.slice(0, 25).forEach((s) => lines.push(`• ${s}`));
+    if (skippedList.length > 25) lines.push(`…and ${skippedList.length - 25} more`);
+    lines.push("_If a BUSY page is here, its dates aren't parsing in col D → check /auditcols._");
+  }
   if (errors.length > 0) {
     lines.push("", "*Errors*:");
     errors.slice(0, 10).forEach((e) => lines.push(`• \`${e.slice(0, 150)}\``));
