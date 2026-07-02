@@ -2012,8 +2012,13 @@ async function handleBonusCommand(ctx) {
     if (!hm) continue;                                   // no @handle → skip silently (e.g. "Miscellaneous")
     const handle = hm[1];
     if (/#(VALUE|REF|N\/A|ERROR|DIV)/i.test(line)) { bad.push(handle); continue; }
-    const am = line.replace(/@[A-Za-z0-9._]+/, "").match(/-?\$?\s*([\d,]+(?:\.\d+)?)/);
-    const amt = am ? parseFloat(am[1].replace(/,/g, "")) : NaN;
+    // Pull the number token, strip $ and thousands commas, then require a CLEAN
+    // number — rejects malformed values like "1.31.32" (double decimal) instead
+    // of silently grabbing "1.31".
+    const numTok = line.replace(/@[A-Za-z0-9._]+/, "").match(/-?\$?\s*([\d.,]+)/);
+    const cleaned = numTok ? numTok[1].replace(/,/g, "") : "";
+    if (!/^\d+(?:\.\d+)?$/.test(cleaned)) { bad.push(handle); continue; }  // malformed / no number
+    const amt = parseFloat(cleaned);
     if (!Number.isFinite(amt)) { bad.push(handle); continue; }
     if (amt === 0) { zero.push(handle); continue; }
     parsed.push({ handle, amount: amt });
