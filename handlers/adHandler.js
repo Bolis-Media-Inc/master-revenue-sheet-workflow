@@ -2111,6 +2111,147 @@ async function handleBonusCommand(ctx) {
 }
 
 /**
+ * /clips [M/D or M/D/YY] + pasted "$amount  @page  Campaign" lines — bulk-write
+ * monthly CLIPPING revenue into each page's P/L ONLY (never the master), ONE
+ * row per campaign. Each row: client = campaign name, Ad Type "Clipping", date
+ * "Tue 6/30/26", price = amount — so /revenue + /reconcile treat it as clipping,
+ * not a placement. Mirrors /bonus exactly (page P/Ls only, master untouched).
+ * Per-(page × campaign × date) double-write guard so a re-run only fills gaps.
+ */
+async function handleClipsCommand(ctx) {
+  const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+  if (adminId && ctx.from?.id !== adminId) return;
+
+  const raw = ctx.message?.text || "";
+  const nl = raw.indexOf("\n");
+  const header = (nl >= 0 ? raw.slice(0, nl) : raw).replace(/^\/clips(?:@\w+)?\s*/i, "").trim();
+  const body = nl >= 0 ? raw.slice(nl + 1) : "";
+
+  // Date: explicit M/D[/YY] on the command line, else last day of prior month.
+  let mo, day, yr;
+  const dm = header.match(/(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?/);
+  if (dm) {
+    mo = +dm[1]; day = +dm[2];
+    yr = dm[3] ? (+dm[3] < 100 ? 2000 + +dm[3] : +dm[3]) : 2026;
+  } else {
+    const now = new Date();
+    const lastPrev = new Date(now.getFullYear(), now.getMonth(), 0);
+    mo = lastPrev.getMonth() + 1; day = lastPrev.getDate(); yr = lastPrev.getFullYear();
+  }
+  const WD = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const dateStr = `${WD[new Date(yr, mo - 1, day).getDay()]} ${mo}/${day}/${String(yr).slice(-2)}`;
+
+  if (!body.trim()) {
+    await ctx.reply(
+      "*Usage:* `/clips [M/D]` then paste lines of `$amount  @page  Campaign` (one per line).\n" +
+      "Writes each as a Clipping row into that page's P/L only (never master), dated end-of-month.\n" +
+      "_Campaign = everything after the amount + handle. Default date = last day of the prior month._",
+      { parse_mode: "Markdown" },
+    ).catch(() => {});
+    return;
+  }
+
+  // Parse "$amount  @page  Campaign" per line. The amount MUST carry a $ — clip
+  // campaign names can contain digits ("Persona 4"), so we anchor on the $ token
+  // to avoid grabbing a stray number out of the campaign name.
+  const parsed = [];   // { handle, amount, campaign }
+  const zero = [], bad = [];
+  for (const line of body.split("\n").map((l) => l.trim()).filter(Boolean)) {
+    const hm = line.match(/@([A-Za-z0-9._]+)/);
+    if (!hm) continue;                                   // no @handle → skip silently
+    const handle = hm[1];
+    if (/#(VALUE|REF|N\/A|ERROR|DIV)/i.test(line)) { bad.push(handle); continue; }
+    const am = line.match(/\$\s*([\d,]+(?:\.\d+)?)/);
+    if (!am) { bad.push(handle); continue; }
+    const amt = parseFloat(am[1].replace(/,/g, ""));
+    if (!Number.isFinite(amt)) { bad.push(handle); continue; }
+    if (amt === 0) { zero.push(handle); continue; }
+    const campaign = line.replace(hm[0], " ").replace(am[0], " ").replace(/\s+/g, " ").trim();
+    if (!campaign) { bad.push(handle); continue; }        // a clip row needs a campaign name
+    parsed.push({ handle, amount: amt, campaign });
+  }
+
+  if (parsed.length === 0) {
+    await ctx.reply(`⚠️ No valid clip lines found. (skipped ${zero.length} zero, ${bad.length} error)`).catch(() => {});
+    return;
+  }
+
+  const statusMsg = await ctx.reply(
+    `⏳ Writing ${parsed.length} clip row(s) → page P/Ls, dated ${dateStr} (not master)…`
+  ).catch(() => null);
+
+  const money = (n) => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const dKey = dateKeyOf(dateStr);
+  const written = [], noSheet = [], failed = [], already = [];
+  const touchedSheets = new Set();
+  const keysCache = new Map();   // sheetId → Set("client|dateKey"), read once per sheet
+  let total = 0, done = 0, lastEdit = Date.now();
+  console.log(`[clips] start — ${parsed.length} row(s) for ${dateStr}`);
+
+  for (const { handle, amount, campaign } of parsed) {
+    const canonical = pagesRegistry.resolveHandle(handle) || handle;
+    const sheetId = pagesRegistry.getSheetId(canonical);
+    if (!sheetId || PLACEHOLDER_PATTERN.test(sheetId)) { noSheet.push(`@${handle} (${campaign})`); done++; continue; }
+    // Per-(page × campaign × date) guard. Read each sheet's keys once + cache —
+    // a page carries many clip rows this run. Fail-open on read error → write.
+    let keys = keysCache.get(sheetId);
+    if (!keys) {
+      try { keys = await getClientDateKeys(sheetId, PAGE_TAB_NAME); }
+      catch { keys = new Set(); }
+      keysCache.set(sheetId, keys);
+    }
+    const clipKey = `${campaign.toLowerCase()}|${dKey}`;
+    if (keys.has(clipKey)) { already.push(`@${canonical} (${campaign})`); done++; continue; }
+    // A=Client, B=AdType, C=Bulk, D=Date, E=PostType, F=Duration, G=Price, H=Notes
+    const row = [campaign, "Clipping", "", dateStr, "", "", money(amount), ""];
+    try {
+      const rowNum = await appendRow(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "A", endColumn: "H" });
+      if (rowNum) {
+        applyCenterAlignmentBatch(sheetId, PAGE_TAB_NAME, [rowNum], "H").catch(() => {});
+        keys.add(clipKey);   // catch a duplicate campaign later in the same run
+        written.push({ handle: canonical, campaign, amount });
+        total += amount;
+        touchedSheets.add(sheetId);
+      } else { failed.push(`@${handle} (${campaign})`); }
+    } catch (err) { failed.push(`@${handle} (${campaign})`); console.error(`[clips] @${handle} ${campaign}: ${err.message}`); }
+    done++;
+    if (statusMsg && Date.now() - lastEdit > 5000) {
+      await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined,
+        `⏳ Clip rows… ${done}/${parsed.length}`, {}).catch(() => {});
+      lastEdit = Date.now();
+    }
+  }
+
+  console.log(`[clips] writes done — written ${written.length}, already ${already.length}, noSheet ${noSheet.length}, failed ${failed.length}`);
+
+  const pageSet = new Set(written.map((w) => w.handle));
+  const lines = [
+    `🎬 *Clipping payouts* — ${dateStr}`,
+    ``,
+    `✅ Written: *${written.length}* row(s) across *${pageSet.size}* page(s) · total *${money(total)}*`,
+    `_Page P/Ls only — master untouched._`,
+  ];
+  if (already.length)  lines.push(`↩️ Already had this run (skipped, no dupe): ${already.length}`);
+  if (zero.length)     lines.push(`⚪ Skipped $0: ${zero.length}`);
+  if (bad.length)      lines.push(`⚠️ Skipped bad line (fix + re-run): ${bad.length}`);
+  if (noSheet.length)  lines.push(`❓ No P/L sheet: ${noSheet.join(", ")}`);
+  if (failed.length)   lines.push(`❌ Write failed (safe to re-run): ${failed.length}`);
+
+  const out = lines.join("\n");
+  if (statusMsg) await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, out, { parse_mode: "Markdown" }).catch(() => {
+    ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, out.replace(/[*_`]/g, "")).catch(() => {});
+  });
+  else await ctx.reply(out, { parse_mode: "Markdown" }).catch(() => {});
+
+  console.log(`[clips] sorting ${touchedSheets.size} sheet(s)…`);
+  let sorted = 0;
+  for (const sid of touchedSheets) {
+    try { await sortSheetByDate(sid, PAGE_TAB_NAME); sorted++; } catch (err) { console.error(`[clips] sort ${sid}: ${err.message}`); }
+  }
+  console.log(`[clips] done — sorted ${sorted}/${touchedSheets.size} sheet(s)`);
+}
+
+/**
  * /revenue <month> [year] — total the master sheet's Price column (H) for a
  * given month. Works for ANY month present in the sheet, including months
  * before DB tracking existed (e.g. May). Read-only. Reports total + top
@@ -3257,6 +3398,13 @@ async function handleAdMessage(ctx) {
     // end-of-month, then sort into place. Stopgap until the ledger revamp.
     if (text && /^\/bonus\b/i.test(text.trim())) {
       return await handleBonusCommand(ctx);
+    }
+
+    // /clips [M/D] <paste "$amount @page Campaign" lines> — bulk-write monthly
+    // clipping revenue into each page's P/L (NEVER the master), one row per
+    // campaign, dated end-of-month, then sort into place. Mirrors /bonus.
+    if (text && /^\/clips\b/i.test(text.trim())) {
+      return await handleClipsCommand(ctx);
     }
 
     const chatId = String(ctx.chat?.id);
