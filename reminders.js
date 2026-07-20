@@ -86,6 +86,21 @@ function parsePostDuration(nifString) {
 async function checkAndFireReminders(telegram) {
   if (!MASTER_SHEET_ID) return;
 
+  // Global reminder kill switch (Connor muted all reminders 2026-07). When off
+  // we CONSUME any due reminders (mark them sent) instead of sending, so they
+  // don't accumulate and flood the chats in one burst when re-enabled. Set
+  // REMINDERS_ENABLED=true to resume sending.
+  if (process.env.REMINDERS_ENABLED !== "true") {
+    try {
+      const stale = await getPendingReminders(MASTER_SHEET_ID);
+      for (const r of stale) await markReminderSent(MASTER_SHEET_ID, r.rowNumber).catch(() => {});
+      if (stale.length) console.log(`[reminders] 🔕 Disabled — consumed ${stale.length} pending (not sent)`);
+    } catch (err) {
+      console.error("[reminders] disabled-consume failed:", err.message);
+    }
+    return;
+  }
+
   let pending;
   try {
     pending = await getPendingReminders(MASTER_SHEET_ID);

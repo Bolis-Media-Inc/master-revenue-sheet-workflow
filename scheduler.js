@@ -49,6 +49,13 @@ function parseNifMs(nifString) {
  * @param {number} nifMs       NIF duration in milliseconds
  */
 function scheduleNifReminder(telegram, destChatId, client, handle, nifMs) {
+  // Global reminder kill switch (Connor muted all reminders 2026-07). Set the
+  // env var REMINDERS_ENABLED=true to resume. Gated here so no NIF timers are
+  // even queued while off.
+  if (process.env.REMINDERS_ENABLED !== "true") {
+    console.log(`[scheduler] 🔕 Reminders disabled — skipping NIF reminder for @${handle}`);
+    return;
+  }
   const mins = Math.round(nifMs / 60000);
   console.log(`[scheduler] ⏰ NIF reminder scheduled for @${handle} in ${mins} min (${client})`);
 
