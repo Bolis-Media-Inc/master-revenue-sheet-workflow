@@ -378,8 +378,21 @@ async function updateTakedown(ctx, brief, briefPages, handles) {
 // ── Main entry — parses /update and dispatches ──────────────────────────────
 
 /**
+ * Parse a Telegram message link into { chatId, messageId }, or null.
+ * Supports private-supergroup links  https://t.me/c/<internalId>/<msg>
+ * and thread links                   https://t.me/c/<internalId>/<threadId>/<msg>.
+ * The real chat_id is "-100" prepended to the internal id.
+ */
+function parseBriefLink(text) {
+  if (!text) return null;
+  const m = String(text).match(/t\.me\/c\/(\d+)\/(?:\d+\/)?(\d+)/i);
+  if (!m) return null;
+  return { chatId: Number("-100" + m[1]), messageId: Number(m[2]) };
+}
+
+/**
  * Entry point for `/update <subcommand> <args>`. Wired via bot.command in
- * index.js. Requires reply-to-brief for unambiguous brief identification.
+ * index.js. Identifies the brief by a reply-to OR a pasted t.me/c/ link.
  */
 async function handleUpdateCommand(ctx) {
   try {
@@ -389,43 +402,48 @@ async function handleUpdateCommand(ctx) {
       // Silent — operator likely typed /update in another chat; not for us
       return;
     }
-    const replyTo = ctx.message?.reply_to_message;
-    if (!replyTo) {
+    const fullText = (ctx.message?.text || "").trim();
+    const replyTo  = ctx.message?.reply_to_message;
+    const link     = parseBriefLink(fullText);
+    // Identify the brief message: reply-to (preferred) OR a pasted t.me/c/ link.
+    let sourceChatId, briefMessageId;
+    if (replyTo) {
+      sourceChatId   = ctx.chat.id;
+      briefMessageId = replyTo.message_id;
+    } else if (link) {
+      sourceChatId   = link.chatId;
+      briefMessageId = link.messageId;
+    } else {
       await ctx.reply(
-        "*/update* must be a reply to the brief.\n\n" +
-        "Examples (reply to the brief, then type):\n" +
+        "*/update* needs the brief — reply to it, or paste its message link.\n\n" +
+        "Reply to the brief, then type:\n" +
         "  `/update price @hitsblunt $250`\n" +
-        "  `/update price @hitsblunt @dailyhoodposts $200`\n" +
-        "  `/update name New Campaign Name`\n" +
-        "  `/update remove @oddlyhorrifying`\n" +
-        "  `/update remove @page1 @page2`\n\n" +
-        "_Multi-line works — each line is processed as a separate command:_\n" +
-        "```\n/update price @hitsblunt $250\n/update remove @oddlyhorrifying\n```",
+        "  `/update remove @oddlyhorrifying`\n\n" +
+        "Or include the message link (no reply needed):\n" +
+        "  `/update price @hitsblunt $600 https://t.me/c/123456/789`\n\n" +
+        "_Also `/update name New Campaign Name`. Multi-line works — each line is its own command._",
         { parse_mode: "Markdown" }
       ).catch(() => {});
       return;
     }
-    const fullText = (ctx.message?.text || "").trim();
-    // Multi-line: each `/update …` line is its own command. Matches the
-    // legacy `price update / takedown / creative update` pattern. Necessary
-    // to fix the "all handles got same price" bug from the single-command-
-    // matches-multiple-lines parser.
-    const updateLines = fullText
+    // Strip any message link from the command text so it isn't parsed as an arg.
+    // Multi-line: each `/update …` line is its own command (fixes the legacy
+    // "all handles got the same price" single-command multi-line bug).
+    const cmdText = fullText.replace(/https?:\/\/t\.me\/\S+/gi, "").trim();
+    const updateLines = cmdText
       .split("\n")
       .map((l) => l.trim())
       .filter((l) => /^\/update(?:@\w+)?\s+/i.test(l));
     if (updateLines.length === 0) {
       await ctx.reply(
         "Usage: `/update <subcommand> <args>`\n" +
-        "Subcommands: `price`, `name` (more coming: creative, takedown, sponsor)",
+        "Subcommands: `price`, `name`, `remove`",
         { parse_mode: "Markdown" }
       ).catch(() => {});
       return;
     }
 
     // Look up brief once, share across all sub-commands
-    const briefMessageId = replyTo.message_id;
-    const sourceChatId   = ctx.chat.id;
     const brief = await adBriefs.findBriefByTelegramMessage(Number(sourceChatId), briefMessageId);
     if (!brief) {
       await ctx.reply(
