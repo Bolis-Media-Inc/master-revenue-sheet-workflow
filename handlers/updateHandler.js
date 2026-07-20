@@ -396,15 +396,18 @@ function parseBriefLink(text) {
  */
 async function handleUpdateCommand(ctx) {
   try {
-    // Only in target chats (don't fire in random groups)
-    const chatId = String(ctx.chat?.id);
-    if (TARGET_CHAT_IDS.size > 0 && !TARGET_CHAT_IDS.has(chatId)) {
-      // Silent — operator likely typed /update in another chat; not for us
-      return;
-    }
     const fullText = (ctx.message?.text || "").trim();
     const replyTo  = ctx.message?.reply_to_message;
     const link     = parseBriefLink(fullText);
+    // Chat gate: only fire in target chats so /update doesn't respond in random
+    // groups — UNLESS a message link is supplied. A link self-identifies the
+    // brief's chat, so /update can be run from a dedicated commands chat that
+    // isn't a target chat. Reply-mode still requires a target chat.
+    const chatId = String(ctx.chat?.id);
+    if (!link && TARGET_CHAT_IDS.size > 0 && !TARGET_CHAT_IDS.has(chatId)) {
+      // Silent — operator likely typed /update in another chat; not for us
+      return;
+    }
     // Identify the brief message: reply-to (preferred) OR a pasted t.me/c/ link.
     let sourceChatId, briefMessageId;
     if (replyTo) {
