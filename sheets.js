@@ -127,6 +127,33 @@ function getAuth() {
 }
 
 /**
+ * Convenience: return the shared rate-limited Sheets client. Exported so the
+ * v2 Ledger mirror (v2ledger.js) reuses the SAME rate limiter instead of
+ * standing up a second one that could blow the combined 60/min quota.
+ */
+async function sheetsClient() {
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  return getThrottledSheets(client);
+}
+
+/**
+ * Fire a v2 Ledger mirror method (from v2ledger.js) — strictly additive and
+ * FAIL-OPEN: any error is logged and swallowed so it can never break the bot's
+ * master/page/DB writes. No-op unless V2_LEDGER_ID is set. Required lazily to
+ * avoid a circular-require race with v2ledger.js.
+ */
+async function _mirrorV2(method, ...args) {
+  if (!process.env.V2_LEDGER_ID) return;
+  try {
+    const v2 = require("./v2ledger");
+    if (typeof v2[method] === "function") await v2[method](...args);
+  } catch (err) {
+    console.error(`[sheets] v2 mirror ${method} (non-fatal): ${err.message}`);
+  }
+}
+
+/**
  * Append a single row to a Google Sheet.
  *
  * @param {string} spreadsheetId   The Sheet ID (from the URL)
@@ -223,6 +250,13 @@ async function appendRow(spreadsheetId, tabName, rowValues, opts = {}) {
       valueInputOption: "USER_ENTERED",
       requestBody: { values: [rowValues] },
     });
+  }
+
+  // Mirror ad-placement appends into the v2 Ledger — ONLY the master ad tab
+  // (not per-page sheets, reminders, or day-divider rows). Fail-open.
+  if (spreadsheetId === process.env.MASTER_SHEET_ID &&
+      tabName === (process.env.SHEET_TAB_NAME || "2026 Ad Overview")) {
+    await _mirrorV2("mirrorAppend", rowValues);
   }
 
   return targetRow;
@@ -965,6 +999,7 @@ async function updateStatusToLive(spreadsheetId, tabName, pageHandles, clientNam
     });
   }
 
+  if (spreadsheetId === process.env.MASTER_SHEET_ID) await _mirrorV2("mirrorUpdateStatusToLive", pageHandles, clientName);
   return updates.length;
 }
 
@@ -1018,6 +1053,7 @@ async function updateAdDate(spreadsheetId, tabName, pageHandles, clientName, new
         requestBody: { valueInputOption: "USER_ENTERED", data: updates },
       });
     }
+    if (spreadsheetId === process.env.MASTER_SHEET_ID) await _mirrorV2("mirrorUpdateDate", pageHandles, clientName, newDate);
     return updates.length;
   }
 
@@ -1088,6 +1124,7 @@ async function updateAdPrice(spreadsheetId, tabName, pageHandles, clientName, ne
         requestBody: { valueInputOption: "USER_ENTERED", data: updates },
       });
     }
+    if (spreadsheetId === process.env.MASTER_SHEET_ID) await _mirrorV2("mirrorUpdatePrice", pageHandles, clientName, newPrice);
     return updates.length;
 
   } else {
@@ -1159,6 +1196,7 @@ async function updateAdClient(spreadsheetId, tabName, pageHandles, oldClient, ne
         requestBody: { valueInputOption: "USER_ENTERED", data: updates },
       });
     }
+    if (spreadsheetId === process.env.MASTER_SHEET_ID) await _mirrorV2("mirrorUpdateClient", pageHandles, oldClient, newClient);
     return updates.length;
   } else {
     // Per-page sheet: A=client. Match + rewrite col A.
@@ -1287,6 +1325,10 @@ async function deleteAdRows(spreadsheetId, tabName, pageHandles, clientName, isM
     requestBody: { requests },
   });
 
+  if (isMasterSheet && spreadsheetId === process.env.MASTER_SHEET_ID) {
+    await _mirrorV2("mirrorDelete", pageHandles, clientName, { dateFilter: opts.dateFilter });
+  }
+
   return rowsToDelete.length;
 }
 
@@ -1352,6 +1394,12 @@ async function deleteRowsByNumber(spreadsheetId, tabName, items, opts = {}) {
       })),
     },
   });
+  if (opts.isMasterSheet && spreadsheetId === process.env.MASTER_SHEET_ID) {
+    const pages     = [...new Set(items.map((it) => it && it.page).filter(Boolean))];
+    const anyClient = (items.find((it) => it && it.client) || {}).client;
+    const anyDate   = (items.find((it) => it && it.date) || {}).date;
+    await _mirrorV2("mirrorDelete", pages, anyClient, { dateFilter: anyDate });
+  }
   return { deleted: uniq.length, stale };
 }
 
