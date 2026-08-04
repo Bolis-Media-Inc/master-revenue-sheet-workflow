@@ -247,6 +247,12 @@ async function handleAuditCommand(ctx) {
         }
 
         for (const handle of cmd.handles) {
+          // Single-destination mode: per-page chats are off; the creative stays in
+          // Internal Network Ads (where /audit runs) rather than forwarding out.
+          if (process.env.RESULTS_CHAT_ID) {
+            replyLines.push(`✅ Creative kept in Internal Network Ads for @${handle}`);
+            continue;
+          }
           const destChatId = pagesRegistry.getChatId(handle);
 
           if (!destChatId || PLACEHOLDER_PATTERN.test(String(destChatId))) {

@@ -122,19 +122,24 @@ async function handleCreativeReply(ctx) {
   }
 
   const destChatId = pagesRegistry.getChatId(canonical);
-  if (!destChatId) {
-    await ctx.reply(`⚠️ No destination chat configured for @${canonical}.`,
-      { reply_to_message_id: msg.message_id }).catch(() => {});
-    return true;
-  }
+  // Single-destination mode: per-page chats are off and the creative is already
+  // in Internal Network Ads (where it was replied) — record it below, don't
+  // re-forward it to a per-page chat.
+  if (!process.env.RESULTS_CHAT_ID) {
+    if (!destChatId) {
+      await ctx.reply(`⚠️ No destination chat configured for @${canonical}.`,
+        { reply_to_message_id: msg.message_id }).catch(() => {});
+      return true;
+    }
 
-  // Forward the creative to the page's chat (preserves the original file).
-  try {
-    await ctx.telegram.forwardMessage(String(destChatId), ctx.chat.id, msg.message_id);
-  } catch (err) {
-    await ctx.reply(`❌ Couldn't forward to @${canonical}: ${err.message}`,
-      { reply_to_message_id: msg.message_id }).catch(() => {});
-    return true;
+    // Forward the creative to the page's chat (preserves the original file).
+    try {
+      await ctx.telegram.forwardMessage(String(destChatId), ctx.chat.id, msg.message_id);
+    } catch (err) {
+      await ctx.reply(`❌ Couldn't forward to @${canonical}: ${err.message}`,
+        { reply_to_message_id: msg.message_id }).catch(() => {});
+      return true;
+    }
   }
 
   await ctx.reply(`✅ Added creative → @${canonical}`,
