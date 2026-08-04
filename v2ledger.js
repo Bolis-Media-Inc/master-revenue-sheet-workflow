@@ -40,6 +40,10 @@ function parseDate(raw) {
 }
 const normPage   = (h) => `@${String(h || "").toLowerCase().replace(/^@+/, "")}`;
 const normClient = (c) => String(c || "").trim().toLowerCase();
+// Synthetic Placement ID for bot-written rows (col A is cosmetic — mutations match by page+client).
+function placementId_(page, dateStr) {
+  return `BOT-${String(page || "").replace(/^@/, "")}-${String(dateStr || "").replace(/\//g, "")}`;
+}
 
 // Map a master A–K row array → a v2 A–P row array. Returns null for non-placement rows.
 function mapMasterRowToV2(mr) {
@@ -56,7 +60,7 @@ function mapMasterRowToV2(mr) {
   const isClip   = price === 0;
   const d        = parseDate(dateText);
   return [
-    "",                             // A ID (mutations match by content, so a stable id isn't needed)
+    placementId_(page, d ? d.dateStr : dateText),  // A ID (synthetic; mutations match by content anyway)
     client,                         // B Client
     adType,                         // C Ad Type
     client,                         // D Campaign (= client, matches the prior pull convention)
@@ -68,18 +72,48 @@ function mapMasterRowToV2(mr) {
     price,                          // J Price
     status,                         // K Status
     d ? d.ym : "",                  // L Month (yyyy-mm; col preformatted '@' in the Ledger → stays text)
-    "",                             // M Post Type (master doesn't carry it)
+    "",                             // M Post Type (not on the master tab — filled via the parsed item)
     nif,                            // N Post Duration (NIF)
     "Bot",                          // O Source
     isClip ? "Unattributed" : "",   // P Clip Status ($0 clips flow into the workbench)
   ];
 }
 
+// Map the RICH parsed brief item (what buildRow/buildPageRow receive) → v2 A–P row. This has Post Type
+// and Post Duration, which the master sheet row lacks — so bot-written rows come out fully populated.
+function mapParsedToV2(p) {
+  const client = String(p.client || "").trim();
+  if (!client) return null;
+  const price  = (typeof p.adPrice === "number") ? p.adPrice : parsePrice(p.adPrice);
+  const isClip = price === 0;
+  const page   = normPage(p.pageHandle);
+  const d      = parseDate(p.datePosted);
+  return [
+    placementId_(page, d ? d.dateStr : p.datePosted),  // A ID
+    client,                                  // B Client
+    p.category || "",                        // C Ad Type
+    client,                                  // D Campaign
+    p.bulkNum || "",                         // E Instance
+    isClip,                                  // F Clipping?
+    d ? d.dateStr : (p.datePosted || ""),    // G Date
+    p.timeMST || "",                         // H Time
+    page,                                    // I Page
+    price,                                   // J Price
+    p.status || "",                          // K Status
+    d ? d.ym : "",                           // L Month
+    p.postType || "",                        // M Post Type
+    p.postDuration || p.nif || "",           // N Post Duration
+    "Bot",                                   // O Source
+    isClip ? "Unattributed" : "",            // P Clip Status
+  ];
+}
+
 // ── mirror: APPEND ───────────────────────────────────────────────────────────
-async function mirrorAppend(masterRow) {
+async function mirrorAppend(masterRow, rich) {
   if (!enabled()) return;
   try {
-    const v2Row = mapMasterRowToV2(masterRow);
+    // Prefer the rich parsed item (has Post Type / Duration); fall back to the master row.
+    const v2Row = rich ? mapParsedToV2(rich) : mapMasterRowToV2(masterRow);
     if (!v2Row) return;
     const { appendRow } = require("./sheets");
     await appendRow(v2Id(), LEDGER_TAB, v2Row, { anchorColumn: "B", endColumn: "P" });
@@ -194,6 +228,6 @@ async function mirrorDelete(pageHandles, clientName, opts = {}) {
 }
 
 module.exports = {
-  enabled, mapMasterRowToV2,
+  enabled, mapMasterRowToV2, mapParsedToV2,
   mirrorAppend, mirrorUpdatePrice, mirrorUpdateClient, mirrorUpdateDate, mirrorUpdateStatusToLive, mirrorDelete,
 };

@@ -256,7 +256,7 @@ async function appendRow(spreadsheetId, tabName, rowValues, opts = {}) {
   // (not per-page sheets, reminders, or day-divider rows). Fail-open.
   if (spreadsheetId === process.env.MASTER_SHEET_ID &&
       tabName === (process.env.SHEET_TAB_NAME || "2026 Ad Overview")) {
-    await _mirrorV2("mirrorAppend", rowValues);
+    await _mirrorV2("mirrorAppend", rowValues, opts.v2);
   }
 
   return targetRow;

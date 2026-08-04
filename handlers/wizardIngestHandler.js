@@ -146,7 +146,11 @@ async function ingestWizardBrief(telegram, payload) {
         brief.nif || "",                                                 // K: NIF
       ];
       try {
-        const rowNum = await appendRow(MASTER_SHEET_ID, TAB_NAME, row);
+        const rowNum = await appendRow(MASTER_SHEET_ID, TAB_NAME, row, { v2: {
+          client: brief.client, category: brief.category, datePosted: brief.date_posted,
+          timeMST: brief.time_mst, pageHandle: handle, bulkNum: p.bulk_num, adPrice: p.price,
+          status: "Scheduled", nif: brief.nif, postType: brief.post_type, postDuration: brief.post_duration,
+        } });
         if (rowNum) {
           writes.master_rows++;
           masterRowsToFormat.push(rowNum);

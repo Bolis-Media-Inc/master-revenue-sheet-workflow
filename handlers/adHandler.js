@@ -1441,7 +1441,7 @@ async function handleReplayCommand(ctx) {
         // Master sheet backfill
         if (MASTER_SHEET_ID && !dbPage.master_sheet_row && !PLACEHOLDER_PATTERN.test(MASTER_SHEET_ID)) {
           try {
-            const rowNum = await appendRow(MASTER_SHEET_ID, TAB_NAME, buildRow(parsedItem));
+            const rowNum = await appendRow(MASTER_SHEET_ID, TAB_NAME, buildRow(parsedItem), { v2: parsedItem });
             if (rowNum) {
               adBriefs.updatePageSheetRows(dbPage.id, { masterSheetRow: rowNum }).catch(() => {});
               // Center-align the backfilled row to match the rest of the sheet
@@ -1616,7 +1616,7 @@ async function handleSyncSheetsCommand(ctx) {
     // ── Master sheet backfill ───────────────────────────────────────────
     if (!row.master_sheet_row && MASTER_SHEET_ID && !PLACEHOLDER_PATTERN.test(MASTER_SHEET_ID)) {
       try {
-        const rowNum = await appendRow(MASTER_SHEET_ID, TAB_NAME, buildRow(parsedItem));
+        const rowNum = await appendRow(MASTER_SHEET_ID, TAB_NAME, buildRow(parsedItem), { v2: parsedItem });
         if (rowNum) {
           await adBriefs.updatePageSheetRows(row.id, { masterSheetRow: rowNum });
           applyCenterAlignmentBatch(MASTER_SHEET_ID, TAB_NAME, [rowNum], "K").catch(() => {});
@@ -3782,7 +3782,7 @@ async function handleAdMessage(ctx) {
       for (const item of parsedList) {
         const row = buildRow(item);
         try {
-          const rowNumber = await appendRow(MASTER_SHEET_ID, TAB_NAME, row);
+          const rowNumber = await appendRow(MASTER_SHEET_ID, TAB_NAME, row, { v2: item });
           successCount++;
           if (rowNumber) masterRowsToFormat.push(rowNumber);
           if (item.pageHandle && rowNumber) {
