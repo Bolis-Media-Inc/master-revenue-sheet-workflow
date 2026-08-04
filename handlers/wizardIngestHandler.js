@@ -210,30 +210,48 @@ async function ingestWizardBrief(telegram, payload) {
   // file_ids are bot-scoped so re-sending via sendDocument doesn't work
   // either. User accounts aren't subject to that filter, so Greg does it
   // post-handoff via userClient.forwardMessages.
-  for (const p of pages) {
-    const handle = String(p.handle).toLowerCase();
-    const canonicalHandle = pagesRegistry.resolveHandle(handle) || handle;
-    const destChatId = pagesRegistry.getChatId(canonicalHandle);
-    if (!destChatId || PLACEHOLDER_PATTERN.test(String(destChatId))) {
-      errors.push(`no chat_id for @${handle}`);
-      continue;
-    }
-
+  const RESULTS_CHAT_ID = process.env.RESULTS_CHAT_ID;
+  if (RESULTS_CHAT_ID) {
+    // Single-destination mode: send the FULL brief ONCE to the results chat (a
+    // per-brief feed the team replies to with insights), not per-page. Then mark
+    // every page forwarded so the books/DB match.
     try {
-      const perPageBrief = buildPerPageBrief(brief, p);
-      await telegram.sendMessage(String(destChatId), perPageBrief);
+      await telegram.sendMessage(String(RESULTS_CHAT_ID), brief.raw_text || buildPerPageBrief(brief, pages[0] || {}));
       writes.forwarded_chats++;
-      // Mark forwarded — Greg's userClient takes care of media+caption next
-      const pageRowId = pageRowIdByHandle.get(handle);
-      if (pageRowId) {
-        await adBriefs.markPageForwarded(pageRowId, {}).catch(() => {});
-      }
     } catch (err) {
-      errors.push(`brief → @${handle}: ${err.message}`);
-      console.error(`[ingest-wizard-brief] ❌ Brief send → @${handle}: ${err.message}`);
-      const pageRowId = pageRowIdByHandle.get(handle);
-      if (pageRowId) {
-        await adBriefs.markPageForwardError(pageRowId, err.message).catch(() => {});
+      errors.push(`brief → results: ${err.message}`);
+      console.error(`[ingest-wizard-brief] ❌ Brief → results: ${err.message}`);
+    }
+    for (const p of pages) {
+      const pageRowId = pageRowIdByHandle.get(String(p.handle).toLowerCase());
+      if (pageRowId) await adBriefs.markPageForwarded(pageRowId, {}).catch(() => {});
+    }
+  } else {
+    for (const p of pages) {
+      const handle = String(p.handle).toLowerCase();
+      const canonicalHandle = pagesRegistry.resolveHandle(handle) || handle;
+      const destChatId = pagesRegistry.getChatId(canonicalHandle);
+      if (!destChatId || PLACEHOLDER_PATTERN.test(String(destChatId))) {
+        errors.push(`no chat_id for @${handle}`);
+        continue;
+      }
+
+      try {
+        const perPageBrief = buildPerPageBrief(brief, p);
+        await telegram.sendMessage(String(destChatId), perPageBrief);
+        writes.forwarded_chats++;
+        // Mark forwarded — Greg's userClient takes care of media+caption next
+        const pageRowId = pageRowIdByHandle.get(handle);
+        if (pageRowId) {
+          await adBriefs.markPageForwarded(pageRowId, {}).catch(() => {});
+        }
+      } catch (err) {
+        errors.push(`brief → @${handle}: ${err.message}`);
+        console.error(`[ingest-wizard-brief] ❌ Brief send → @${handle}: ${err.message}`);
+        const pageRowId = pageRowIdByHandle.get(handle);
+        if (pageRowId) {
+          await adBriefs.markPageForwardError(pageRowId, err.message).catch(() => {});
+        }
       }
     }
   }

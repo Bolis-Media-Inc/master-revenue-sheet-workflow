@@ -1318,19 +1318,37 @@ async function handleReplayCommand(ctx) {
   const errors = [];
   const forwardedDestinations = new Set();
 
+  // Single-destination mode: re-forward the brief ONCE to the results chat
+  // instead of per-page. Per-page sends + prior-forward cleanup are skipped
+  // below; sheet backfill still runs for every page.
+  const RESULTS_CHAT_ID = process.env.RESULTS_CHAT_ID;
+  const singleDest = !!RESULTS_CHAT_ID;
+  let resultsBriefMsgId = null;
+  if (singleDest) {
+    try {
+      const sent = briefMessageId
+        ? await ctx.telegram.forwardMessage(String(RESULTS_CHAT_ID), sourceChatId, briefMessageId)
+        : (briefText ? await ctx.telegram.sendMessage(String(RESULTS_CHAT_ID), briefText) : null);
+      resultsBriefMsgId = sent?.message_id ?? null;
+      console.log(`[adHandler] ✅ /replay results: forwarded brief → ${RESULTS_CHAT_ID}`);
+    } catch (e) {
+      console.error(`[adHandler] ❌ /replay results forward (non-fatal): ${e.message}`);
+    }
+  }
+
   for (const handle of ready) {
-    const destChatId = String(pagesRegistry.getChatId(handle));
-    if (forwardedDestinations.has(destChatId)) {
+    const destChatId = singleDest ? String(RESULTS_CHAT_ID) : String(pagesRegistry.getChatId(handle));
+    if (!singleDest && forwardedDestinations.has(destChatId)) {
       console.log(`[adHandler]    ⏭️ /replay: skipping @${handle} — dest ${destChatId} already covered`);
       continue;
     }
-    forwardedDestinations.add(destChatId);
+    if (!singleDest) forwardedDestinations.add(destChatId);
 
     // Clean delete + resend: remove the bot's prior forwards for this
     // campaign in this page's chat BEFORE re-sending, so the page ends up
     // with exactly one correct copy (not the junk + the fix stacked).
     const replayClient = (parsedList?.[0]?.client) || dbBriefForBackfill?.client || null;
-    await deletePriorCampaignForwards(ctx.telegram, sourceChatId, replayClient, handle, destChatId);
+    if (!singleDest) await deletePriorCampaignForwards(ctx.telegram, sourceChatId, replayClient, handle, destChatId);
 
     // Collect ids we send this pass so we can persist the fresh set (and so
     // a future /replay or /update targets the right messages).
@@ -1351,6 +1369,11 @@ async function handleReplayCommand(ctx) {
     const dbSharedCaption  = !sharedBundle.caption && dbBriefForBackfill?.shared_caption || null;
 
     try {
+      if (singleDest) {
+        // Brief already forwarded once to the results chat above — skip all
+        // per-page sends; the sheet backfill below still runs.
+        if (resultsBriefMsgId) replayIds.push(resultsBriefMsgId);
+      } else {
       // 1. Per-page media — buffer (forwardMessage) OR DB (sendByKind)
       for (const m of perPageBundle.media) {
         try {
@@ -1404,6 +1427,7 @@ async function handleReplayCommand(ctx) {
         ctx.telegram, sourceChatId, briefMessageId, briefText, destChatId, handle, parsedItem,
       );
       if (replayBriefMsgId) replayIds.push(replayBriefMsgId); // brief last → updateHandler reads [length-1]
+      }
 
       // ── Backfill missing sheet rows ─────────────────────────────────────
       // If the original processing missed a sheet write (quota error,
