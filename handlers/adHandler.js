@@ -4396,8 +4396,32 @@ async function handleAdMessage(ctx) {
       const masterRowsToMark = [];
       const remindersToQueue = [];
 
+      // ── Single-destination mode ────────────────────────────────────────────
+      // When RESULTS_CHAT_ID is set, we STOP per-page forwarding entirely and
+      // instead forward the original brief + its shared media ONCE into the
+      // "Internal Network Ads results" chat. All sheet/DB writes (done above in
+      // Phase A) are untouched. The per-page loop below still runs so each page
+      // gets its DB "forwarded" mark, master "Forwarded" tick, and NIF reminder —
+      // it just skips the Telegram sends. The single results message-id is stored
+      // as each page's brief id so /update edits retarget to it. Fail-open.
+      const RESULTS_CHAT_ID = process.env.RESULTS_CHAT_ID;
+      const singleDest = !!RESULTS_CHAT_ID;
+      let resultsBriefMsgId = null;
+      if (singleDest) {
+        // Forward ONLY the brief text into the results chat — it's a per-brief
+        // feed the team replies to with ad-insight screenshots, NOT a mirror of
+        // all creatives. Media/covers are not copied here.
+        try {
+          const sent = await ctx.telegram.forwardMessage(String(RESULTS_CHAT_ID), sourceChatId, adMessageId);
+          resultsBriefMsgId = sent?.message_id ?? null;
+          console.log(`[adHandler] ✅ results: forwarded brief → ${RESULTS_CHAT_ID}`);
+        } catch (e) {
+          console.error(`[adHandler] ❌ results forward (non-fatal): ${e.message}`);
+        }
+      }
+
       for (const handle of uniqueHandles) {
-        const destChatId = pagesRegistry.getChatId(handle);
+        const destChatId = singleDest ? RESULTS_CHAT_ID : pagesRegistry.getChatId(handle);
 
         if (!destChatId || PLACEHOLDER_PATTERN.test(String(destChatId))) {
           console.warn(`[adHandler] ⚠️ No Telegram destination configured for @${handle} — skipping forward`);
@@ -4405,14 +4429,16 @@ async function handleAdMessage(ctx) {
           continue;
         }
 
-        // Dedup by destination chat — skip if we already forwarded the ad brief to this channel
+        // Dedup by destination chat — skip if we already forwarded the ad brief to
+        // this channel. In single-dest mode every page shares the results chat, so
+        // dedup would drop all but the first page's bookkeeping — bypass it there.
         const destKey = String(destChatId);
-        if (forwardedDestinations.has(destKey)) {
+        if (!singleDest && forwardedDestinations.has(destKey)) {
           console.log(`[adHandler] ⏭️ Skipping @${handle} — ad already forwarded to ${destKey}`);
           forwardSkipped++;
           continue;
         }
-        forwardedDestinations.add(destKey);
+        if (!singleDest) forwardedDestinations.add(destKey);
 
         // Collect EVERY message id we send to this page (covers, shared
         // slides, caption, brief) so a later /replay can delete the whole
@@ -4434,7 +4460,10 @@ async function handleAdMessage(ctx) {
         // bundle is in effect (collab / filename / label). In standard
         // fallback every page receives the same shared bundle by design,
         // so "no per-page creative" isn't a missing-creative bug.
-        if (perPageMedia.length === 0 && isAttributed) {
+        if (singleDest) {
+          // Single-destination mode: per-page media already went once to the
+          // results chat above — no per-page media send here.
+        } else if (perPageMedia.length === 0 && isAttributed) {
           // We HAVE attribution data but this specific handle isn't in
           // byHandle. Operator typo'd the label / host line, OR the page
           // was added to the brief but its creative wasn't included.
@@ -4457,7 +4486,7 @@ async function handleAdMessage(ctx) {
 
         // 2️⃣ Forward shared media (slides 2-4 for ALL pages, etc.)
         // Same set to every destination, in original chronological order.
-        if (sharedBundle.media.length > 0) {
+        if (!singleDest && sharedBundle.media.length > 0) {
           for (const mediaMsg of sharedBundle.media) {
             try {
               const sent = await ctx.telegram.forwardMessage(String(destChatId), sourceChatId, mediaMsg.message_id);
@@ -4478,7 +4507,7 @@ async function handleAdMessage(ctx) {
         const _ppCap = perPageCaption && !isBareHandleCaption(perPageCaption) ? perPageCaption : null;
         const _shCap = sharedBundle.caption && !isBareHandleCaption(sharedBundle.caption) ? sharedBundle.caption : null;
         const captionToSend = _ppCap || _shCap;
-        if (captionToSend) {
+        if (!singleDest && captionToSend) {
           try {
             const sent = await ctx.telegram.sendMessage(String(destChatId), captionToSend);
             if (sent?.message_id) forwardedIds.push(sent.message_id);
@@ -4493,15 +4522,22 @@ async function handleAdMessage(ctx) {
           // Find the parsed item for THIS handle so the per-page brief
           // rewrite can use the right price + bulkNum + nif.
           const parsedItem = parsedList.find((p) => p.pageHandle === handle);
-          const briefFwdMsgId = await forwardToPage(
-            ctx.telegram,
-            sourceChatId,
-            adMessageId,
-            ctx.message?.text || ctx.message?.caption || "",
-            String(destChatId),
-            handle,
-            parsedItem
-          );
+          let briefFwdMsgId;
+          if (singleDest) {
+            // Brief already forwarded once to the results chat — reuse that id so
+            // /update edits (which read the LAST forwarded id) retarget to it.
+            briefFwdMsgId = resultsBriefMsgId;
+          } else {
+            briefFwdMsgId = await forwardToPage(
+              ctx.telegram,
+              sourceChatId,
+              adMessageId,
+              ctx.message?.text || ctx.message?.caption || "",
+              String(destChatId),
+              handle,
+              parsedItem
+            );
+          }
           if (briefFwdMsgId) forwardedIds.push(briefFwdMsgId);
           forwardOk++;
 
