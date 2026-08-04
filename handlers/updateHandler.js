@@ -64,7 +64,9 @@ async function _editForwardedBriefs(ctx, brief, pages, mutator) {
     if (!p.forwarded_message_ids || p.forwarded_message_ids.length === 0) {
       skipped++; continue;
     }
-    const destChatId = pagesRegistry.getChatId(p.page_handle);
+    // Single-destination mode: the brief now lives in the results chat (its id
+    // is stored as the page's forwarded id), so edits retarget there.
+    const destChatId = process.env.RESULTS_CHAT_ID || pagesRegistry.getChatId(p.page_handle);
     if (!destChatId) { skipped++; continue; }
     // The brief forward is the LAST forwarded message (sent after the media).
     const briefFwdMsgId = p.forwarded_message_ids[p.forwarded_message_ids.length - 1];
