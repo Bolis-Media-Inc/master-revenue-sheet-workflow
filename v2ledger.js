@@ -40,6 +40,9 @@ function parseDate(raw) {
 }
 const normPage   = (h) => `@${String(h || "").toLowerCase().replace(/^@+/, "")}`;
 const normClient = (c) => String(c || "").trim().toLowerCase();
+// Post Duration must be a real duration (Permanent/24hr/…), NOT a NIF timing — the master's NIF value
+// isn't valid for the Ledger's dropdown (shows a red flag). Drop anything NIF-ish → blank.
+const cleanDur_  = (v) => { v = String(v || "").trim(); return /nif/i.test(v) ? "" : v; };
 // Synthetic Placement ID for bot-written rows (col A is cosmetic — mutations match by page+client).
 function placementId_(page, dateStr) {
   return `BOT-${String(page || "").replace(/^@/, "")}-${String(dateStr || "").replace(/\//g, "")}`;
@@ -73,7 +76,7 @@ function mapMasterRowToV2(mr) {
     status,                         // K Status
     d ? d.ym : "",                  // L Month (yyyy-mm; col preformatted '@' in the Ledger → stays text)
     "",                             // M Post Type (not on the master tab — filled via the parsed item)
-    nif,                            // N Post Duration (NIF)
+    cleanDur_(nif),                 // N Post Duration (NIF-ish → blank; master has no real duration)
     "Bot",                          // O Source
     isClip ? "Unattributed" : "",   // P Clip Status ($0 clips flow into the workbench)
   ];
@@ -102,7 +105,7 @@ function mapParsedToV2(p) {
     p.status || "",                          // K Status
     d ? d.ym : "",                           // L Month
     p.postType || "",                        // M Post Type
-    p.postDuration || p.nif || "",           // N Post Duration
+    cleanDur_(p.postDuration),               // N Post Duration (real duration only — no NIF)
     "Bot",                                   // O Source
     isClip ? "Unattributed" : "",            // P Clip Status
   ];
