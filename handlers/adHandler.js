@@ -4432,13 +4432,18 @@ async function handleAdMessage(ctx) {
       const singleDest = !!RESULTS_CHAT_ID;
       let resultsBriefMsgId = null;
       if (singleDest) {
-        // Forward ONLY the brief text into the results chat — it's a per-brief
-        // feed the team replies to with ad-insight screenshots, NOT a mirror of
-        // all creatives. Media/covers are not copied here.
+        // Send ALL the creative posted with this brief — no attribution parsing,
+        // just every media message back to the previous brief — then the brief last.
         try {
+          const allBundle = getStandardBundle(sourceChatId, adMessageId);
+          const creativeIds = (allBundle?.media || []).map((m) => m && m.message_id).filter(Boolean);
+          for (const mid of creativeIds) {
+            try { await ctx.telegram.forwardMessage(String(RESULTS_CHAT_ID), sourceChatId, mid); }
+            catch (e) { console.error(`[adHandler] ❌ results creative ${mid}: ${e.message}`); }
+          }
           const sent = await ctx.telegram.forwardMessage(String(RESULTS_CHAT_ID), sourceChatId, adMessageId);
           resultsBriefMsgId = sent?.message_id ?? null;
-          console.log(`[adHandler] ✅ results: forwarded brief → ${RESULTS_CHAT_ID}`);
+          console.log(`[adHandler] ✅ results: forwarded ${creativeIds.length} creative(s) + brief → ${RESULTS_CHAT_ID}`);
         } catch (e) {
           console.error(`[adHandler] ❌ results forward (non-fatal): ${e.message}`);
         }
