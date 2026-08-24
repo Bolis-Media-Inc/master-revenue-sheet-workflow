@@ -144,13 +144,14 @@ async function sheetsClient() {
  * avoid a circular-require race with v2ledger.js.
  */
 async function _mirrorV2(method, ...args) {
-  if (!process.env.V2_LEDGER_ID) return;
+  if (!process.env.V2_LEDGER_ID) return undefined;
   try {
     const v2 = require("./v2ledger");
-    if (typeof v2[method] === "function") await v2[method](...args);
+    if (typeof v2[method] === "function") return await v2[method](...args);
   } catch (err) {
     console.error(`[sheets] v2 mirror ${method} (non-fatal): ${err.message}`);
   }
+  return undefined;
 }
 
 /**
@@ -256,7 +257,11 @@ async function appendRow(spreadsheetId, tabName, rowValues, opts = {}) {
   // (not per-page sheets, reminders, or day-divider rows). Fail-open.
   if (spreadsheetId === process.env.MASTER_SHEET_ID &&
       tabName === (process.env.SHEET_TAB_NAME || "2026 Ad Overview")) {
-    await _mirrorV2("mirrorAppend", rowValues, opts.v2);
+    // Capture the Ledger row the mirror wrote and hand it back on `opts` so the
+    // caller can persist it (ad_brief_pages.ledger_sheet_row) — the key that
+    // makes a later /remove delete THIS exact Ledger row, not a same-day twin.
+    const ledgerRow = await _mirrorV2("mirrorAppend", rowValues, opts.v2);
+    if (opts && typeof ledgerRow === "number") opts.v2LedgerRow = ledgerRow;
   }
 
   return targetRow;
@@ -1395,10 +1400,22 @@ async function deleteRowsByNumber(spreadsheetId, tabName, items, opts = {}) {
     },
   });
   if (opts.isMasterSheet && spreadsheetId === process.env.MASTER_SHEET_ID) {
-    const pages     = [...new Set(items.map((it) => it && it.page).filter(Boolean))];
-    const anyClient = (items.find((it) => it && it.client) || {}).client;
-    const anyDate   = (items.find((it) => it && it.date) || {}).date;
-    await _mirrorV2("mirrorDelete", pages, anyClient, { dateFilter: anyDate });
+    // Precise Ledger takedown: items carrying a known ledgerRow delete THAT exact
+    // row (content-verified) — so an identical same-day twin, on a different
+    // Ledger row, is never touched. Items without one (legacy rows written before
+    // ledger_sheet_row existed) fall back to the content-match delete for just
+    // their pages. Both fail-open.
+    const precise = items
+      .filter((it) => it && Number(it.ledgerRow) > 0)
+      .map((it) => ({ row: Number(it.ledgerRow), client: it.client, date: it.date, page: it.page }));
+    const legacy  = items.filter((it) => it && !(Number(it.ledgerRow) > 0));
+    if (precise.length) await _mirrorV2("mirrorDeleteRows", precise);
+    if (legacy.length) {
+      const pages     = [...new Set(legacy.map((it) => it && it.page).filter(Boolean))];
+      const anyClient = (legacy.find((it) => it && it.client) || {}).client;
+      const anyDate   = (legacy.find((it) => it && it.date) || {}).date;
+      if (pages.length) await _mirrorV2("mirrorDelete", pages, anyClient, { dateFilter: anyDate });
+    }
   }
   return { deleted: uniq.length, stale };
 }

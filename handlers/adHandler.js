@@ -1214,7 +1214,11 @@ async function handleReplayCommand(ctx) {
   // have a DB row, refuse to re-forward — would just blast wrong covers
   // again. Operator runs /resolve to assign first; Phase 3 (resolveHandler)
   // re-forwards with the correct mapping when assignments complete.
-  if (dbBriefForBackfill?.id && adBriefs._supabase) {
+  //
+  // Single-destination mode (RESULTS_CHAT_ID set): creative is forwarded once
+  // to the Results feed as-is, never per-page — there's no cover→page mapping
+  // to resolve, so skip the whole pause gate and forward directly below.
+  if (!process.env.RESULTS_CHAT_ID && dbBriefForBackfill?.id && adBriefs._supabase) {
     const briefHandleCountRpl = ready.length;
     const useFilenamesRpl  = format === "filename";
     const isStandardRpl    = format === "standard";
@@ -1441,9 +1445,10 @@ async function handleReplayCommand(ctx) {
         // Master sheet backfill
         if (MASTER_SHEET_ID && !dbPage.master_sheet_row && !PLACEHOLDER_PATTERN.test(MASTER_SHEET_ID)) {
           try {
-            const rowNum = await appendRow(MASTER_SHEET_ID, TAB_NAME, buildRow(parsedItem), { v2: parsedItem });
+            const appendOpts = { v2: parsedItem };
+            const rowNum = await appendRow(MASTER_SHEET_ID, TAB_NAME, buildRow(parsedItem), appendOpts);
             if (rowNum) {
-              adBriefs.updatePageSheetRows(dbPage.id, { masterSheetRow: rowNum }).catch(() => {});
+              adBriefs.updatePageSheetRows(dbPage.id, { masterSheetRow: rowNum, ledgerSheetRow: appendOpts.v2LedgerRow ?? null }).catch(() => {});
               // Center-align the backfilled row to match the rest of the sheet
               applyCenterAlignmentBatch(MASTER_SHEET_ID, TAB_NAME, [rowNum], "K")
                 .catch(() => {});
@@ -1616,9 +1621,10 @@ async function handleSyncSheetsCommand(ctx) {
     // ── Master sheet backfill ───────────────────────────────────────────
     if (!row.master_sheet_row && MASTER_SHEET_ID && !PLACEHOLDER_PATTERN.test(MASTER_SHEET_ID)) {
       try {
-        const rowNum = await appendRow(MASTER_SHEET_ID, TAB_NAME, buildRow(parsedItem), { v2: parsedItem });
+        const appendOpts = { v2: parsedItem };
+        const rowNum = await appendRow(MASTER_SHEET_ID, TAB_NAME, buildRow(parsedItem), appendOpts);
         if (rowNum) {
-          await adBriefs.updatePageSheetRows(row.id, { masterSheetRow: rowNum });
+          await adBriefs.updatePageSheetRows(row.id, { masterSheetRow: rowNum, ledgerSheetRow: appendOpts.v2LedgerRow ?? null });
           applyCenterAlignmentBatch(MASTER_SHEET_ID, TAB_NAME, [rowNum], "K").catch(() => {});
           masterWritten++;
           console.log(`[adHandler] 🩹 /syncsheets: master row ${rowNum} → ${brief.client} / @${row.page_handle}`);
@@ -3525,24 +3531,57 @@ async function handleAdMessage(ctx) {
           .catch((err) => console.error(`[adBriefs] markPagesPosted: ${err.message}`));
 
         if (overrideDate) {
-          // Master sheet: update column D for matching client + handle rows
+          // GUARD (added after the Aug-2026 clobber): updateAdDate matches rows
+          // by client + page, so if this campaign has MORE THAN ONE placement on
+          // a page, a dated "Posted on" repins EVERY one of them to this single
+          // date. That's what silently overwrote ~260 FashionNova rows + the
+          // Karam ones (every real date replaced). So only apply the date
+          // override when the match is unambiguous (≤ one placement per page);
+          // otherwise skip the date write (Status→Live already ran) and warn.
+          // Fails SAFE — any error in the check → treat as ambiguous → don't write.
+          let ambiguousDate = false;
           try {
-            const dated = await updateAdDate(MASTER_SHEET_ID, TAB_NAME, handles, clientName, overrideDate, true);
-            console.log(`[adHandler] ✅ "Posted on" date override → "${overrideDate}" on ${dated} master row(s)`);
+            if (adBriefs._supabase && clientName && handles.length) {
+              const { count } = await adBriefs._supabase
+                .from("ad_brief_pages")
+                .select("id, ad_briefs!inner(client)", { count: "exact", head: true })
+                .eq("ad_briefs.client", clientName)
+                .in("page_handle", handles.map((h) => h.toLowerCase()));
+              if ((count || 0) > handles.length) ambiguousDate = true;
+            }
           } catch (err) {
-            console.error(`[adHandler] ❌ "Posted on" date update (master): ${err.message}`);
+            ambiguousDate = true;
+            console.error(`[adHandler] Posted-on ambiguity check failed — skipping date override to be safe: ${err.message}`);
           }
 
-          // Per-page sheets: update column D where this handle has a sheet
-          for (const handle of handles) {
-            if (!isPageEnabled(handle)) continue;
-            const sheetId = pagesRegistry.getSheetId(handle);
-            if (!sheetId || PLACEHOLDER_PATTERN.test(sheetId)) continue;
+          if (ambiguousDate) {
+            console.warn(`[adHandler] ⚠️ Posted-on date override SKIPPED — "${clientName}" has multiple placements on ${handles.join(", ")}; refusing to bulk-repin dates.`);
+            ctx.reply(
+              `⚠️ Date *not* changed — "${clientName}" has multiple placements on ${handles.map((h) => "@" + h).join(", ")}.\n` +
+              `A dated "Posted on" would repin *all* of them to ${overrideDate} (this is the bug that clobbered FashionNova), so I skipped the date write. ` +
+              `Status was still set to Live — fix the one date by hand if it's really wrong.`,
+              { parse_mode: "Markdown" },
+            ).catch(() => {});
+          } else {
+            // Master sheet: update column D for matching client + handle rows
             try {
-              const dated = await updateAdDate(sheetId, PAGE_TAB_NAME, [handle], clientName, overrideDate, false);
-              console.log(`[adHandler] ✅ "Posted on" date override → "${overrideDate}" on ${dated} @${handle} sheet row(s)`);
+              const dated = await updateAdDate(MASTER_SHEET_ID, TAB_NAME, handles, clientName, overrideDate, true);
+              console.log(`[adHandler] ✅ "Posted on" date override → "${overrideDate}" on ${dated} master row(s)`);
             } catch (err) {
-              console.error(`[adHandler] ❌ "Posted on" date update (@${handle}): ${err.message}`);
+              console.error(`[adHandler] ❌ "Posted on" date update (master): ${err.message}`);
+            }
+
+            // Per-page sheets: update column D where this handle has a sheet
+            for (const handle of handles) {
+              if (!isPageEnabled(handle)) continue;
+              const sheetId = pagesRegistry.getSheetId(handle);
+              if (!sheetId || PLACEHOLDER_PATTERN.test(sheetId)) continue;
+              try {
+                const dated = await updateAdDate(sheetId, PAGE_TAB_NAME, [handle], clientName, overrideDate, false);
+                console.log(`[adHandler] ✅ "Posted on" date override → "${overrideDate}" on ${dated} @${handle} sheet row(s)`);
+              } catch (err) {
+                console.error(`[adHandler] ❌ "Posted on" date update (@${handle}): ${err.message}`);
+              }
             }
           }
         }
@@ -3782,7 +3821,10 @@ async function handleAdMessage(ctx) {
       for (const item of parsedList) {
         const row = buildRow(item);
         try {
-          const rowNumber = await appendRow(MASTER_SHEET_ID, TAB_NAME, row, { v2: item });
+          // Hold the opts object so we can read back the Ledger row the mirror
+          // wrote (opts.v2LedgerRow) and persist it alongside master_sheet_row.
+          const appendOpts = { v2: item };
+          const rowNumber = await appendRow(MASTER_SHEET_ID, TAB_NAME, row, appendOpts);
           successCount++;
           if (rowNumber) masterRowsToFormat.push(rowNumber);
           if (item.pageHandle && rowNumber) {
@@ -3794,7 +3836,7 @@ async function handleAdMessage(ctx) {
             const pageRowId = pageRowIdByHandle.get(item.pageHandle.toLowerCase());
             if (pageRowId) {
               try {
-                await adBriefs.updatePageSheetRows(pageRowId, { masterSheetRow: rowNumber });
+                await adBriefs.updatePageSheetRows(pageRowId, { masterSheetRow: rowNumber, ledgerSheetRow: appendOpts.v2LedgerRow ?? null });
               } catch (dbErr) {
                 console.error(`[adHandler] ❌ DB persist master_sheet_row for @${item.pageHandle}: ${dbErr.message}`);
               }
@@ -4036,6 +4078,12 @@ async function handleAdMessage(ctx) {
       // monetization chat — exactly what /resolve would show. Takes precedence
       // over the cover-only ambiguity pause below.
       let multiGroupHandled = false;
+      // Single-destination mode (RESULTS_CHAT_ID set): all creative is forwarded
+      // ONCE into the Results feed as-is — there is no per-page forwarding, so
+      // there is nothing to map a cover onto. Skip the cover→page assignment
+      // machinery entirely (no /resolve session, no "needs cover assignment"
+      // pause, no team ping). This is dark whenever RESULTS_CHAT_ID is unset.
+      const skipResolve = !!process.env.RESULTS_CHAT_ID;
       try {
         const blockStruct = getBlockStructure(sourceChatId, adMessageId);
         const briefPages = [...new Set(parsedList.map((p) => p.pageHandle?.toLowerCase()).filter(Boolean))];
@@ -4053,7 +4101,7 @@ async function handleAdMessage(ctx) {
           && briefPages.length >= 2
         );
 
-        if (blockStruct && (blockStruct.isMultiGroup || multiCoverForAll) && briefRowId && adBriefs._supabase) {
+        if (!skipResolve && blockStruct && (blockStruct.isMultiGroup || multiCoverForAll) && briefRowId && adBriefs._supabase) {
           const singleGroup = blockStruct.groups.length === 1;
           const serGroups = blockStruct.groups.map((g) => ({
             key:        g.key,
@@ -4145,7 +4193,7 @@ async function handleAdMessage(ctx) {
       // Multi-group already paused + created its own (richer) session above —
       // don't ALSO run the cover-only ambiguity pause for the same brief.
       if (multiGroupHandled) isPaused = true;
-      if (!multiGroupHandled && isAmbiguousBrief && briefRowId && adBriefs._supabase) {
+      if (!skipResolve && !multiGroupHandled && isAmbiguousBrief && briefRowId && adBriefs._supabase) {
         try {
           const unattributedRefs = sharedBundle.media.map((m, i) => extractMediaRef(m)
             ? { ...extractMediaRef(m), idx: i, msg_id: m.message_id || `synth-${i}`, file_name: m.document?.file_name || m.video?.file_name || null }

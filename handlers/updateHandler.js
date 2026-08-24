@@ -643,8 +643,10 @@ async function takedownBriefPrecise(ctx, brief, briefPages) {
       stale.push(`@${norm} — no recorded per-page row`);
     }
 
-    // 3. Queue this brief's master row for one batched verified delete.
-    if (pr.master_sheet_row) masterItems.push({ row: pr.master_sheet_row, client: brief.client, date: brief.date_posted, page: norm });
+    // 3. Queue this brief's master row for one batched verified delete. Carry
+    //    the Ledger row too so the master delete's v2 mirror removes THIS exact
+    //    Ledger row (content-verified) — never a same-day twin on another row.
+    if (pr.master_sheet_row) masterItems.push({ row: pr.master_sheet_row, ledgerRow: pr.ledger_sheet_row || null, client: brief.client, date: brief.date_posted, page: norm });
 
     replies.push(`@${norm}: ${postsDeleted} post(s) · ${pgDel} sheet row`);
   }

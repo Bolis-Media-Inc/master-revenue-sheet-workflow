@@ -112,16 +112,23 @@ function mapParsedToV2(p) {
 }
 
 // ── mirror: APPEND ───────────────────────────────────────────────────────────
+// Returns the 1-indexed Ledger row it wrote (or null). The caller (sheets.js
+// appendRow) surfaces this so it can be persisted to ad_brief_pages.ledger_sheet_row
+// — the key that lets /remove delete THIS exact row later, the same way
+// master_sheet_row makes the master takedown precise.
 async function mirrorAppend(masterRow, rich) {
-  if (!enabled()) return;
+  if (!enabled()) return null;
   try {
     // Prefer the rich parsed item (has Post Type / Duration); fall back to the master row.
     const v2Row = rich ? mapParsedToV2(rich) : mapMasterRowToV2(masterRow);
-    if (!v2Row) return;
+    if (!v2Row) return null;
     const { appendRow } = require("./sheets");
-    await appendRow(v2Id(), LEDGER_TAB, v2Row, { anchorColumn: "B", endColumn: "P" });
+    // appendRow returns the row number it wrote (mirror is not re-fired: the
+    // Ledger id !== MASTER_SHEET_ID, so no recursion).
+    return await appendRow(v2Id(), LEDGER_TAB, v2Row, { anchorColumn: "B", endColumn: "P" });
   } catch (err) {
     console.error(`[v2ledger] mirrorAppend (non-fatal): ${err.message}`);
+    return null;
   }
 }
 
@@ -208,7 +215,58 @@ async function mirrorUpdateStatusToLive(pageHandles, clientName) {
   } catch (err) { console.error(`[v2ledger] mirrorUpdateStatusToLive (non-fatal): ${err.message}`); }
 }
 
+// ── mirror: DELETE exact rows (PRECISE — row + content verified) ─────────────
+// The parallel to the master takedown: delete specific Ledger row numbers, each
+// verified against its expected client/date/page before removal. Because it
+// targets a KNOWN row (ad_brief_pages.ledger_sheet_row), an identical same-day
+// twin — which lives on a DIFFERENT Ledger row — is never matched, so it can't
+// be collaterally deleted. A row whose content no longer matches (the Ledger was
+// re-sorted / rows shifted) is REPORTED as stale, never force-deleted.
+// `items`: [{ row, client, date, page }].
+async function mirrorDeleteRows(items) {
+  if (!enabled()) return { deleted: 0, stale: [] };
+  try {
+    const wanted = (items || []).filter((it) => it && Number(it.row) > 0);
+    if (!wanted.length) return { deleted: 0, stale: [] };
+    const { sheetsClient } = require("./sheets");
+    const sheets = await sheetsClient();
+    const resp = await sheets.spreadsheets.values.get({ spreadsheetId: v2Id(), range: `${LEDGER_TAB}!A:P` });
+    const rows = resp.data.values || [];
+    const dnorm = (s) => { const p = parseDate(s); return p ? p.dateStr : null; };
+    const verified = [], stale = [];
+    for (const it of wanted) {
+      const r = rows[Number(it.row) - 1];                                          // 1-indexed
+      if (!r) { stale.push({ row: it.row, found: "(out of range)" }); continue; }
+      const okClient = it.client == null || normClient(r[1]) === normClient(it.client);   // B Client
+      const okDate   = it.date   == null || dnorm(r[6]) === dnorm(it.date);               // G Date
+      const okPage   = it.page   == null || normPage(r[8]) === normPage(it.page);          // I Page
+      if (okClient && okDate && okPage) verified.push(Number(it.row));
+      else stale.push({ row: it.row, found: `${r[1] || "?"} | ${dnorm(r[6]) || "?"} | ${r[8] || "?"}` });
+    }
+    if (!verified.length) return { deleted: 0, stale };
+    const meta = await sheets.spreadsheets.get({ spreadsheetId: v2Id() });
+    const sheet = meta.data.sheets?.find((s) => s.properties.title === LEDGER_TAB);
+    if (!sheet) return { deleted: 0, stale };
+    const sheetId = sheet.properties.sheetId;
+    const uniq = [...new Set(verified)].sort((a, b) => b - a);                     // bottom-up
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: v2Id(),
+      requestBody: { requests: uniq.map((rn) => ({
+        deleteDimension: { range: { sheetId, dimension: "ROWS", startIndex: rn - 1, endIndex: rn } },
+      })) },
+    });
+    return { deleted: uniq.length, stale };
+  } catch (err) {
+    console.error(`[v2ledger] mirrorDeleteRows (non-fatal): ${err.message}`);
+    return { deleted: 0, stale: [] };
+  }
+}
+
 // ── mirror: DELETE rows (match page+client, optional dateFilter) ──────────────
+// Content-match delete — used for client-wide / date-wide takedowns (deleteAdRows)
+// and as the LEGACY fallback for rows written before ledger_sheet_row existed.
+// Not precise against identical same-day twins; prefer mirrorDeleteRows when a
+// known Ledger row is available.
 async function mirrorDelete(pageHandles, clientName, opts = {}) {
   if (!enabled()) return;
   try {
@@ -232,5 +290,5 @@ async function mirrorDelete(pageHandles, clientName, opts = {}) {
 
 module.exports = {
   enabled, mapMasterRowToV2, mapParsedToV2,
-  mirrorAppend, mirrorUpdatePrice, mirrorUpdateClient, mirrorUpdateDate, mirrorUpdateStatusToLive, mirrorDelete,
+  mirrorAppend, mirrorUpdatePrice, mirrorUpdateClient, mirrorUpdateDate, mirrorUpdateStatusToLive, mirrorDelete, mirrorDeleteRows,
 };

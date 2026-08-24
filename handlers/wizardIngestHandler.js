@@ -146,18 +146,19 @@ async function ingestWizardBrief(telegram, payload) {
         brief.nif || "",                                                 // K: NIF
       ];
       try {
-        const rowNum = await appendRow(MASTER_SHEET_ID, TAB_NAME, row, { v2: {
+        const appendOpts = { v2: {
           client: brief.client, category: brief.category, datePosted: brief.date_posted,
           timeMST: brief.time_mst, pageHandle: handle, bulkNum: p.bulk_num, adPrice: p.price,
           status: "Scheduled", nif: brief.nif, postType: brief.post_type, postDuration: brief.post_duration,
-        } });
+        } };
+        const rowNum = await appendRow(MASTER_SHEET_ID, TAB_NAME, row, appendOpts);
         if (rowNum) {
           writes.master_rows++;
           masterRowsToFormat.push(rowNum);
           masterRowsToTickForwarded.push(rowNum);
           const pageRowId = pageRowIdByHandle.get(handle);
           if (pageRowId) {
-            await adBriefs.updatePageSheetRows(pageRowId, { masterSheetRow: rowNum }).catch(() => {});
+            await adBriefs.updatePageSheetRows(pageRowId, { masterSheetRow: rowNum, ledgerSheetRow: appendOpts.v2LedgerRow ?? null }).catch(() => {});
           }
         }
       } catch (err) {
