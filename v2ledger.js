@@ -192,11 +192,13 @@ async function mirrorUpdateClient(pageHandles, oldClient, newClient) {
 }
 
 // ── mirror: DATE (col G) + recompute Month (col L) ────────────────────────────
-async function mirrorUpdateDate(pageHandles, clientName, newDate) {
+async function mirrorUpdateDate(pageHandles, clientName, newDate, matchDate) {
   if (!enabled()) return;
   try {
     const d = parseDate(newDate);
-    const rows = await _matchRows(pageHandles, clientName);
+    // matchDate (optional): only repin Ledger rows currently on that date — the
+    // surgical "Posted on" path, so one placement moves, not the whole client.
+    const rows = await _matchRows(pageHandles, clientName, matchDate ? { dateFilter: matchDate } : {});
     const updates = [];
     rows.forEach((row) => {
       updates.push({ range: `${LEDGER_TAB}!G${row}`, values: [[d ? d.dateStr : newDate]] });

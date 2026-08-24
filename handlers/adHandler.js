@@ -3531,42 +3531,48 @@ async function handleAdMessage(ctx) {
           .catch((err) => console.error(`[adBriefs] markPagesPosted: ${err.message}`));
 
         if (overrideDate) {
-          // GUARD (added after the Aug-2026 clobber): updateAdDate matches rows
-          // by client + page, so if this campaign has MORE THAN ONE placement on
-          // a page, a dated "Posted on" repins EVERY one of them to this single
-          // date. That's what silently overwrote ~260 FashionNova rows + the
-          // Karam ones (every real date replaced). So only apply the date
-          // override when the match is unambiguous (≤ one placement per page);
-          // otherwise skip the date write (Status→Live already ran) and warn.
-          // Fails SAFE — any error in the check → treat as ambiguous → don't write.
-          let ambiguousDate = false;
-          try {
-            if (adBriefs._supabase && clientName && handles.length) {
-              const { count } = await adBriefs._supabase
-                .from("ad_brief_pages")
-                .select("id, ad_briefs!inner(client)", { count: "exact", head: true })
-                .eq("ad_briefs.client", clientName)
-                .in("page_handle", handles.map((h) => h.toLowerCase()));
-              if ((count || 0) > handles.length) ambiguousDate = true;
+          // Update the ONE placement this "Posted on" confirms — not every row
+          // for the client. The reply is to a specific brief whose own scheduled
+          // date is the row to move, so we match client+page+THAT date and repin
+          // only it. That's what makes it safe for recurring multi-placement
+          // clients (FashionNova, Karam) — the old blind client+page match
+          // clobbered every one of their rows to a single date (Aug-2026).
+          //   • matchDate present -> surgical update (any # of placements is fine)
+          //   • matchDate absent  -> ambiguity guard: if >1 row would match, skip
+          //                          + warn (fail safe); Status->Live still ran.
+          const matchDate = originalList[0]?.datePosted || null;
+
+          let blocked = false;
+          if (!matchDate) {
+            try {
+              if (adBriefs._supabase && clientName && handles.length) {
+                const { count } = await adBriefs._supabase
+                  .from("ad_brief_pages")
+                  .select("id, ad_briefs!inner(client)", { count: "exact", head: true })
+                  .eq("ad_briefs.client", clientName)
+                  .in("page_handle", handles.map((h) => h.toLowerCase()));
+                if ((count || 0) > handles.length) blocked = true;
+              }
+            } catch (err) {
+              blocked = true;
+              console.error(`[adHandler] Posted-on ambiguity check failed — skipping date override to be safe: ${err.message}`);
             }
-          } catch (err) {
-            ambiguousDate = true;
-            console.error(`[adHandler] Posted-on ambiguity check failed — skipping date override to be safe: ${err.message}`);
           }
 
-          if (ambiguousDate) {
-            console.warn(`[adHandler] ⚠️ Posted-on date override SKIPPED — "${clientName}" has multiple placements on ${handles.join(", ")}; refusing to bulk-repin dates.`);
+          if (blocked) {
+            console.warn(`[adHandler] ⚠️ Posted-on date override SKIPPED — "${clientName}" has multiple placements on ${handles.join(", ")} and no specific brief/date to target.`);
             ctx.reply(
-              `⚠️ Date *not* changed — "${clientName}" has multiple placements on ${handles.map((h) => "@" + h).join(", ")}.\n` +
-              `A dated "Posted on" would repin *all* of them to ${overrideDate} (this is the bug that clobbered FashionNova), so I skipped the date write. ` +
-              `Status was still set to Live — fix the one date by hand if it's really wrong.`,
+              `⚠️ Date *not* changed — "${clientName}" has multiple placements on ${handles.map((h) => "@" + h).join(", ")} and I couldn't tell which one you meant. ` +
+              `Reply directly to the specific brief (so I can target just that date), and I'll update only that entry. Status was still set to Live.`,
               { parse_mode: "Markdown" },
             ).catch(() => {});
           } else {
-            // Master sheet: update column D for matching client + handle rows
+            const dOpts = matchDate ? { matchDate } : {};
+            const scope = matchDate ? ` (only the row dated ${matchDate})` : "";
+            // Master sheet: update column D for the matching row(s)
             try {
-              const dated = await updateAdDate(MASTER_SHEET_ID, TAB_NAME, handles, clientName, overrideDate, true);
-              console.log(`[adHandler] ✅ "Posted on" date override → "${overrideDate}" on ${dated} master row(s)`);
+              const dated = await updateAdDate(MASTER_SHEET_ID, TAB_NAME, handles, clientName, overrideDate, true, dOpts);
+              console.log(`[adHandler] ✅ "Posted on" date → "${overrideDate}"${scope} on ${dated} master row(s)`);
             } catch (err) {
               console.error(`[adHandler] ❌ "Posted on" date update (master): ${err.message}`);
             }
@@ -3577,8 +3583,8 @@ async function handleAdMessage(ctx) {
               const sheetId = pagesRegistry.getSheetId(handle);
               if (!sheetId || PLACEHOLDER_PATTERN.test(sheetId)) continue;
               try {
-                const dated = await updateAdDate(sheetId, PAGE_TAB_NAME, [handle], clientName, overrideDate, false);
-                console.log(`[adHandler] ✅ "Posted on" date override → "${overrideDate}" on ${dated} @${handle} sheet row(s)`);
+                const dated = await updateAdDate(sheetId, PAGE_TAB_NAME, [handle], clientName, overrideDate, false, dOpts);
+                console.log(`[adHandler] ✅ "Posted on" date → "${overrideDate}"${scope} on ${dated} @${handle} sheet row(s)`);
               } catch (err) {
                 console.error(`[adHandler] ❌ "Posted on" date update (@${handle}): ${err.message}`);
               }

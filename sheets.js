@@ -1023,12 +1023,19 @@ async function updateStatusToLive(spreadsheetId, tabName, pageHandles, clientNam
  *
  * Returns the number of cells updated.
  */
-async function updateAdDate(spreadsheetId, tabName, pageHandles, clientName, newDate, isMasterSheet = true) {
+async function updateAdDate(spreadsheetId, tabName, pageHandles, clientName, newDate, isMasterSheet = true, opts = {}) {
   const auth   = getAuth();
   const client = await auth.getClient();
   const sheets = getThrottledSheets(client);
 
   const normClient = clientName?.toLowerCase().trim() || null;
+  // Optional SURGICAL filter: when set, only rows whose CURRENT Date matches
+  // this are touched — so a dated "Posted on" updates the ONE placement it's
+  // confirming (client+page+that date), never every row for the client (the
+  // Aug-2026 clobber). Compared as M/D/YYYY so weekday/comma differences don't
+  // matter. Without it, behaviour is unchanged (match client[+page]).
+  const _nd = (s) => { const m = String(s || "").match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/); if (!m) return null; let y = +m[3]; if (y < 100) y += 2000; return `${+m[1]}/${+m[2]}/${y}`; };
+  const wantDate = opts.matchDate ? _nd(opts.matchDate) : null;
 
   if (isMasterSheet) {
     const response = await sheets.spreadsheets.values.get({
@@ -1045,8 +1052,9 @@ async function updateAdDate(spreadsheetId, tabName, pageHandles, clientName, new
 
       const pageMatches   = normalised.includes(pageCell);
       const clientMatches = !normClient || clientCell === normClient;
+      const dateMatches   = !wantDate || _nd(rows[i]?.[2]) === wantDate; // D = index 2 in B:I
 
-      if (pageMatches && clientMatches) {
+      if (pageMatches && clientMatches && dateMatches) {
         // Master sheet date is column D
         updates.push({ range: `${tabName}!D${i + 1}`, values: [[newDate]] });
       }
@@ -1058,7 +1066,7 @@ async function updateAdDate(spreadsheetId, tabName, pageHandles, clientName, new
         requestBody: { valueInputOption: "USER_ENTERED", data: updates },
       });
     }
-    if (spreadsheetId === process.env.MASTER_SHEET_ID) await _mirrorV2("mirrorUpdateDate", pageHandles, clientName, newDate);
+    if (spreadsheetId === process.env.MASTER_SHEET_ID) await _mirrorV2("mirrorUpdateDate", pageHandles, clientName, newDate, opts.matchDate || null);
     return updates.length;
   }
 
@@ -1074,6 +1082,7 @@ async function updateAdDate(spreadsheetId, tabName, pageHandles, clientName, new
     const clientCell = (rows[i]?.[0] || "").trim().toLowerCase(); // A
     if (normClient && clientCell !== normClient) continue;
     if (!clientCell) continue; // skip blank rows
+    if (wantDate && _nd(rows[i]?.[3]) !== wantDate) continue; // D = index 3 in A:G — surgical filter
     // Page sheet date is column D ("Date Posted")
     updates.push({ range: `${tabName}!D${i + 1}`, values: [[newDate]] });
   }
