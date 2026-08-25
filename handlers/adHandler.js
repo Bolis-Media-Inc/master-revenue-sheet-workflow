@@ -2130,14 +2130,13 @@ async function handleBonusCommand(ctx) {
   });
   else await ctx.reply(out, { parse_mode: "Markdown" }).catch(() => {});
 
-  // Best-effort re-sort AFTER the summary is posted. If a sort stalls here, the
-  // run is already reported + safe to re-run — nothing gets orphaned.
-  console.log(`[bonus] sorting ${touchedSheets.size} sheet(s)…`);
-  let sorted = 0;
-  for (const sid of touchedSheets) {
-    try { await sortSheetByDate(sid, PAGE_TAB_NAME); sorted++; } catch (err) { console.error(`[bonus] sort ${sid}: ${err.message}`); }
-  }
-  console.log(`[bonus] done — sorted ${sorted}/${touchedSheets.size} sheet(s)`);
+  // APPEND-ONLY: /bonus deliberately does NOT re-sort the touched sheets. A full
+  // date-sort reorders EVERY existing row by its Date cell — which silently
+  // undoes manual date fixes and re-clumps any rows that share a date (e.g. the
+  // clobbered FashionNova rows all on 8/15 would group back together). New bonus
+  // rows just land at the bottom; run /sortsheets by hand when the dates are
+  // trusted and you actually want the sheet reordered.
+  console.log(`[bonus] done — appended ${touchedSheets.size} sheet(s), no auto-sort`);
 }
 
 /**
@@ -2273,12 +2272,12 @@ async function handleClipsCommand(ctx) {
   });
   else await ctx.reply(out, { parse_mode: "Markdown" }).catch(() => {});
 
-  console.log(`[clips] sorting ${touchedSheets.size} sheet(s)…`);
-  let sorted = 0;
-  for (const sid of touchedSheets) {
-    try { await sortSheetByDate(sid, PAGE_TAB_NAME); sorted++; } catch (err) { console.error(`[clips] sort ${sid}: ${err.message}`); }
-  }
-  console.log(`[clips] done — sorted ${sorted}/${touchedSheets.size} sheet(s)`);
+  // APPEND-ONLY: /clips deliberately does NOT re-sort the touched sheets. A full
+  // date-sort reorders EVERY existing row by its Date cell — which silently
+  // undoes manual date fixes and re-clumps rows sharing a date (this is what
+  // re-grouped the FashionNova rows on 8/15). New clip rows just land at the
+  // bottom; run /sortsheets by hand when you actually want the sheet reordered.
+  console.log(`[clips] done — appended ${touchedSheets.size} sheet(s), no auto-sort`);
 }
 
 /**
