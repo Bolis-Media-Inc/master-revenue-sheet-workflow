@@ -3738,12 +3738,41 @@ async function handleAdMessage(ctx) {
     // downstream lookup (sheet_id, chat_id, auto_forward) hits a canonical
     // handle. Falls through unchanged for unknown handles — we only "fix"
     // a handle when there's a unique fuzzy match within distance 1.
+    const unrecognizedHandles = [];
     for (const item of parsedList) {
       if (!item.pageHandle) continue;
       const canonical = pagesRegistry.resolveHandle(item.pageHandle);
       if (canonical && canonical !== item.pageHandle.toLowerCase()) {
         item.pageHandle = canonical;
+      } else if (!canonical && !pagesRegistry.getSheetId(item.pageHandle)) {
+        // Couldn't resolve to any registered page (misspell beyond distance 1,
+        // or a genuinely unregistered page) — it will be SKIPPED from the page
+        // sheet. Collect it so we can surface it instead of dropping it silently.
+        unrecognizedHandles.push(item.pageHandle.toLowerCase().replace(/^@/, ""));
       }
+    }
+
+    // ── "Did you mean?" alert ───────────────────────────────────────────────
+    // Auto-assign stays safe at distance 1, but anything beyond that used to
+    // just vanish (the @hauntededfootage / @neymarjrgoals cases). Surface each
+    // unrecognized handle + its closest registered match, in the chat the brief
+    // came from, so it gets fixed or the page gets registered. Non-fatal.
+    if (unrecognizedHandles.length && typeof ctx.reply === "function") {
+      try {
+        const uniq = [...new Set(unrecognizedHandles)];
+        const lines = uniq.map((h) => {
+          const near = pagesRegistry.nearestHandle(h);
+          return near && near.dist <= 4
+            ? `• \`@${h}\` — did you mean *@${near.handle}*?`
+            : `• \`@${h}\` — not a registered page`;
+        });
+        await ctx.reply(
+          `⚠️ *${uniq.length} page handle${uniq.length > 1 ? "s" : ""} not recognized* — skipped from the page sheet${uniq.length > 1 ? "s" : ""} (revenue + master row still logged):\n` +
+          lines.join("\n") +
+          `\n\nFix the spelling and re-send / \`/replay\`, or register the page.`,
+          { parse_mode: "Markdown" },
+        ).catch(() => {});
+      } catch (err) { console.error(`[adHandler] unrecognized-handle alert (non-fatal): ${err.message}`); }
     }
 
     console.log(
