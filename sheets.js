@@ -1097,6 +1097,43 @@ async function updateAdDate(spreadsheetId, tabName, pageHandles, clientName, new
 }
 
 /**
+ * Repoint the master Page column (F) from a misspelled handle to the correct
+ * one, for rows matching client + oldPage (+ optional date). Used by /fixpage
+ * after routing the per-page write to the right sheet, so the master reads the
+ * correct handle (and per-page master reporting counts the right page).
+ * Master only. Returns the number of cells updated.
+ */
+async function updateAdPageHandle(spreadsheetId, tabName, oldPage, newPage, clientName, dateStr) {
+  const auth   = getAuth();
+  const client = await auth.getClient();
+  const sheets = getThrottledSheets(client);
+  const normClient = clientName?.toLowerCase().trim() || null;
+  const nOld = `@${String(oldPage).toLowerCase().replace(/^@/, "")}`;
+  const nNew = `@${String(newPage).toLowerCase().replace(/^@/, "")}`;
+  const _nd  = (s) => { const m = String(s || "").match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/); if (!m) return null; let y = +m[3]; if (y < 100) y += 2000; return `${+m[1]}/${+m[2]}/${y}`; };
+  const wantDate = dateStr ? _nd(dateStr) : null;
+  const resp = await sheets.spreadsheets.values.get({ spreadsheetId, range: `${tabName}!B:I` });
+  const rows = resp.data.values || [];
+  const updates = [];
+  for (let i = 0; i < rows.length; i++) {
+    const c  = (rows[i]?.[0] || "").trim().toLowerCase();   // B client
+    const pg = (rows[i]?.[4] || "").trim().toLowerCase();   // F page
+    const dc = _nd(rows[i]?.[2]);                            // D date
+    if (pg !== nOld) continue;
+    if (normClient && c !== normClient) continue;
+    if (wantDate && dc !== wantDate) continue;
+    updates.push({ range: `${tabName}!F${i + 1}`, values: [[nNew]] });
+  }
+  if (updates.length > 0) {
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId,
+      requestBody: { valueInputOption: "USER_ENTERED", data: updates },
+    });
+  }
+  return updates.length;
+}
+
+/**
  * Update the Ad Price for rows matching the given page handles + client name.
  *
  * Master sheet (isMasterSheet = true):
@@ -1753,6 +1790,6 @@ module.exports = {
   getColumnDropdownOptions, snapToDropdown, fixDropdownColumn,
   applyCenterAlignmentBatch, applyColumnCenterAlignment,
   getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, getClientDateKeys, dateKeyOf, readMasterPlacements, readPagePlacements,
-  updateStatusToLive, updateAdPrice, updateAdClient, updateAdDate, deleteAdRows, deleteRowsByNumber,
+  updateStatusToLive, updateAdPrice, updateAdClient, updateAdDate, updateAdPageHandle, deleteAdRows, deleteRowsByNumber,
   appendReminder, appendRemindersBatch, getPendingReminders, markReminderSent,
 };

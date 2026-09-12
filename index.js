@@ -10,7 +10,7 @@ if (process.env.CLEANUP_MODE === "true") {
 const http = require("http");
 const cron = require("node-cron");
 const { Telegraf } = require("telegraf");
-const { handleAdMessage }    = require("./handlers/adHandler");
+const { handleAdMessage, handlePageFixCallback } = require("./handlers/adHandler");
 const { handleAuditCommand } = require("./handlers/auditHandler");
 const { addMessage, updateMessage, hydrateFromDb } = require("./messageBuffer");
 const { checkAndFireReminders } = require("./reminders");
@@ -44,6 +44,9 @@ bot.action(/^ca:[0-9a-f-]+:[^:]+:.+$/, handleAssignmentCallback);
 // /catchup Forward/Skip buttons (recover briefs missed during downtime).
 const { handleCatchupCallback } = require("./handlers/catchupHandler");
 bot.action(/^catchup:(fwd|skip):-?\d+:\d+$/, handleCatchupCallback);
+
+// "Did you mean @X?" page-handle confirm buttons (pgfix:y|n:<briefMsgId>:<suggested>).
+bot.action(/^pgfix:(y|n):\d+:.+$/, handlePageFixCallback);
 
 // ── /update — unified brief mutation (price, name; more subcommands TODO) ────
 // Reply to a brief in Internal Network Ads then:

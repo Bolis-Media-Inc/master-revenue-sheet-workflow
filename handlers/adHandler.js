@@ -12,7 +12,7 @@
  */
 
 const { parseAdMessage }       = require("../parser");
-const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, repinDateByClient, fixDropdownColumn, getColumnDropdownOptions, snapToDropdown, getClientDateKeys, dateKeyOf, readMasterPlacements, readPagePlacements } = require("../sheets");
+const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, updateAdPageHandle, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, repinDateByClient, fixDropdownColumn, getColumnDropdownOptions, snapToDropdown, getClientDateKeys, dateKeyOf, readMasterPlacements, readPagePlacements } = require("../sheets");
 const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages, getStandardBundle, getBlockStructure, getBriefBlockForAI } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
@@ -3436,6 +3436,12 @@ async function handleAdMessage(ctx) {
       return await handleClipsCommand(ctx);
     }
 
+    // /fixpage @correcthandle — reply to a brief to route its skipped/misspelled
+    // page to the right sheet (also the manual counterpart to the confirm buttons).
+    if (text && /^\/fixpage\b/i.test(text.trim())) {
+      return await handleFixPageCommand(ctx);
+    }
+
     const chatId = String(ctx.chat?.id);
 
     // Only process messages from allowed groups (production + any test groups)
@@ -3738,38 +3744,53 @@ async function handleAdMessage(ctx) {
     // downstream lookup (sheet_id, chat_id, auto_forward) hits a canonical
     // handle. Falls through unchanged for unknown handles — we only "fix"
     // a handle when there's a unique fuzzy match within distance 1.
-    const unrecognizedHandles = [];
+    // Distance-1 (obvious) typos are corrected silently. Anything unresolved
+    // with a plausible closest match (≤ distance 3) becomes an interactive
+    // CONFIRM prompt ("you sent @X, did you mean @Y?" + Yes/No) rather than a
+    // silent guess. Handles with no close match are surfaced as "not registered".
+    const unrecognizedHandles = [];   // no good suggestion
+    const needConfirm = [];           // { orig, suggested }
     for (const item of parsedList) {
       if (!item.pageHandle) continue;
-      const canonical = pagesRegistry.resolveHandle(item.pageHandle);
-      if (canonical && canonical !== item.pageHandle.toLowerCase()) {
+      const orig = item.pageHandle.toLowerCase().replace(/^@/, "");
+      const canonical = pagesRegistry.resolveHandle(item.pageHandle, 1); // silent only for obvious (≤1)
+      if (canonical && canonical !== orig) {
         item.pageHandle = canonical;
       } else if (!canonical && !pagesRegistry.getSheetId(item.pageHandle)) {
-        // Couldn't resolve to any registered page (misspell beyond distance 1,
-        // or a genuinely unregistered page) — it will be SKIPPED from the page
-        // sheet. Collect it so we can surface it instead of dropping it silently.
-        unrecognizedHandles.push(item.pageHandle.toLowerCase().replace(/^@/, ""));
+        const near = pagesRegistry.nearestHandle(orig);
+        if (near && near.dist <= 3 && near.handle !== orig && pagesRegistry.getSheetId(near.handle)) {
+          needConfirm.push({ orig, suggested: near.handle });
+        } else {
+          unrecognizedHandles.push(orig);
+        }
       }
     }
 
-    // ── "Did you mean?" alert ───────────────────────────────────────────────
-    // Auto-assign stays safe at distance 1, but anything beyond that used to
-    // just vanish (the @hauntededfootage / @neymarjrgoals cases). Surface each
-    // unrecognized handle + its closest registered match, in the chat the brief
-    // came from, so it gets fixed or the page gets registered. Non-fatal.
+    // ── Interactive "did you mean?" confirm (one per unresolved-but-close handle) ──
+    // Yes routes the page to the suggestion; No points to /fixpage. Callback data
+    // carries the brief message id + suggestion so the handler can re-derive the row.
+    for (const nc of [...new Map(needConfirm.map((n) => [n.orig, n])).values()]) {
+      if (typeof ctx.reply !== "function" || !ctx.message?.message_id) break;
+      try {
+        await ctx.reply(
+          `⚠️ You sent the page \`@${nc.orig}\` — did you mean *@${nc.suggested}*?\n` +
+          `_(Revenue + master row are already logged; this just routes it to the right page sheet.)_`,
+          { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[
+            { text: `✅ Yes, @${nc.suggested}`.slice(0, 60), callback_data: `pgfix:y:${ctx.message.message_id}:${nc.suggested}`.slice(0, 64) },
+            { text: "❌ No",                                  callback_data: `pgfix:n:${ctx.message.message_id}:${nc.suggested}`.slice(0, 64) },
+          ]] } },
+        ).catch(() => {});
+      } catch (err) { console.error(`[adHandler] page-confirm prompt (non-fatal): ${err.message}`); }
+    }
+
+    // ── Plain alert — handles with NO close match (genuinely new / far off) ──
     if (unrecognizedHandles.length && typeof ctx.reply === "function") {
       try {
         const uniq = [...new Set(unrecognizedHandles)];
-        const lines = uniq.map((h) => {
-          const near = pagesRegistry.nearestHandle(h);
-          return near && near.dist <= 4
-            ? `• \`@${h}\` — did you mean *@${near.handle}*?`
-            : `• \`@${h}\` — not a registered page`;
-        });
         await ctx.reply(
           `⚠️ *${uniq.length} page handle${uniq.length > 1 ? "s" : ""} not recognized* — skipped from the page sheet${uniq.length > 1 ? "s" : ""} (revenue + master row still logged):\n` +
-          lines.join("\n") +
-          `\n\nFix the spelling and re-send / \`/replay\`, or register the page.`,
+          uniq.map((h) => `• \`@${h}\` — no close match; register it or fix the spelling`).join("\n") +
+          `\n\nReply to the brief with \`/fixpage @correcthandle\` to route it, or register the page.`,
           { parse_mode: "Markdown" },
         ).catch(() => {});
       } catch (err) { console.error(`[adHandler] unrecognized-handle alert (non-fatal): ${err.message}`); }
@@ -4738,4 +4759,100 @@ async function handleAdMessage(ctx) {
   }
 }
 
-module.exports = { handleAdMessage, extractPostedOnDate, buildPerPageBriefText };
+/**
+ * Route a brief's misspelled/unrecognized page to the correct registered page:
+ * write the missing per-page sheet row, repoint the master Page cell, and fix
+ * the DB record. Shared by the confirm-button callback and the /fixpage command.
+ * Finds the brief by its Telegram message id (falls back to provided text), then
+ * the brief's page nearest to `correctHandle` that doesn't already resolve.
+ */
+async function routeBriefPageToHandle({ telegram, chatId, briefMsgId, correctHandle, briefTextFallback }) {
+  const correct = pagesRegistry.resolveHandle(correctHandle) || String(correctHandle || "").toLowerCase().replace(/^@/, "");
+  const sheetId = pagesRegistry.getSheetId(correct);
+  if (!sheetId || PLACEHOLDER_PATTERN.test(sheetId)) return { ok: false, reason: `@${correct} isn't a registered page with a sheet` };
+
+  let raw = briefTextFallback || null, briefId = null;
+  try {
+    if (adBriefs._supabase && briefMsgId) {
+      const { data } = await adBriefs._supabase.from("ad_briefs")
+        .select("id, raw_text").eq("telegram_message_id", briefMsgId)
+        .order("received_at", { ascending: false }).limit(1);
+      if (data?.[0]) { briefId = data[0].id; raw = data[0].raw_text || raw; }
+    }
+  } catch (err) { console.error(`[routePage] brief lookup: ${err.message}`); }
+  if (!raw) return { ok: false, reason: "couldn't find the brief text" };
+
+  const parsed = parseAdMessage(raw, new Date());
+  const list = Array.isArray(parsed) ? parsed : (parsed ? [parsed] : []);
+  let best = null, bd = Infinity;
+  for (const it of list) {
+    const h = (it.pageHandle || "").toLowerCase().replace(/^@/, "");
+    if (!h || pagesRegistry.resolveHandle(h)) continue; // skip pages that already resolve
+    const d = _editDistance(h, correct);
+    if (d < bd) { bd = d; best = it; }
+  }
+  if (!best) return { ok: false, reason: `no unrecognized page near @${correct} in this brief` };
+  const wrong = best.pageHandle.toLowerCase().replace(/^@/, "");
+
+  best.pageHandle = correct;
+  const row = await buildPageRowSnapped(sheetId, best);
+  const rowNum = await appendRow(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "A", endColumn: "H" });
+
+  let masterFixed = 0;
+  try {
+    if (MASTER_SHEET_ID && !PLACEHOLDER_PATTERN.test(MASTER_SHEET_ID)) {
+      masterFixed = await updateAdPageHandle(MASTER_SHEET_ID, TAB_NAME, wrong, correct, best.client, best.datePosted);
+    }
+  } catch (err) { console.error(`[routePage] master repoint: ${err.message}`); }
+
+  try {
+    if (adBriefs._supabase && briefId) {
+      await adBriefs._supabase.from("ad_brief_pages")
+        .update({ page_handle: correct, page_sheet_row: rowNum })
+        .eq("brief_id", briefId).eq("page_handle", wrong);
+    }
+  } catch (err) { console.error(`[routePage] db update: ${err.message}`); }
+
+  return { ok: true, wrong, correct, rowNum, masterFixed, price: best.adPrice };
+}
+
+// Yes/No callback for the "did you mean @X?" page-confirm prompt.
+async function handlePageFixCallback(ctx) {
+  try {
+    const m = (ctx.callbackQuery?.data || "").match(/^pgfix:(y|n):(\d+):(.+)$/);
+    if (!m) return ctx.answerCbQuery().catch(() => {});
+    const [, act, msgId, suggested] = m;
+    const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+    if (adminId && ctx.from?.id !== adminId) return ctx.answerCbQuery("Not authorized").catch(() => {});
+    if (act === "n") {
+      await ctx.answerCbQuery("Ok").catch(() => {});
+      await ctx.editMessageText(`↩️ Not @${suggested}. Reply to the brief with \`/fixpage @correcthandle\` to set the right page.`, { parse_mode: "Markdown" }).catch(() => {});
+      return;
+    }
+    await ctx.answerCbQuery("Routing…").catch(() => {});
+    const res = await routeBriefPageToHandle({ telegram: ctx.telegram, chatId: ctx.chat?.id, briefMsgId: Number(msgId), correctHandle: suggested });
+    if (res.ok) {
+      await ctx.editMessageText(`✅ Routed @${res.wrong} → *@${res.correct}* — wrote $${res.price} to its sheet (row ${res.rowNum})${res.masterFixed ? `, corrected ${res.masterFixed} master row(s)` : ""}.`, { parse_mode: "Markdown" }).catch(() => {});
+    } else {
+      await ctx.editMessageText(`❌ Couldn't route: ${res.reason}.`).catch(() => {});
+    }
+  } catch (err) { console.error(`[pgfix callback] ${err.message}`); ctx.answerCbQuery("Error").catch(() => {}); }
+}
+
+// /fixpage @correcthandle — reply to a brief to route its skipped/misspelled page.
+async function handleFixPageCommand(ctx) {
+  const adminId = parseInt(process.env.WIZARD_ADMIN_USER_ID || "0", 10);
+  if (adminId && ctx.from?.id !== adminId) return;
+  const m = (ctx.message?.text || "").trim().match(/^\/fixpage(?:@\w+)?\s+@?([\w.]+)/i);
+  if (!m) { await ctx.reply("Reply to the brief with `/fixpage @correcthandle`.", { parse_mode: "Markdown" }).catch(() => {}); return; }
+  const reply = ctx.message?.reply_to_message;
+  if (!reply) { await ctx.reply("Reply to the *brief message* with `/fixpage @handle`.", { parse_mode: "Markdown" }).catch(() => {}); return; }
+  const res = await routeBriefPageToHandle({ telegram: ctx.telegram, chatId: ctx.chat?.id, briefMsgId: reply.message_id, correctHandle: m[1], briefTextFallback: reply.text || reply.caption });
+  if (res.ok) {
+    await ctx.reply(`✅ Routed @${res.wrong} → *@${res.correct}* — wrote $${res.price} to its sheet (row ${res.rowNum})${res.masterFixed ? `, corrected ${res.masterFixed} master row(s)` : ""}.`, { parse_mode: "Markdown" }).catch(() => {});
+  } else {
+    await ctx.reply(`❌ ${res.reason}.`).catch(() => {});
+  }
+}
+
+module.exports = { handleAdMessage, extractPostedOnDate, buildPerPageBriefText, handlePageFixCallback, handleFixPageCommand };
