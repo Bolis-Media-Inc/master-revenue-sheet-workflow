@@ -46,11 +46,23 @@ function parseAdMessage(text, date) {
   const headerMatch = lines[0].match(
     /^(.+?)\s*-\s*(.+?)\s*-\s*\$?([\d,]+(?:\.\d{1,2})?)(?:\s*\([^)]*\))?\s*$/
   );
-  if (!headerMatch) return null;
-
-  const client   = headerMatch[1].trim();
-  let   category = headerMatch[2].trim();
-  const adPrice  = parseFloat(headerMatch[3].replace(/,/g, ""));
+  let client, category, adPrice;
+  if (headerMatch) {
+    client   = headerMatch[1].trim();
+    category = headerMatch[2].trim();
+    adPrice  = parseFloat(headerMatch[3].replace(/,/g, ""));
+  } else {
+    // Fallback: "{Client} - ${amount}" with NO category segment, e.g.
+    // "Hundred Days (JT) - $727.57". Common on music briefs. Without this the
+    // whole brief silently drops at parse time — it never reaches the DB or the
+    // sheets (and /checkmissed, using this same parser, can't recover it either).
+    // Category is left blank; everything else parses as normal.
+    const noCat = lines[0].match(/^(.+?)\s*-\s*\$?([\d,]+(?:\.\d{1,2})?)(?:\s*\([^)]*\))?\s*$/);
+    if (!noCat) return null;
+    client   = noCat[1].trim();
+    category = "";
+    adPrice  = parseFloat(noCat[2].replace(/,/g, ""));
+  }
 
   // ── Normalize category to the master sheet's Ad Type dropdown value ─────
   // Briefs type the category inconsistently — "E-com", "Ecom", "E-Commerce"
