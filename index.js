@@ -56,6 +56,14 @@ bot.action(/^pgfix:(y|n):\d+:.+$/, handlePageFixCallback);
 const { handleUpdateCommand } = require("./handlers/updateHandler");
 bot.command("update", handleUpdateCommand);
 
+// ── /checkmissed [days] — find ad briefs in the ads chat not in the books,
+// and Add them (master + page sheet + Ledger, NO forwarding). Run in any admin
+// chat (e.g. Monetization). See handlers/checkMissedHandler.js.
+const { handleCheckMissedCommand, handleCheckMissedCallback } = require("./handlers/checkMissedHandler");
+bot.command("checkmissed", handleCheckMissedCommand);
+bot.action(/^ckadd:-?\d+:\d+$/, handleCheckMissedCallback);
+bot.action(/^ckskip:\d+$/, handleCheckMissedCallback);
+
 // ── /editbrief — surgical edit of ONE bot-sent message via Telegram link ─────
 // Manual escape hatch for past briefs with NULL forwarded_message_ids.
 // `/editbrief <link>` + new text on the next lines. See handlers/editBriefHandler.js.

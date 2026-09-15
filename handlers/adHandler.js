@@ -3979,6 +3979,15 @@ async function handleAdMessage(ctx) {
         .catch((err) => console.error(`[adHandler] ❌ Center-align page sheet ${sheetId.slice(0, 8)}…: ${err.message}`));
     }
 
+    // WRITE-ONLY mode (/checkmissed "Add"): the sheets (master + per-page), the
+    // Ledger mirror, and the DB rows have all been written above. Stop here so
+    // NOTHING forwards — no Results feed, no page chats, no NIF reminders. This
+    // is how a missed brief gets recovered into the books without re-posting it.
+    if (ctx._writeOnly) {
+      console.log(`[adHandler] ✍️  write-only ingest complete for "${parsedList[0]?.client}" — no forwarding`);
+      return;
+    }
+
     // ── Forward content + ad brief to each page's Telegram destination ─────────
     // Skip entirely if this brief was sent by Greg's /api/ad/intake — Greg already
     // forwarded per-page creatives directly to each destination.
