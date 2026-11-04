@@ -1786,7 +1786,7 @@ async function fixDropdownColumn(spreadsheetId, tabName, colLetter, opts = {}) {
 }
 
 module.exports = {
-  appendRow, markForwarded, markForwardedBatch, repinDateByClient,
+  appendRow, markForwarded, markForwardedBatch, repinDateByClient, sheetsClient,
   getColumnDropdownOptions, snapToDropdown, fixDropdownColumn,
   applyCenterAlignmentBatch, applyColumnCenterAlignment,
   getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, getClientDateKeys, dateKeyOf, readMasterPlacements, readPagePlacements,
