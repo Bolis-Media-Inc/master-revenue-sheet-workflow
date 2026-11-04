@@ -1,7 +1,8 @@
 /**
  * sheets.js
  * Google Sheets API helper.
- * Authenticates with a Service Account and provides a single `appendRow` function.
+ * Authenticates with a Service Account; row writes go through `appendRow`
+ * (always the bottom) or `insertRowByDate` (into the row's date section).
  *
  * Setup:
  *  1. Create a Google Cloud project + enable the Sheets API.
@@ -11,6 +12,7 @@
  */
 
 const { google } = require("googleapis");
+const { DAY_DIVIDER_MARK, dateKey, planDatedInsert, rebaseRow } = require("./lib/datedInsert");
 
 let _auth = null;
 
@@ -155,20 +157,170 @@ async function _mirrorV2(method, ...args) {
 }
 
 /**
- * Append a single row to a Google Sheet.
+ * Write `rowsValues` into rows startRow..startRow+n-1 (A:endColumn). Extends
+ * the grid by 1000 rows and retries if the target is past the sheet's
+ * allocated rows.
+ */
+async function _writeRowsAt(sheets, spreadsheetId, tabName, startRow, rowsValues, endColumn) {
+  const range = `${tabName}!A${startRow}:${endColumn}${startRow + rowsValues.length - 1}`;
+  // values.update fails with "exceeds grid limits" when the target row is
+  // beyond the sheet's currently-allocated grid (default sheets ship with
+  // 1000 rows; once filled, the sheet caps there). values.append would
+  // auto-extend but it has the table-detection issues described in appendRow.
+  // Solution: try update, catch grid-exceeded, extend by 1000 rows, retry.
+  try {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId, range, valueInputOption: "USER_ENTERED",
+      requestBody: { values: rowsValues },
+    });
+  } catch (err) {
+    const msg = err?.message || String(err);
+    if (!/exceeds grid limits/i.test(msg)) throw err;
+
+    // Find the numeric sheet id (different from spreadsheetId) — needed by
+    // batchUpdate's appendDimension request.
+    const sheetId = await _sheetIdOf(sheets, spreadsheetId, tabName);
+    if (sheetId == null) throw err; // re-throw original if we can't find the tab
+
+    console.log(`[sheets] 📐 Extending "${tabName}" by 1000 rows (target row ${startRow} exceeded grid)`);
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests: [{ appendDimension: { sheetId, dimension: "ROWS", length: 1000 } }],
+      },
+    });
+
+    // Retry the value write now that the rows exist
+    await sheets.spreadsheets.values.update({
+      spreadsheetId, range, valueInputOption: "USER_ENTERED",
+      requestBody: { values: rowsValues },
+    });
+  }
+}
+
+async function _sheetIdOf(sheets, spreadsheetId, tabName) {
+  const meta  = await sheets.spreadsheets.get({ spreadsheetId });
+  const sheet = meta.data.sheets?.find((s) => s.properties.title === tabName);
+  return sheet ? sheet.properties.sheetId : null;
+}
+
+/** Last non-empty row (1-indexed) in a column's values; 0 if none. */
+function _lastFilledRow(colValues) {
+  for (let i = colValues.length - 1; i >= 0; i--) {
+    if (colValues[i] != null && String(colValues[i]).trim() !== "") return i + 1;
+  }
+  return 0;
+}
+
+const _isMasterTab = (spreadsheetId, tabName) =>
+  !!spreadsheetId && spreadsheetId === process.env.MASTER_SHEET_ID &&
+  tabName === (process.env.SHEET_TAB_NAME || "2026 Ad Overview");
+
+/**
+ * Mirror an ad-placement row into the v2 Ledger — ONLY the master ad tab (not
+ * per-page sheets, reminders, or day-divider rows). Fail-open.
+ */
+async function _mirrorMasterRow(spreadsheetId, tabName, rowValues, opts) {
+  if (!_isMasterTab(spreadsheetId, tabName)) return;
+  // Capture the Ledger row the mirror wrote and hand it back on `opts` so the
+  // caller can persist it (ad_brief_pages.ledger_sheet_row) — the key that
+  // makes a later /remove delete THIS exact Ledger row, not a same-day twin.
+  const ledgerRow = await _mirrorV2("mirrorAppend", rowValues, opts.v2);
+  if (opts && typeof ledgerRow === "number") opts.v2LedgerRow = ledgerRow;
+}
+
+// ── Per-tab write lock + insert log ──────────────────────────────────────────
+// Every write that picks a row number from a read (appendRow, insertRowByDate)
+// runs under a per-(spreadsheet, tab) promise chain, so two briefs in this
+// process can't both read "last row = 900" and write over each other, and an
+// insert can't land between another write's read and its write.
+//
+// Every row INSERT is also logged as { seq, row, count }. Callers that hold a
+// row number for a while (e.g. ticking the Forwarded checkbox after forwarding
+// finishes) record `opts.rowSeq` at write time and call currentRowNumber() to
+// get where that row is now. In-process only: the Tracker service does all
+// bot writes (Greg hands off to it via /api/ingest-wizard-brief).
+const _tabLocks = new Map();   // key → tail promise
+const _insertLogs = new Map(); // key → { seq, entries: [{seq,row,count}] }
+const INSERT_LOG_MAX = 500;
+const _tabKey = (spreadsheetId, tabName) => `${spreadsheetId}|${tabName}`;
+
+function _withTabLock(spreadsheetId, tabName, fn) {
+  const key  = _tabKey(spreadsheetId, tabName);
+  const prev = _tabLocks.get(key) || Promise.resolve();
+  const run  = prev.catch(() => {}).then(fn);
+  const tail = run.catch(() => {});
+  _tabLocks.set(key, tail);
+  tail.then(() => { if (_tabLocks.get(key) === tail) _tabLocks.delete(key); });
+  return run;
+}
+
+function _insertLog(spreadsheetId, tabName) {
+  const key = _tabKey(spreadsheetId, tabName);
+  if (!_insertLogs.has(key)) _insertLogs.set(key, { seq: 0, entries: [] });
+  return _insertLogs.get(key);
+}
+
+function _logInsert(spreadsheetId, tabName, row, count) {
+  const log = _insertLog(spreadsheetId, tabName);
+  log.seq++;
+  log.entries.push({ seq: log.seq, row, count });
+  if (log.entries.length > INSERT_LOG_MAX) log.entries.shift();
+}
+
+/**
+ * Where is a row now? `row` was written with `opts.rowSeq === seq`; any
+ * inserts at or above it since then pushed it down. Returns `row` unchanged
+ * when seq is unknown (null/undefined).
+ */
+function currentRowNumber(spreadsheetId, tabName, row, seq) {
+  if (!Number.isFinite(row) || !Number.isFinite(seq)) return row;
+  const log = _insertLog(spreadsheetId, tabName);
+  if (log.entries.length && log.entries[0].seq > seq + 1) {
+    console.warn(`[sheets] currentRowNumber: insert log for "${tabName}" rotated past seq ${seq} — row ${row} may be stale`);
+  }
+  return rebaseRow(row, seq, log.entries);
+}
+
+/**
+ * Shift the row numbers stored in Supabase after `count` rows were inserted at
+ * `fromRow`. Master tab → ad_brief_pages.master_sheet_row; a per-page "IG
+ * Revenue Tracker" → page_sheet_row, limited to the handles whose registry
+ * sheet_id is this spreadsheet. ledger_sheet_row is untouched (the v2 Ledger
+ * is still append-only). Fail-open: logs and moves on — updateHandler already
+ * content-verifies stored rows before acting on them.
+ */
+async function _shiftStoredRows(spreadsheetId, tabName, fromRow, count) {
+  try {
+    const adBriefs = require("./lib/adBriefs");
+    if (_isMasterTab(spreadsheetId, tabName)) {
+      return await adBriefs.shiftSheetRows({ column: "master_sheet_row", fromRow, by: count });
+    }
+    if (tabName === (process.env.PAGE_SHEET_TAB_NAME || "IG Revenue Tracker")) {
+      const pagesRegistry = require("./lib/pages");
+      const handles = pagesRegistry.listAllSync()
+        .filter((p) => p.sheet_id === spreadsheetId)
+        .map((p) => p.handle);
+      if (handles.length === 0) return 0;
+      return await adBriefs.shiftSheetRows({ column: "page_sheet_row", fromRow, by: count, pageHandles: handles });
+    }
+  } catch (err) {
+    console.error(`[sheets] shift stored rows for "${tabName}" from ${fromRow} (non-fatal): ${err.message}`);
+  }
+  return 0;
+}
+
+/**
+ * Append a single row and return the 1-indexed row number that was written.
+ * Always writes below the last filled row, whatever the row's date — use
+ * insertRowByDate for ad-placement rows.
  *
  * @param {string} spreadsheetId   The Sheet ID (from the URL)
  * @param {string} tabName         Tab name, e.g. "IG Revenue Tracker"
  * @param {any[]}  rowValues       Array of cell values in column order
  */
-/**
- * Append a single row and return the 1-indexed row number that was written.
- * Returns null if the row number can't be determined from the API response.
- */
 async function appendRow(spreadsheetId, tabName, rowValues, opts = {}) {
-  const auth   = getAuth();
-  const client = await auth.getClient();
-  const sheets = getThrottledSheets(client);
+  const sheets = await sheetsClient();
 
   // ── Deterministic append ───────────────────────────────────────────────────
   // Don't use spreadsheets.values.append + table auto-detection — it gets
@@ -191,80 +343,149 @@ async function appendRow(spreadsheetId, tabName, rowValues, opts = {}) {
   const anchorColumn = opts.anchorColumn || "B";
   const endColumn    = opts.endColumn    || "K";
 
-  const colData = await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range: `${tabName}!${anchorColumn}:${anchorColumn}`,
-    majorDimension: "COLUMNS",
+  const targetRow = await _withTabLock(spreadsheetId, tabName, async () => {
+    const colData = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `${tabName}!${anchorColumn}:${anchorColumn}`,
+      majorDimension: "COLUMNS",
+    });
+    const colValues = (colData.data.values && colData.data.values[0]) || [];
+    // Walk backwards to find the last non-empty cell (handles sparse history)
+    const row = _lastFilledRow(colValues) + 1;
+    await _writeRowsAt(sheets, spreadsheetId, tabName, row, [rowValues], endColumn);
+    opts.rowSeq = _insertLog(spreadsheetId, tabName).seq;
+    return row;
   });
-  const colValues = (colData.data.values && colData.data.values[0]) || [];
-  // Walk backwards to find the last non-empty cell (handles sparse history)
-  let lastFilledRow = 0;
-  for (let i = colValues.length - 1; i >= 0; i--) {
-    if (colValues[i] != null && String(colValues[i]).trim() !== "") {
-      lastFilledRow = i + 1; // values array is 0-indexed, sheet rows are 1-indexed
-      break;
-    }
-  }
-  const targetRow = lastFilledRow + 1;
 
-  // values.update fails with "exceeds grid limits" when the target row is
-  // beyond the sheet's currently-allocated grid (default sheets ship with
-  // 1000 rows; once filled, the sheet caps there). values.append would
-  // auto-extend but it has the table-detection issues described above.
-  // Solution: try update, catch grid-exceeded, extend by 1000 rows, retry.
-  try {
-    await sheets.spreadsheets.values.update({
-      spreadsheetId,
-      range: `${tabName}!A${targetRow}:${endColumn}${targetRow}`,
-      valueInputOption: "USER_ENTERED",
-      requestBody: { values: [rowValues] },
-    });
-  } catch (err) {
-    const msg = err?.message || String(err);
-    if (!/exceeds grid limits/i.test(msg)) throw err;
-
-    // Find the numeric sheet id (different from spreadsheetId) — needed by
-    // batchUpdate's appendDimension request.
-    const meta  = await sheets.spreadsheets.get({ spreadsheetId });
-    const sheet = meta.data.sheets?.find((s) => s.properties.title === tabName);
-    if (!sheet) throw err; // re-throw original if we can't find the tab
-    const sheetId = sheet.properties.sheetId;
-
-    console.log(`[sheets] 📐 Extending "${tabName}" by 1000 rows (target row ${targetRow} exceeded grid)`);
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId,
-      requestBody: {
-        requests: [{
-          appendDimension: {
-            sheetId,
-            dimension: "ROWS",
-            length: 1000,
-          },
-        }],
-      },
-    });
-
-    // Retry the value write now that the row exists
-    await sheets.spreadsheets.values.update({
-      spreadsheetId,
-      range: `${tabName}!A${targetRow}:${endColumn}${targetRow}`,
-      valueInputOption: "USER_ENTERED",
-      requestBody: { values: [rowValues] },
-    });
-  }
-
-  // Mirror ad-placement appends into the v2 Ledger — ONLY the master ad tab
-  // (not per-page sheets, reminders, or day-divider rows). Fail-open.
-  if (spreadsheetId === process.env.MASTER_SHEET_ID &&
-      tabName === (process.env.SHEET_TAB_NAME || "2026 Ad Overview")) {
-    // Capture the Ledger row the mirror wrote and hand it back on `opts` so the
-    // caller can persist it (ad_brief_pages.ledger_sheet_row) — the key that
-    // makes a later /remove delete THIS exact Ledger row, not a same-day twin.
-    const ledgerRow = await _mirrorV2("mirrorAppend", rowValues, opts.v2);
-    if (opts && typeof ledgerRow === "number") opts.v2LedgerRow = ledgerRow;
-  }
-
+  await _mirrorMasterRow(spreadsheetId, tabName, rowValues, opts);
   return targetRow;
+}
+
+/**
+ * Write an ad-placement row into its DATE SECTION instead of always at the
+ * bottom. Placement rules live in lib/datedInsert.js planDatedInsert:
+ *
+ *   - Current-day (or newer, or undated) rows → cheap append at the bottom,
+ *     same cost as appendRow. Master: a black day divider goes first when it's
+ *     a new day (this replaces the old maybeInsertDayDivider call).
+ *   - Late rows (date earlier than the last dated row) → real row insert
+ *     (insertDimension) under the last row of that date — master: above that
+ *     day's next divider; a missing day gets its own divider(s). Page sheets:
+ *     under the last same-or-earlier-dated row.
+ *
+ * Inserting pushes every row below down, so on the insert path the stored
+ * ad_brief_pages row numbers at/below the insert point are shifted +N in
+ * Supabase (see _shiftStoredRows) BEFORE `opts.persistRow(row)` runs — all
+ * inside the tab lock, so the new row's own DB write can't race a shift.
+ *
+ * @param {object} opts
+ * @param {string}   opts.dateStr          The row's date ("Wed, 10/21/26"); falls back to
+ *                                         the value in the date column of rowValues.
+ * @param {string}   [opts.anchorColumn="B"]
+ * @param {string}   [opts.dateColumn="D"]
+ * @param {string}   [opts.endColumn="K"]
+ * @param {boolean}  [opts.dayDividers]    Default: true on the master tab, false elsewhere.
+ * @param {Function} [opts.persistRow]     async (row) => … — save the row number to the DB
+ *                                         under the lock. Errors are logged, not thrown.
+ * @param {object}   [opts.v2]             Passed through to the v2 Ledger mirror.
+ * Sets opts.rowSeq (for currentRowNumber) and opts.v2LedgerRow (mirror).
+ * @returns {Promise<number>} 1-indexed row the data landed on.
+ */
+async function insertRowByDate(spreadsheetId, tabName, rowValues, opts = {}) {
+  const anchorColumn = (opts.anchorColumn || "B").toUpperCase();
+  const dateColumn   = (opts.dateColumn   || "D").toUpperCase();
+  const endColumn    = (opts.endColumn    || "K").toUpperCase();
+  const dayDividers  = opts.dayDividers ?? _isMasterTab(spreadsheetId, tabName);
+  const anchorIdx    = anchorColumn.charCodeAt(0) - 65;
+  const dateIdx      = dateColumn.charCodeAt(0) - 65;
+  const endIdx       = endColumn.charCodeAt(0) - 65;
+  const dateStr      = opts.dateStr ?? rowValues[dateIdx];
+
+  const sheets = await sheetsClient();
+
+  const dataRow = await _withTabLock(spreadsheetId, tabName, async () => {
+    // One read covers both the anchor and date columns.
+    const lo = Math.min(anchorIdx, dateIdx), hi = Math.max(anchorIdx, dateIdx);
+    const resp = await sheets.spreadsheets.values.get({
+      spreadsheetId, range: `${tabName}!${_colLetter(lo)}:${_colLetter(hi)}`,
+    });
+    const cells = (resp.data.values || []).map((r) => ({
+      anchor: (r || [])[anchorIdx - lo],
+      date:   (r || [])[dateIdx - lo],
+    }));
+
+    const plan = planDatedInsert(cells, dateStr, { dayDividers });
+    const dividerValues = Array.from({ length: endIdx + 1 }, (_, i) => (i === anchorIdx ? DAY_DIVIDER_MARK : ""));
+    const block = plan.kinds.map((k) => (k === "divider" ? dividerValues : rowValues));
+    const dividerRows = plan.kinds
+      .map((k, i) => (k === "divider" ? plan.startRow + i : null))
+      .filter((r) => r != null);
+
+    let sheetId = null;
+    if (plan.mode === "insert") {
+      sheetId = await _sheetIdOf(sheets, spreadsheetId, tabName);
+      if (sheetId == null) throw new Error(`tab "${tabName}" not found`);
+      // Inherit formatting (checkbox column, alignment) from the row above —
+      // a data row of the same/earlier day — or from below when inserting
+      // above the very first dated row (the row above is the header).
+      const firstDatedIdx = cells.findIndex((c) => dateKey(c.date) != null);
+      const inheritFromBefore = plan.startRow - 2 >= firstDatedIdx;
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId,
+        requestBody: {
+          requests: [{
+            insertDimension: {
+              range: {
+                sheetId, dimension: "ROWS",
+                startIndex: plan.startRow - 1, endIndex: plan.startRow - 1 + plan.kinds.length,
+              },
+              inheritFromBefore,
+            },
+          }],
+        },
+      });
+      _logInsert(spreadsheetId, tabName, plan.startRow, plan.kinds.length);
+    }
+
+    await _writeRowsAt(sheets, spreadsheetId, tabName, plan.startRow, block, endColumn);
+
+    if (dividerRows.length) {
+      if (sheetId == null) sheetId = await _sheetIdOf(sheets, spreadsheetId, tabName);
+      if (sheetId != null) {
+        await sheets.spreadsheets.batchUpdate({
+          spreadsheetId,
+          requestBody: {
+            requests: dividerRows.map((r) => ({
+              repeatCell: {
+                range: {
+                  sheetId, startRowIndex: r - 1, endRowIndex: r,
+                  startColumnIndex: 0, endColumnIndex: endIdx + 1,
+                },
+                cell: { userEnteredFormat: { backgroundColor: { red: 0, green: 0, blue: 0 } } },
+                fields: "userEnteredFormat.backgroundColor",
+              },
+            })),
+          },
+        }).catch((err) => console.error(`[sheets] paint day divider (non-fatal): ${err.message}`));
+      }
+      console.log(`[sheets] ▬ Day divider(s) at row(s) ${dividerRows.join(", ")} in "${tabName}" (${dateStr})`);
+    }
+
+    if (plan.mode === "insert") {
+      const shifted = await _shiftStoredRows(spreadsheetId, tabName, plan.startRow, plan.kinds.length);
+      console.log(`[sheets] ↪️ Late row (${dateStr}) inserted at row ${plan.dataRow} of "${tabName}" — ${plan.kinds.length} row(s) pushed down, ${shifted} stored row number(s) shifted`);
+    }
+
+    opts.rowSeq = _insertLog(spreadsheetId, tabName).seq;
+    if (typeof opts.persistRow === "function") {
+      try { await opts.persistRow(plan.dataRow); }
+      catch (err) { console.error(`[sheets] persistRow for "${tabName}" row ${plan.dataRow}: ${err.message}`); }
+    }
+    return plan.dataRow;
+  });
+
+  await _mirrorMasterRow(spreadsheetId, tabName, rowValues, opts);
+  return dataRow;
 }
 
 /**
@@ -393,112 +614,6 @@ async function applyCenterAlignmentBatch(spreadsheetId, tabName, rowNumbers, end
     spreadsheetId,
     requestBody: { requests },
   });
-}
-
-// Zero-width space — marks a day-divider row's anchor cell. Non-whitespace
-// (so appendRow's `.trim() !== ""` anchor check counts it and the next real
-// row lands BELOW the divider), but invisible to humans.
-const DAY_DIVIDER_MARK = "​";
-
-/**
- * Insert a black separator bar at the start of a new day's submissions in the
- * master sheet — the visual day-break the team used to keep by hand.
- *
- * Fires only when the brief's date differs from the last real data row's date
- * (so it lands once per day, above that day's first brief). Idempotent: if the
- * last row is already a divider, it no-ops.
- *
- * Mechanics: appends a row whose ANCHOR cell holds a zero-width space (so the
- * brief rows append below it, not over it) and whose A:endColumn cells get a
- * black background via batchUpdate — matching the old empty-black-bar look.
- *
- * Detection compares NORMALIZED M/D/YY (extracted by regex), so "Tue 5/26/26"
- * vs "Wed, 5/27/26" formatting drift doesn't cause false splits.
- *
- * Fully fail-open: any error is logged and swallowed (returns {inserted:false})
- * so a divider hiccup never blocks the brief's real sheet writes.
- *
- * @returns {Promise<{inserted: boolean, row?: number}>}
- */
-async function maybeInsertDayDivider(spreadsheetId, tabName, briefDateStr, opts = {}) {
-  try {
-    if (!spreadsheetId || !briefDateStr) return { inserted: false };
-    const anchorColumn = opts.anchorColumn || "B"; // master: Client col
-    const dateColumn   = opts.dateColumn   || "D"; // master: Date col
-    const endColumn    = opts.endColumn    || "K";
-
-    const auth   = getAuth();
-    const client = await auth.getClient();
-    const sheets = getThrottledSheets(client);
-
-    const norm = (s) => {
-      const m = String(s || "").match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
-      return m ? `${+m[1]}/${+m[2]}/${m[3].slice(-2)}` : null;
-    };
-    const briefNorm = norm(briefDateStr);
-    if (!briefNorm) return { inserted: false }; // can't parse incoming date — skip
-
-    // Last REAL data date (divider rows have empty date col, so naturally skipped)
-    const dateResp = await sheets.spreadsheets.values.get({
-      spreadsheetId, range: `${tabName}!${dateColumn}:${dateColumn}`, majorDimension: "COLUMNS",
-    });
-    const dateVals = (dateResp.data.values && dateResp.data.values[0]) || [];
-    let lastDate = null;
-    for (let i = dateVals.length - 1; i >= 0; i--) {
-      if (dateVals[i] != null && String(dateVals[i]).trim() !== "") { lastDate = dateVals[i]; break; }
-    }
-    if (!lastDate) return { inserted: false };          // no data yet → no divider before day 1
-    if (norm(lastDate) === briefNorm) return { inserted: false }; // same day → no divider
-
-    // Guard against double dividers: if the last anchored row is already a
-    // divider mark, don't stack another.
-    const anchorResp = await sheets.spreadsheets.values.get({
-      spreadsheetId, range: `${tabName}!${anchorColumn}:${anchorColumn}`, majorDimension: "COLUMNS",
-    });
-    const anchorVals = (anchorResp.data.values && anchorResp.data.values[0]) || [];
-    for (let i = anchorVals.length - 1; i >= 0; i--) {
-      const v = anchorVals[i];
-      if (v != null && String(v).trim() !== "") {
-        if (v === DAY_DIVIDER_MARK) return { inserted: false };
-        break;
-      }
-    }
-
-    // Build a blank divider row with the zero-width mark in the anchor column,
-    // then reuse appendRow (handles deterministic placement + grid-extend).
-    const colIdx = anchorColumn.toUpperCase().charCodeAt(0) - 65;
-    const endIdx = endColumn.toUpperCase().charCodeAt(0) - 65;
-    const rowValues = Array.from({ length: endIdx + 1 }, (_, i) => (i === colIdx ? DAY_DIVIDER_MARK : ""));
-    const dividerRow = await appendRow(spreadsheetId, tabName, rowValues, { anchorColumn, endColumn });
-    if (!dividerRow) return { inserted: false };
-
-    // Paint A:endColumn black.
-    const meta  = await sheets.spreadsheets.get({ spreadsheetId });
-    const sheet = meta.data.sheets?.find((s) => s.properties.title === tabName);
-    if (sheet) {
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId,
-        requestBody: {
-          requests: [{
-            repeatCell: {
-              range: {
-                sheetId: sheet.properties.sheetId,
-                startRowIndex: dividerRow - 1, endRowIndex: dividerRow,
-                startColumnIndex: 0, endColumnIndex: endIdx + 1,
-              },
-              cell: { userEnteredFormat: { backgroundColor: { red: 0, green: 0, blue: 0 } } },
-              fields: "userEnteredFormat.backgroundColor",
-            },
-          }],
-        },
-      });
-    }
-    console.log(`[sheets] ▬ Day divider inserted at row ${dividerRow} (new day: ${briefDateStr})`);
-    return { inserted: true, row: dividerRow };
-  } catch (err) {
-    console.error(`[sheets] maybeInsertDayDivider (non-fatal): ${err.message}`);
-    return { inserted: false };
-  }
 }
 
 /**
@@ -1786,10 +1901,10 @@ async function fixDropdownColumn(spreadsheetId, tabName, colLetter, opts = {}) {
 }
 
 module.exports = {
-  appendRow, markForwarded, markForwardedBatch, repinDateByClient, sheetsClient,
+  appendRow, insertRowByDate, currentRowNumber, markForwarded, markForwardedBatch, repinDateByClient, sheetsClient,
   getColumnDropdownOptions, snapToDropdown, fixDropdownColumn,
   applyCenterAlignmentBatch, applyColumnCenterAlignment,
-  getLastDate, appendSeparatorRow, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, getClientDateKeys, dateKeyOf, readMasterPlacements, readPagePlacements,
+  getLastDate, appendSeparatorRow, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, getClientDateKeys, dateKeyOf, readMasterPlacements, readPagePlacements,
   updateStatusToLive, updateAdPrice, updateAdClient, updateAdDate, updateAdPageHandle, deleteAdRows, deleteRowsByNumber,
   appendReminder, appendRemindersBatch, getPendingReminders, markReminderSent,
 };

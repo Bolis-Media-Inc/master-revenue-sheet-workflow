@@ -25,7 +25,8 @@
 const adBriefs       = require("../lib/adBriefs");
 const pagesRegistry  = require("../lib/pages");
 const {
-  appendRow,
+  insertRowByDate,
+  currentRowNumber,
   markForwardedBatch,
   applyCenterAlignmentBatch,
 } = require("../sheets");
@@ -151,14 +152,20 @@ async function ingestWizardBrief(telegram, payload) {
           timeMST: brief.time_mst, pageHandle: handle, bulkNum: p.bulk_num, adPrice: p.price,
           status: "Scheduled", nif: brief.nif, postType: brief.post_type, postDuration: brief.post_duration,
         } };
-        const rowNum = await appendRow(MASTER_SHEET_ID, TAB_NAME, row, appendOpts);
+        // Approvals that land days late go into their date section (with a
+        // day divider if that day has none), not under today's ads.
+        const pageRowId = pageRowIdByHandle.get(handle);
+        appendOpts.dateStr = brief.date_posted;
+        if (pageRowId) {
+          appendOpts.persistRow = (r) => adBriefs.updatePageSheetRows(pageRowId, { masterSheetRow: r }).catch(() => {});
+        }
+        const rowNum = await insertRowByDate(MASTER_SHEET_ID, TAB_NAME, row, appendOpts);
         if (rowNum) {
           writes.master_rows++;
           masterRowsToFormat.push(rowNum);
-          masterRowsToTickForwarded.push(rowNum);
-          const pageRowId = pageRowIdByHandle.get(handle);
-          if (pageRowId) {
-            await adBriefs.updatePageSheetRows(pageRowId, { masterSheetRow: rowNum, ledgerSheetRow: appendOpts.v2LedgerRow ?? null }).catch(() => {});
+          masterRowsToTickForwarded.push({ row: rowNum, seq: appendOpts.rowSeq });
+          if (pageRowId && appendOpts.v2LedgerRow != null) {
+            await adBriefs.updatePageSheetRows(pageRowId, { ledgerSheetRow: appendOpts.v2LedgerRow }).catch(() => {});
           }
         }
       } catch (err) {
@@ -193,13 +200,15 @@ async function ingestWizardBrief(telegram, payload) {
       "",                                                                // H: Notes
     ];
     try {
-      const rowNum = await appendRow(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "A", endColumn: "H" });
+      const pageRowId = pageRowIdByHandle.get(handle);
+      const rowNum = await insertRowByDate(sheetId, PAGE_TAB_NAME, row, {
+        anchorColumn: "A", endColumn: "H", dateStr: brief.date_posted,
+        persistRow: pageRowId
+          ? (r) => adBriefs.updatePageSheetRows(pageRowId, { pageSheetRow: r }).catch(() => {})
+          : null,
+      });
       if (rowNum) {
         writes.page_rows++;
-        const pageRowId = pageRowIdByHandle.get(handle);
-        if (pageRowId) {
-          await adBriefs.updatePageSheetRows(pageRowId, { pageSheetRow: rowNum }).catch(() => {});
-        }
         applyCenterAlignmentBatch(sheetId, PAGE_TAB_NAME, [rowNum], "H").catch(() => {});
       }
     } catch (err) {
@@ -264,7 +273,9 @@ async function ingestWizardBrief(telegram, payload) {
   // ── 5. Tick Forwarded checkbox on master sheet for everything that forwarded
   // (batched single call). Best-effort.
   if (masterRowsToTickForwarded.length > 0 && MASTER_SHEET_ID) {
-    markForwardedBatch(MASTER_SHEET_ID, TAB_NAME, masterRowsToTickForwarded)
+    // Rows may have been pushed down by a late insert while the briefs sent.
+    const rowsNow = masterRowsToTickForwarded.map((t) => currentRowNumber(MASTER_SHEET_ID, TAB_NAME, t.row, t.seq));
+    markForwardedBatch(MASTER_SHEET_ID, TAB_NAME, rowsNow)
       .then(() => console.log(`[ingest-wizard-brief] ✅ markForwarded ticked ${masterRowsToTickForwarded.length}`))
       .catch((err) => console.error(`[ingest-wizard-brief] ❌ markForwarded: ${err.message}`));
   }
