@@ -12,7 +12,7 @@
  */
 
 const { parseAdMessage }       = require("../parser");
-const { appendRow, markForwardedBatch, updateStatusToLive, updateAdDate, updateAdPageHandle, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, maybeInsertDayDivider, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, repinDateByClient, fixDropdownColumn, getColumnDropdownOptions, snapToDropdown, getClientDateKeys, dateKeyOf, readMasterPlacements, readPagePlacements } = require("../sheets");
+const { insertRowByDate, currentRowNumber, markForwardedBatch, updateStatusToLive, updateAdDate, updateAdPageHandle, appendRemindersBatch, applyCenterAlignmentBatch, applyColumnCenterAlignment, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, repinDateByClient, fixDropdownColumn, getColumnDropdownOptions, snapToDropdown, getClientDateKeys, dateKeyOf, readMasterPlacements, readPagePlacements } = require("../sheets");
 const { clearBufferUpTo, getCollabBundlesByPage, getContentBundlesByPage, getFilenameBundlesByPage, getMessages, getPrecedingMessages, getStandardBundle, getBlockStructure, getBriefBlockForAI } = require("../messageBuffer");
 const { parseNifMs, scheduleNifReminder } = require("../scheduler");
 const { parsePostDuration }    = require("../reminders");
@@ -1438,17 +1438,20 @@ async function handleReplayCommand(ctx) {
       // network blip, etc.), DB will have null master_sheet_row /
       // page_sheet_row on the corresponding ad_brief_pages row. Now that
       // we're successfully forwarding, re-attempt those writes using the
-      // now-deterministic appendRow. Failures here are non-fatal — log,
+      // date-aware insertRowByDate. Failures here are non-fatal — log,
       // don't abort the rest of the loop.
       const dbPage = dbPagesByHandle.get(handle.toLowerCase());
       if (dbPage && parsedItem) {
         // Master sheet backfill
         if (MASTER_SHEET_ID && !dbPage.master_sheet_row && !PLACEHOLDER_PATTERN.test(MASTER_SHEET_ID)) {
           try {
-            const appendOpts = { v2: parsedItem };
-            const rowNum = await appendRow(MASTER_SHEET_ID, TAB_NAME, buildRow(parsedItem), appendOpts);
+            const appendOpts = {
+              v2: parsedItem, dateStr: parsedItem.datePosted,
+              persistRow: (r) => adBriefs.updatePageSheetRows(dbPage.id, { masterSheetRow: r }).catch(() => {}),
+            };
+            const rowNum = await insertRowByDate(MASTER_SHEET_ID, TAB_NAME, buildRow(parsedItem), appendOpts);
             if (rowNum) {
-              adBriefs.updatePageSheetRows(dbPage.id, { masterSheetRow: rowNum, ledgerSheetRow: appendOpts.v2LedgerRow ?? null }).catch(() => {});
+              if (appendOpts.v2LedgerRow != null) adBriefs.updatePageSheetRows(dbPage.id, { ledgerSheetRow: appendOpts.v2LedgerRow }).catch(() => {});
               // Center-align the backfilled row to match the rest of the sheet
               applyCenterAlignmentBatch(MASTER_SHEET_ID, TAB_NAME, [rowNum], "K")
                 .catch(() => {});
@@ -1463,12 +1466,14 @@ async function handleReplayCommand(ctx) {
           const sheetId = pagesRegistry.getSheetId(handle);
           if (sheetId && !PLACEHOLDER_PATTERN.test(sheetId)) {
             try {
-              const rowNum = await appendRow(
+              const rowNum = await insertRowByDate(
                 sheetId, PAGE_TAB_NAME, await buildPageRowSnapped(sheetId, parsedItem),
-                { anchorColumn: "A", endColumn: "H" },
+                {
+                  anchorColumn: "A", endColumn: "H", dateStr: parsedItem.datePosted,
+                  persistRow: (r) => adBriefs.updatePageSheetRows(dbPage.id, { pageSheetRow: r }).catch(() => {}),
+                },
               );
               if (rowNum) {
-                adBriefs.updatePageSheetRows(dbPage.id, { pageSheetRow: rowNum }).catch(() => {});
                 applyCenterAlignmentBatch(sheetId, PAGE_TAB_NAME, [rowNum], "H").catch(() => {});
                 console.log(`[adHandler] 🩹 /replay backfilled per-page row ${rowNum} for @${handle}`);
               }
@@ -1481,9 +1486,10 @@ async function handleReplayCommand(ctx) {
         // and re-replays of previously-failed forwards). Persist the FRESH
         // message-id set from this replay so the next /replay cleans these
         // (not the now-deleted old ones) and /update edits the right brief.
+        // Sheet row numbers aren't re-sent: they were saved at write time,
+        // and this dbPage snapshot could be stale if a late-dated insert
+        // shifted them during the replay.
         adBriefs.markPageForwarded(dbPage.id, {
-          masterSheetRow: dbPage.master_sheet_row ?? null,
-          pageSheetRow:   dbPage.page_sheet_row   ?? null,
           messageIds:     replayIds.length > 0 ? replayIds : null,
         }).catch(() => {});
       }
@@ -1513,7 +1519,7 @@ async function handleReplayCommand(ctx) {
  *
  * Walks ad_brief_pages for entries with NULL master_sheet_row or
  * NULL page_sheet_row, rebuilds the rows from the joined brief data,
- * appends to the correct sheets via the (now grid-extending) appendRow,
+ * writes them into their date sections via insertRowByDate,
  * and writes the resulting row numbers back to DB.
  *
  * Idempotent — only writes when the corresponding sheet_row column is
@@ -1621,17 +1627,22 @@ async function handleSyncSheetsCommand(ctx) {
     // ── Master sheet backfill ───────────────────────────────────────────
     if (!row.master_sheet_row && MASTER_SHEET_ID && !PLACEHOLDER_PATTERN.test(MASTER_SHEET_ID)) {
       try {
-        const appendOpts = { v2: parsedItem };
-        const rowNum = await appendRow(MASTER_SHEET_ID, TAB_NAME, buildRow(parsedItem), appendOpts);
+        const appendOpts = {
+          v2: parsedItem, dateStr: parsedItem.datePosted,
+          persistRow: (r) => adBriefs.updatePageSheetRows(row.id, { masterSheetRow: r }),
+        };
+        const rowNum = await insertRowByDate(MASTER_SHEET_ID, TAB_NAME, buildRow(parsedItem), appendOpts);
         if (rowNum) {
-          await adBriefs.updatePageSheetRows(row.id, { masterSheetRow: rowNum, ledgerSheetRow: appendOpts.v2LedgerRow ?? null });
+          if (appendOpts.v2LedgerRow != null) await adBriefs.updatePageSheetRows(row.id, { ledgerSheetRow: appendOpts.v2LedgerRow });
           applyCenterAlignmentBatch(MASTER_SHEET_ID, TAB_NAME, [rowNum], "K").catch(() => {});
           masterWritten++;
           console.log(`[adHandler] 🩹 /syncsheets: master row ${rowNum} → ${brief.client} / @${row.page_handle}`);
           // If the page was already forwarded (per DB), the original
           // markForwardedBatch never saw this row number (sheet write
           // had failed at that point). Queue for batched tick at end.
-          if (row.forwarded_at) masterRowsToTickForwarded.push(rowNum);
+          // Keep the insert seq: a later (earlier-dated) backfill in this
+          // same run can push this row down before the tick fires.
+          if (row.forwarded_at) masterRowsToTickForwarded.push({ row: rowNum, seq: appendOpts.rowSeq });
         }
       } catch (err) {
         masterFailed++;
@@ -1669,11 +1680,11 @@ async function handleSyncSheetsCommand(ctx) {
         continue;
       }
       try {
-        const rowNum = await appendRow(sheetId, PAGE_TAB_NAME, await buildPageRowSnapped(sheetId, parsedItem), {
-          anchorColumn: "A", endColumn: "H",
+        const rowNum = await insertRowByDate(sheetId, PAGE_TAB_NAME, await buildPageRowSnapped(sheetId, parsedItem), {
+          anchorColumn: "A", endColumn: "H", dateStr: parsedItem.datePosted,
+          persistRow: (r) => adBriefs.updatePageSheetRows(row.id, { pageSheetRow: r }),
         });
         if (rowNum) {
-          await adBriefs.updatePageSheetRows(row.id, { pageSheetRow: rowNum });
           applyCenterAlignmentBatch(sheetId, PAGE_TAB_NAME, [rowNum], "H").catch(() => {});
           pageWritten++;
           console.log(`[adHandler] 🩹 /syncsheets: page row ${rowNum} → @${row.page_handle} (${brief.client})`);
@@ -1696,7 +1707,8 @@ async function handleSyncSheetsCommand(ctx) {
   let forwardedTicked = 0;
   if (masterRowsToTickForwarded.length > 0 && MASTER_SHEET_ID) {
     try {
-      await markForwardedBatch(MASTER_SHEET_ID, TAB_NAME, masterRowsToTickForwarded);
+      await markForwardedBatch(MASTER_SHEET_ID, TAB_NAME,
+        masterRowsToTickForwarded.map((t) => currentRowNumber(MASTER_SHEET_ID, TAB_NAME, t.row, t.seq)));
       forwardedTicked = masterRowsToTickForwarded.length;
       console.log(`[adHandler] 🩹 /syncsheets: ticked ${forwardedTicked} Forwarded checkbox(es)`);
     } catch (err) {
@@ -2091,7 +2103,7 @@ async function handleBonusCommand(ctx) {
     // A=Client, B=AdType, C=Bulk, D=Date, E=PostType, F=Duration, G=Price, H=Notes
     const row = ["IG Payout (Instagram Bonus)", "Bonus", "", dateStr, "", "", money(amount), ""];
     try {
-      const rowNum = await appendRow(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "A", endColumn: "H" });
+      const rowNum = await insertRowByDate(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "A", endColumn: "H", dateStr });
       if (rowNum) {
         applyCenterAlignmentBatch(sheetId, PAGE_TAB_NAME, [rowNum], "H").catch(() => {});
         written.push({ handle: canonical, amount });
@@ -2234,7 +2246,7 @@ async function handleClipsCommand(ctx) {
     // A=Client, B=AdType, C=Bulk, D=Date, E=PostType, F=Duration, G=Price, H=Notes
     const row = [campaign, "Clipping", "", dateStr, "", "", money(amount), ""];
     try {
-      const rowNum = await appendRow(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "A", endColumn: "H" });
+      const rowNum = await insertRowByDate(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "A", endColumn: "H", dateStr });
       if (rowNum) {
         applyCenterAlignmentBatch(sheetId, PAGE_TAB_NAME, [rowNum], "H").catch(() => {});
         keys.add(clipKey);   // catch a duplicate campaign later in the same run
@@ -3857,7 +3869,8 @@ async function handleAdMessage(ctx) {
     }
 
     // ── Write to Master Revenue Sheet ──────────────────────────────────────────
-    // masterRowByHandle: handle → 1-indexed row number (used later to tick checkbox)
+    // masterRowByHandle: handle → { row, seq } (used later to tick checkbox;
+    // currentRowNumber() follows the row if a late insert pushed it down)
     const masterRowByHandle = new Map();
 
     // Row numbers we successfully wrote — flushed to a single batched
@@ -3866,34 +3879,43 @@ async function handleAdMessage(ctx) {
     const masterRowsToFormat = [];
     if (MASTER_SHEET_ID && !PLACEHOLDER_PATTERN.test(MASTER_SHEET_ID)) {
 
-      // Insert a black day-divider bar if this brief starts a new day in the
-      // master sheet (matches the team's old by-hand day breaks). Fires once
-      // per day, above that day's first brief. Fully fail-open — never blocks
-      // the real row writes below.
-      await maybeInsertDayDivider(MASTER_SHEET_ID, TAB_NAME, parsedList[0]?.datePosted);
-
+      // insertRowByDate files each row into its date section: current-day rows
+      // append at the bottom (with a black day-divider bar above a new day's
+      // first brief); late rows (/checkmissed adds, late approvals) go into
+      // their own day instead of under today's ads.
       let successCount = 0;
       for (const item of parsedList) {
         const row = buildRow(item);
         try {
           // Hold the opts object so we can read back the Ledger row the mirror
           // wrote (opts.v2LedgerRow) and persist it alongside master_sheet_row.
-          const appendOpts = { v2: item };
-          const rowNumber = await appendRow(MASTER_SHEET_ID, TAB_NAME, row, appendOpts);
+          // Persist master row number to DB. Runs inside insertRowByDate's
+          // tab lock so a concurrent late insert can't shift rows between
+          // the write and this save. Explicit error logging so we can match
+          // this against the per-page DB update — if master succeeds and
+          // per-page fails (the symptom we saw), both logs will be present
+          // in Railway and we can compare.
+          const pageRowId = item.pageHandle ? pageRowIdByHandle.get(item.pageHandle.toLowerCase()) : null;
+          const appendOpts = {
+            v2: item,
+            dateStr: item.datePosted,
+            persistRow: pageRowId
+              ? (r) => adBriefs.updatePageSheetRows(pageRowId, { masterSheetRow: r }).catch((dbErr) => {
+                  console.error(`[adHandler] ❌ DB persist master_sheet_row for @${item.pageHandle}: ${dbErr.message}`);
+                })
+              : null,
+          };
+          const rowNumber = await insertRowByDate(MASTER_SHEET_ID, TAB_NAME, row, appendOpts);
           successCount++;
           if (rowNumber) masterRowsToFormat.push(rowNumber);
           if (item.pageHandle && rowNumber) {
-            masterRowByHandle.set(item.pageHandle, rowNumber);
-            // Persist master row number to DB. Awaited with explicit error
-            // logging so we can match this against the per-page DB update —
-            // if master succeeds and per-page fails (the symptom we saw),
-            // both logs will be present in Railway and we can compare.
-            const pageRowId = pageRowIdByHandle.get(item.pageHandle.toLowerCase());
-            if (pageRowId) {
+            masterRowByHandle.set(item.pageHandle, { row: rowNumber, seq: appendOpts.rowSeq });
+            // Ledger row is only known after the mirror (outside the lock).
+            if (pageRowId && appendOpts.v2LedgerRow != null) {
               try {
-                await adBriefs.updatePageSheetRows(pageRowId, { masterSheetRow: rowNumber, ledgerSheetRow: appendOpts.v2LedgerRow ?? null });
+                await adBriefs.updatePageSheetRows(pageRowId, { ledgerSheetRow: appendOpts.v2LedgerRow });
               } catch (dbErr) {
-                console.error(`[adHandler] ❌ DB persist master_sheet_row for @${item.pageHandle}: ${dbErr.message}`);
+                console.error(`[adHandler] ❌ DB persist ledger_sheet_row for @${item.pageHandle}: ${dbErr.message}`);
               }
             }
           }
@@ -3935,29 +3957,32 @@ async function handleAdMessage(ctx) {
 
       const row = await buildPageRowSnapped(sheetId, item);
       try {
-        // Per-page sheets: col A = Client Name (always filled), cols go A→H
-        const pageSheetRowNum = await appendRow(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "A", endColumn: "H" });
-        pageSheetCount++;
-        if (pageSheetRowNum) {
-          if (!perPageRowsToFormat.has(sheetId)) perPageRowsToFormat.set(sheetId, []);
-          perPageRowsToFormat.get(sheetId).push(pageSheetRowNum);
-        }
         // Persist per-page sheet row to DB for audit + retry visibility.
         // Was previously fire-and-forget with .catch(() => {}) but production
         // showed this update silently failing for every brief — DB rows had
         // master_sheet_row set but page_sheet_row=null even though the bot
         // logged "Page sheet write" successfully. Switched to await+explicit
         // error logging so any failure mode (network, supabase quota, etc.)
-        // surfaces in Railway logs instead of hiding behind .catch().
+        // surfaces in Railway logs instead of hiding behind .catch(). Runs
+        // via persistRow, inside insertRowByDate's tab lock.
         const pageRowId = pageRowIdByHandle.get(item.pageHandle.toLowerCase());
-        if (pageRowId && pageSheetRowNum) {
-          try {
-            await adBriefs.updatePageSheetRows(pageRowId, { pageSheetRow: pageSheetRowNum });
-          } catch (dbErr) {
-            console.error(`[adHandler] ❌ DB persist page_sheet_row for @${item.pageHandle} (page_row=${pageRowId.slice(0,8)}, sheet_row=${pageSheetRowNum}): ${dbErr.message}`);
-          }
-        } else if (!pageRowId) {
+        if (!pageRowId) {
           console.warn(`[adHandler] ⚠️ DB persist skipped: no pageRowId mapping for @${item.pageHandle} (handle key lookup miss; map has ${pageRowIdByHandle.size} entries)`);
+        }
+        // Per-page sheets: col A = Client Name (always filled), cols go A→H.
+        // Late-dated rows land in their date section, not at the bottom.
+        const pageSheetRowNum = await insertRowByDate(sheetId, PAGE_TAB_NAME, row, {
+          anchorColumn: "A", endColumn: "H", dateStr: item.datePosted,
+          persistRow: pageRowId
+            ? (r) => adBriefs.updatePageSheetRows(pageRowId, { pageSheetRow: r }).catch((dbErr) => {
+                console.error(`[adHandler] ❌ DB persist page_sheet_row for @${item.pageHandle} (page_row=${pageRowId.slice(0,8)}, sheet_row=${r}): ${dbErr.message}`);
+              })
+            : null,
+        });
+        pageSheetCount++;
+        if (pageSheetRowNum) {
+          if (!perPageRowsToFormat.has(sheetId)) perPageRowsToFormat.set(sheetId, []);
+          perPageRowsToFormat.get(sheetId).push(pageSheetRowNum);
         }
         console.log(`[adHandler] ✅ Page sheet write: @${item.pageHandle} → "${PAGE_TAB_NAME}" (sheet row ${pageSheetRowNum}, db row ${pageRowId ? pageRowId.slice(0,8) : "n/a"})`);
       } catch (err) {
@@ -4691,15 +4716,16 @@ async function handleAdMessage(ctx) {
           const pageRowId = pageRowIdByHandle.get(handle.toLowerCase());
           if (pageRowId) {
             adBriefs.markPageForwarded(pageRowId, {
-              masterSheetRow: masterRowByHandle.get(handle) ?? null,
+              // master_sheet_row was already saved at write time (and is
+              // kept current by late-insert shifts) — don't re-send it here.
               messageIds:     forwardedIds.length > 0 ? forwardedIds : null,
             }).catch(() => {});
           }
 
           // ── Queue "Forwarded" checkbox tick (batched after loop) ────────────
-          const masterRow = masterRowByHandle.get(handle);
-          if (MASTER_SHEET_ID && masterRow) {
-            masterRowsToMark.push(masterRow);
+          const masterRef = masterRowByHandle.get(handle);
+          if (MASTER_SHEET_ID && masterRef) {
+            masterRowsToMark.push(currentRowNumber(MASTER_SHEET_ID, TAB_NAME, masterRef.row, masterRef.seq));
           }
 
           // ── Queue post-expiry / analytics reminder (batched after loop) ──
@@ -4805,7 +4831,20 @@ async function routeBriefPageToHandle({ telegram, chatId, briefMsgId, correctHan
 
   best.pageHandle = correct;
   const row = await buildPageRowSnapped(sheetId, best);
-  const rowNum = await appendRow(sheetId, PAGE_TAB_NAME, row, { anchorColumn: "A", endColumn: "H" });
+  // The DB repoint runs as persistRow (inside the tab lock) so a concurrent
+  // late insert into this page sheet can't shift the row before it's saved.
+  const rowNum = await insertRowByDate(sheetId, PAGE_TAB_NAME, row, {
+    anchorColumn: "A", endColumn: "H", dateStr: best.datePosted,
+    persistRow: async (r) => {
+      try {
+        if (adBriefs._supabase && briefId) {
+          await adBriefs._supabase.from("ad_brief_pages")
+            .update({ page_handle: correct, page_sheet_row: r })
+            .eq("brief_id", briefId).eq("page_handle", wrong);
+        }
+      } catch (err) { console.error(`[routePage] db update: ${err.message}`); }
+    },
+  });
 
   let masterFixed = 0;
   try {
@@ -4813,14 +4852,6 @@ async function routeBriefPageToHandle({ telegram, chatId, briefMsgId, correctHan
       masterFixed = await updateAdPageHandle(MASTER_SHEET_ID, TAB_NAME, wrong, correct, best.client, best.datePosted);
     }
   } catch (err) { console.error(`[routePage] master repoint: ${err.message}`); }
-
-  try {
-    if (adBriefs._supabase && briefId) {
-      await adBriefs._supabase.from("ad_brief_pages")
-        .update({ page_handle: correct, page_sheet_row: rowNum })
-        .eq("brief_id", briefId).eq("page_handle", wrong);
-    }
-  } catch (err) { console.error(`[routePage] db update: ${err.message}`); }
 
   return { ok: true, wrong, correct, rowNum, masterFixed, price: best.adPrice };
 }
