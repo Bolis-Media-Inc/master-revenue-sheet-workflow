@@ -4017,8 +4017,12 @@ bot.on("text", async (ctx) => {
   }
 
   // ── Reply feedback on sourced/betslip images ──────────────────────────
+  // DM-only, and only replies to an image Greg himself sent. Without this,
+  // every caption a VA posts as a reply to a cover in a group (e.g. Internal
+  // Network Ads) was stored as "feedback" and answered in the chat.
   const reply = ctx.message.reply_to_message;
-  if (reply && (reply.photo || reply.document) && ctx.message.text.length > 3) {
+  if (ctx.chat?.type === "private" && reply && reply.from?.id === ctx.botInfo?.id &&
+      (reply.photo || reply.document) && ctx.message.text.length > 3) {
     // User is replying to an image with feedback text
     const feedbackText = ctx.message.text.trim();
     const caption = reply.caption || "";
