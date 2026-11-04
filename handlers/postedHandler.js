@@ -33,6 +33,7 @@
 
 const { extractIGPostInfo, hasIGUrl, extractHandleMention } = require("../lib/igUrl");
 const sessions     = require("../lib/sessions");
+const adBriefs     = require("../lib/adBriefs");
 const digiClient   = require("../lib/digiClient");
 const captionMatch = require("../lib/captionMatch");
 const { updateStatusToLive, updateAdDate } = require("../sheets");
@@ -425,15 +426,30 @@ async function handlePostedOnConfirmation(ctx) {
       //    single source of truth and the contributor can immediately
       //    see "Marked Live for @page" in their reply
       const sessionHandles = ads.map((a) => a.page_handle);
+
+      // Move only the placement this confirmation is for: match the brief's own
+      // scheduled date, same as bm_tracking_bot's Posted-on. A blind client+page
+      // match re-dated every row of a recurring client (the Aug-2026 FashionNova
+      // clobber). No brief date → leave dates alone rather than guess.
+      let matchDate = null;
+      if (overrideDate && brief?.chatId && brief?.messageId) {
+        try {
+          const row = await adBriefs.findBriefByTelegramMessage(brief.chatId, brief.messageId);
+          matchDate = row?.date_posted || null;
+        } catch (e) { console.error("[postedHandler] brief date lookup:", e.message); }
+      }
+      const dateSkipped = !!overrideDate && !matchDate;
+      if (dateSkipped) console.warn(`[postedHandler] ⚠️ date override skipped for session ${sessionId} — no brief date to target`);
+
       if (MASTER_SHEET_ID) {
         try {
           const flipped = await updateStatusToLive(MASTER_SHEET_ID, TAB_NAME, sessionHandles, clientName);
           totalSheetRows += flipped;
         } catch (e) { console.error("[postedHandler] master status update:", e.message); }
 
-        if (overrideDate) {
+        if (matchDate) {
           try {
-            await updateAdDate(MASTER_SHEET_ID, TAB_NAME, sessionHandles, clientName, overrideDate, true);
+            await updateAdDate(MASTER_SHEET_ID, TAB_NAME, sessionHandles, clientName, overrideDate, true, { matchDate });
           } catch (e) { console.error("[postedHandler] master date update:", e.message); }
         }
       }
@@ -441,12 +457,12 @@ async function handlePostedOnConfirmation(ctx) {
       // Per-page sheets: status flip is done via mirror (bm_tracking_bot
       // would also flip, but it'll skip due to greg-handled marker — see
       // below). For the page sheet date, do it directly.
-      if (overrideDate) {
+      if (matchDate) {
         for (const handle of sessionHandles) {
           const pageSheetId = pagesRegistry.getSheetId(handle);
           if (!pageSheetId || PLACEHOLDER_PATTERN.test(pageSheetId)) continue;
           try {
-            await updateAdDate(pageSheetId, PAGE_TAB_NAME, [handle], clientName, overrideDate, false);
+            await updateAdDate(pageSheetId, PAGE_TAB_NAME, [handle], clientName, overrideDate, false, { matchDate });
           } catch (e) { console.error(`[postedHandler] @${handle} sheet date:`, e.message); }
         }
       }
@@ -489,7 +505,8 @@ async function handlePostedOnConfirmation(ctx) {
 
       replyParts.push(
         `✅ @${ads.map((a) => a.page_handle).join(", @")} — ${clientName || "unknown client"}` +
-        (overrideDate ? ` (date: ${overrideDate})` : "")
+        (dateSkipped ? ` (date NOT changed — couldn't tell which placement; reply to the brief in Internal Network Ads instead)`
+          : overrideDate ? ` (date: ${overrideDate})` : "")
       );
     }
 
