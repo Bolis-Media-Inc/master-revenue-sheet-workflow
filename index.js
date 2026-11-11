@@ -64,6 +64,12 @@ bot.command("checkmissed", handleCheckMissedCommand);
 bot.action(/^ckadd:-?\d+:\d+$/, handleCheckMissedCallback);
 bot.action(/^ckskip:\d+$/, handleCheckMissedCallback);
 
+// ── /auditprices [days] — compare every brief's price as it reads NOW in the
+// ads chat (edits included) against master / page P/L / DB. Read-only; prints
+// a ready-to-paste /update price per mismatch. See handlers/auditPricesHandler.js.
+const { handleAuditPricesCommand } = require("./handlers/auditPricesHandler");
+bot.command("auditprices", handleAuditPricesCommand);
+
 // ── /editbrief — surgical edit of ONE bot-sent message via Telegram link ─────
 // Manual escape hatch for past briefs with NULL forwarded_message_ids.
 // `/editbrief <link>` + new text on the next lines. See handlers/editBriefHandler.js.

@@ -846,7 +846,8 @@ async function getClientDateKeys(spreadsheetId, tabName) {
 
 /**
  * Read every placement row from the master sheet and return parsed rows
- * { client, page, mo, day, yr, price } for revenue reporting. Read-only.
+ * { row, client, page, mo, day, yr, price } for revenue reporting (row is the
+ * 1-indexed sheet row, used by /auditprices). Read-only.
  * Master columns: B=Client, D=Date, F=Page, H=Price ($-prefixed). Rows without
  * a client, a parseable date, or a numeric price are skipped, as is the pinned
  * "Undistributed Funds Allocation" line.
@@ -860,7 +861,8 @@ async function readMasterPlacements(spreadsheetId, tabName) {
   });
   const rows = resp.data.values || [];
   const out = [];
-  for (const r of rows) {
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
     const clientCell = (r?.[1] || "").trim();          // B
     if (!clientCell || /undistributed/i.test(clientCell)) continue;
     const m = String(r?.[3] || "").match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/); // D
@@ -870,14 +872,14 @@ async function readMasterPlacements(spreadsheetId, tabName) {
     const price = parseFloat(priceRaw);
     if (!Number.isFinite(price)) continue;
     let yr = +m[3]; if (yr < 100) yr += 2000;
-    out.push({ client: clientCell, page: (r?.[5] || "").trim(), mo: +m[1], day: +m[2], yr, price });
+    out.push({ row: i + 1, client: clientCell, page: (r?.[5] || "").trim(), mo: +m[1], day: +m[2], yr, price });
   }
   return out;
 }
 
 /**
  * Read a per-page P/L sheet and return parsed placement rows
- * { client, mo, day, yr, price }. Read-only. Per-page columns:
+ * { row, client, mo, day, yr, price }. Read-only. Per-page columns:
  * A=Client, D=Date, G=Ad Price. Used by /reconcile to count how many times a
  * client appears in a page's own sheet.
  */
@@ -890,7 +892,8 @@ async function readPagePlacements(spreadsheetId, tabName) {
   });
   const rows = resp.data.values || [];
   const out = [];
-  for (const r of rows) {
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
     const clientCell = (r?.[0] || "").trim();          // A
     if (!clientCell || /^client\b/i.test(clientCell)) continue;
     const m = String(r?.[3] || "").match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/); // D
@@ -898,7 +901,7 @@ async function readPagePlacements(spreadsheetId, tabName) {
     const priceRaw = String(r?.[6] || "").replace(/[$,\s]/g, "");            // G
     const price = parseFloat(priceRaw);
     let yr = +m[3]; if (yr < 100) yr += 2000;
-    out.push({ client: clientCell, mo: +m[1], day: +m[2], yr, price: Number.isFinite(price) ? price : 0 });
+    out.push({ row: i + 1, client: clientCell, mo: +m[1], day: +m[2], yr, price: Number.isFinite(price) ? price : 0 });
   }
   return out;
 }
