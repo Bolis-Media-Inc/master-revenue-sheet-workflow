@@ -96,7 +96,10 @@ async function _editForwardedBriefs(ctx, brief, pages, mutator) {
 /**
  * /update price @handle $newPrice
  *
- * Sheets: updates Master + per-page Price column for matching rows
+ * Sheets: updates the Master + per-page Price cell of THIS brief's placement
+ *         only — its stored row (ad_brief_pages.master_sheet_row /
+ *         page_sheet_row) if that still holds the client, else client + the
+ *         brief's date_posted. Never the client's other dates.
  * DB:     updates ad_brief_pages.page_price
  * Chat:   edits the forwarded brief in each affected page chat,
  *         swapping "@handle - $oldPrice" → "@handle - $newPrice"
@@ -105,12 +108,14 @@ async function updatePrice(ctx, brief, briefPages, handles, newPrice) {
   const replies = [];
   for (const handle of handles) {
     const norm = handle.toLowerCase().replace(/^@/, "");
+    const bp = briefPages.find((p) => (p.page_handle || "").toLowerCase() === norm);
+    const target = _placementTarget(brief, bp, norm);
     // Sheets
-    let masterRows = 0, pageRows = 0;
+    let master = { updated: 0 }, page = { updated: 0 };
     try {
       if (MASTER_SHEET_ID) {
-        masterRows = await sheetsLib.updateAdPrice(
-          MASTER_SHEET_ID, MASTER_TAB_NAME, [norm], brief.client, `$${newPrice}`, true,
+        master = await sheetsLib.updatePlacementPrice(
+          MASTER_SHEET_ID, MASTER_TAB_NAME, { ...target, storedRow: bp?.master_sheet_row }, `$${newPrice}`, true,
         );
       }
     } catch (err) {
@@ -119,8 +124,8 @@ async function updatePrice(ctx, brief, briefPages, handles, newPrice) {
     const pgSheetId = pagesRegistry.getSheetId(norm);
     if (pgSheetId) {
       try {
-        pageRows = await sheetsLib.updateAdPrice(
-          pgSheetId, PAGE_TAB_NAME, [norm], brief.client, `$${newPrice}`, false,
+        page = await sheetsLib.updatePlacementPrice(
+          pgSheetId, PAGE_TAB_NAME, { ...target, storedRow: bp?.page_sheet_row }, `$${newPrice}`, false,
         );
       } catch (err) {
         console.error(`[update price] page @${norm}: ${err.message}`);
@@ -144,7 +149,7 @@ async function updatePrice(ctx, brief, briefPages, handles, newPrice) {
     }
     replies.push(
       `*@${_md(norm)}* → \$${newPrice}: ` +
-      `Master ${masterRows} · Per-page ${pageRows} · DB ${dbUpdated}`
+      `Master ${_rowNote(master)} · Per-page ${pgSheetId ? _rowNote(page) : "no sheet"} · DB ${dbUpdated}`
     );
   }
 
@@ -165,6 +170,23 @@ async function updatePrice(ctx, brief, briefPages, handles, newPrice) {
     replies,
     chatEdits: editResult,
   };
+}
+
+/** The one placement a per-page edit targets (row numbers added per sheet). */
+function _placementTarget(brief, bp, handle) {
+  return {
+    client:    brief.client,
+    page:      handle,
+    date:      brief.date_posted || null,
+    ledgerRow: bp?.ledger_sheet_row || null,
+    oldPrice:  bp?.page_price ?? null,
+  };
+}
+
+/** "row 812" / "row 40 (by date)" / "not found" for the /update reply. */
+function _rowNote(res) {
+  if (!res?.updated) return "not found";
+  return `row ${res.row}${res.via === "date" ? " (by date)" : ""}`;
 }
 
 // ── Subcommand: name (rename campaign client) ────────────────────────────────

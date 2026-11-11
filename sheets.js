@@ -13,6 +13,7 @@
 
 const { google } = require("googleapis");
 const { DAY_DIVIDER_MARK, dateKey, planDatedInsert, rebaseRow } = require("./lib/datedInsert");
+const { pickPlacementRow } = require("./lib/placementRows");
 
 let _auth = null;
 
@@ -1256,6 +1257,9 @@ async function updateAdPageHandle(spreadsheetId, tabName, oldPage, newPage, clie
  * Page sheet (isMasterSheet = false):
  *   Read A:G — A=Client(0), G=Price(6). Match client only, update col G.
  *
+ * Every date is matched, so this reprices a recurring client's whole history.
+ * To change one brief's price use updatePlacementPrice.
+ *
  * Returns the number of cells updated.
  */
 async function updateAdPrice(spreadsheetId, tabName, pageHandles, clientName, newPrice, isMasterSheet = true) {
@@ -1319,6 +1323,51 @@ async function updateAdPrice(spreadsheetId, tabName, pageHandles, clientName, ne
     }
     return updates.length;
   }
+}
+
+/**
+ * Reprice ONE placement — the brief's own row — instead of every row for the
+ * client (updateAdPrice's scope, which repriced a recurring client's whole
+ * history). The row is picked by lib/placementRows.js pickPlacementRow: the
+ * stored row number if it still holds the same client (+ page on the master),
+ * else client + date (+ page). If neither finds it, nothing is written.
+ *
+ * Master: B=client, D=date, F=page, H=price. Per-page: A=client, D=date, G=price.
+ * On the real master this also reprices the matching v2 Ledger row.
+ *
+ * @param {{client:string, page:string, date?:string, storedRow?:number,
+ *          ledgerRow?:number, oldPrice?:any}} target
+ * @returns {Promise<{updated:number, row:number|null, via:"stored"|"date"|null}>}
+ */
+async function updatePlacementPrice(spreadsheetId, tabName, target, newPrice, isMasterSheet = true) {
+  const sheets = await sheetsClient();
+  const resp = await sheets.spreadsheets.values.get({ spreadsheetId, range: `${tabName}!A:H` });
+  const cells = resp.data.values || [];
+  const cClient = isMasterSheet ? 1 : 0; // B vs A
+  const cPage   = isMasterSheet ? 5 : -1; // F (master only)
+  const cPrice  = isMasterSheet ? 7 : 6;  // H vs G
+  const rows = cells.map((r, i) => ({
+    row:    i + 1,
+    client: r?.[cClient],
+    page:   cPage >= 0 ? r?.[cPage] : null,
+    date:   r?.[3],                      // D (both)
+    price:  r?.[cPrice],
+  }));
+  const hit = pickPlacementRow(rows, target, { byPage: isMasterSheet });
+  if (hit) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `${tabName}!${isMasterSheet ? "H" : "G"}${hit.row}`,
+      valueInputOption: "USER_ENTERED",
+      requestBody: { values: [[newPrice]] },
+    });
+  }
+  // The Ledger has its own stored row, so it's repriced even if the master
+  // row couldn't be pinned down.
+  if (isMasterSheet && spreadsheetId === process.env.MASTER_SHEET_ID) {
+    await _mirrorV2("mirrorUpdatePlacementPrice", target, newPrice);
+  }
+  return hit ? { updated: 1, row: hit.row, via: hit.via } : { updated: 0, row: null, via: null };
 }
 
 /**
@@ -1905,6 +1954,6 @@ module.exports = {
   getColumnDropdownOptions, snapToDropdown, fixDropdownColumn,
   applyCenterAlignmentBatch, applyColumnCenterAlignment,
   getLastDate, appendSeparatorRow, sortSheetByDate, findRowsInColumn, findDuplicateRows, getHeaderRow, findOutlierDates, getClientDateKeys, dateKeyOf, readMasterPlacements, readPagePlacements,
-  updateStatusToLive, updateAdPrice, updateAdClient, updateAdDate, updateAdPageHandle, deleteAdRows, deleteRowsByNumber,
+  updateStatusToLive, updateAdPrice, updatePlacementPrice, updateAdClient, updateAdDate, updateAdPageHandle, deleteAdRows, deleteRowsByNumber,
   appendReminder, appendRemindersBatch, getPendingReminders, markReminderSent,
 };
