@@ -146,6 +146,7 @@ function _mapRichMessage(m) {
   return {
     message_id: m.id,
     date:       m.date,                 // unix seconds
+    edit_date:  m.editDate || null,     // unix seconds of the last edit, if any
     text:       m.message || "",
     hasMedia:   !!(m.media || m.photo || m.video || m.document),
     kind,
