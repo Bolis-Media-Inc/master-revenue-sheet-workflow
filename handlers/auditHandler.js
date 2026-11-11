@@ -8,7 +8,9 @@
  *
  *  price update @handle1 [@handle2 ...] $newprice
  *      Updates the Ad Price in the master sheet (col H) and individual page
- *      sheet (col G) for every listed handle.
+ *      sheet (col G) for every listed handle — only the replied-to brief's
+ *      own row (stored row number, else client + the brief's date), never
+ *      the client's other dates.
  *      Multiple handles → same new price for all.
  *      Different prices per handle → use separate lines.
  *
@@ -31,8 +33,9 @@
  */
 
 const { parseAdMessage }          = require("../parser");
-const { updateAdPrice, deleteAdRows } = require("../sheets");
+const { updatePlacementPrice, deleteAdRows } = require("../sheets");
 const pagesRegistry               = require("../lib/pages");
+const adBriefs                    = require("../lib/adBriefs");
 
 const TARGET_CHAT_ID = process.env.TARGET_CHAT_ID;
 const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
@@ -130,7 +133,8 @@ async function handleAuditCommand(ctx) {
 
     // Get the client name from the original ad (for sheet matching)
     const replyText     = (replyTo.text || replyTo.caption || "").trim();
-    const originalParsed = replyText ? parseAdMessage(replyText, new Date()) : null;
+    const replyDate      = replyTo.date ? new Date(replyTo.date * 1000) : new Date();
+    const originalParsed = replyText ? parseAdMessage(replyText, replyDate) : null;
     const firstParsed    = Array.isArray(originalParsed) ? originalParsed[0] : originalParsed;
     const clientName     = firstParsed?.client || null;
 
@@ -145,15 +149,28 @@ async function handleAuditCommand(ctx) {
 
       // ── price update ──────────────────────────────────────────────────────
       if (cmd.type === "price_update") {
+        // Pin the edit to this brief's placement: its DB row numbers + date
+        // when the brief was captured, else the client + date parsed from the
+        // replied-to text.
+        const brief = await adBriefs.findBriefByTelegramMessage(Number(chatId), replyTo.message_id).catch(() => null);
+        const briefPages = brief ? await adBriefs.getBriefPages(brief.id).catch(() => []) : [];
         for (const handle of cmd.handles) {
           let masterUpdated = 0;
           let pageUpdated   = 0;
+          const bp = briefPages.find((p) => (p.page_handle || "").toLowerCase() === handle);
+          const target = {
+            client:    brief?.client || clientName,
+            page:      handle,
+            date:      brief?.date_posted || firstParsed?.datePosted || null,
+            ledgerRow: bp?.ledger_sheet_row || null,
+            oldPrice:  bp?.page_price ?? null,
+          };
 
           try {
             if (MASTER_SHEET_ID && !PLACEHOLDER_PATTERN.test(MASTER_SHEET_ID)) {
-              masterUpdated = await updateAdPrice(
-                MASTER_SHEET_ID, TAB_NAME, [handle], clientName, cmd.price, true
-              );
+              masterUpdated = (await updatePlacementPrice(
+                MASTER_SHEET_ID, TAB_NAME, { ...target, storedRow: bp?.master_sheet_row }, cmd.price, true
+              )).updated;
             }
           } catch (err) {
             console.error(`[auditHandler] ❌ price update master @${handle}: ${err.message}`);
@@ -163,9 +180,9 @@ async function handleAuditCommand(ctx) {
             if (isPageEnabled(handle)) {
               const sheetId = pagesRegistry.getSheetId(handle);
               if (sheetId && !PLACEHOLDER_PATTERN.test(sheetId)) {
-                pageUpdated = await updateAdPrice(
-                  sheetId, PAGE_TAB_NAME, [handle], clientName, cmd.price, false
-                );
+                pageUpdated = (await updatePlacementPrice(
+                  sheetId, PAGE_TAB_NAME, { ...target, storedRow: bp?.page_sheet_row }, cmd.price, false
+                )).updated;
               }
             }
           } catch (err) {

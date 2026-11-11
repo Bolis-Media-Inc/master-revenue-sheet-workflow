@@ -177,6 +177,31 @@ async function mirrorUpdatePrice(pageHandles, clientName, newPrice) {
   } catch (err) { console.error(`[v2ledger] mirrorUpdatePrice (non-fatal): ${err.message}`); }
 }
 
+// ── mirror: PRICE for ONE placement (col J) ───────────────────────────────────
+// The /update price path. mirrorUpdatePrice above matches page + client across
+// every date; this reprices only the brief's own Ledger row — its
+// ledger_sheet_row if that still holds the same client + page, else client +
+// page + date (lib/placementRows.js). No match → nothing written.
+// `target`: { client, page, date, ledgerRow, oldPrice }.
+async function mirrorUpdatePlacementPrice(target, newPrice) {
+  if (!enabled()) return 0;
+  try {
+    const { pickPlacementRow } = require("./lib/placementRows");
+    const { sheetsClient } = require("./sheets");
+    const sheets = await sheetsClient();
+    const resp = await sheets.spreadsheets.values.get({ spreadsheetId: v2Id(), range: `${LEDGER_TAB}!A:P` });
+    const rows = (resp.data.values || []).map((r, i) => ({
+      row: i + 1, client: r[1], date: r[6], page: r[8], price: r[9],   // B, G, I, J
+    })).slice(2);                                                      // skip title(1)+header(2)
+    const hit = pickPlacementRow(rows, { ...target, storedRow: target.ledgerRow }, { byPage: true });
+    if (!hit) return 0;
+    return await _batchWrite([{ range: `${LEDGER_TAB}!J${hit.row}`, values: [[parsePrice(newPrice)]] }]);
+  } catch (err) {
+    console.error(`[v2ledger] mirrorUpdatePlacementPrice (non-fatal): ${err.message}`);
+    return 0;
+  }
+}
+
 // ── mirror: CLIENT rename (cols B + D) ────────────────────────────────────────
 async function mirrorUpdateClient(pageHandles, oldClient, newClient) {
   if (!enabled()) return;
@@ -292,5 +317,5 @@ async function mirrorDelete(pageHandles, clientName, opts = {}) {
 
 module.exports = {
   enabled, mapMasterRowToV2, mapParsedToV2,
-  mirrorAppend, mirrorUpdatePrice, mirrorUpdateClient, mirrorUpdateDate, mirrorUpdateStatusToLive, mirrorDelete, mirrorDeleteRows,
+  mirrorAppend, mirrorUpdatePrice, mirrorUpdatePlacementPrice, mirrorUpdateClient, mirrorUpdateDate, mirrorUpdateStatusToLive, mirrorDelete, mirrorDeleteRows,
 };
